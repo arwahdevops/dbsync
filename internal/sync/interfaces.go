@@ -8,7 +8,7 @@ import (
 
 // SchemaExecutionResult holds the DDLs generated for execution.
 type SchemaExecutionResult struct {
-	TableDDL       string   // DDL for CREATE/ALTER TABLE (can be multiple ALTERs joined)
+	TableDDL       string   // DDL for CREATE/ALTER TABLE (can be multiple ALTERs joined by ';')
 	IndexDDLs      []string // DDLs for CREATE INDEX / DROP INDEX
 	ConstraintDDLs []string // DDLs for ADD CONSTRAINT / DROP CONSTRAINT (UNIQUE, FK)
 	PrimaryKeys    []string // Detected primary key columns (unquoted)

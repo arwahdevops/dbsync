@@ -81,7 +81,7 @@ Handles table structure synchronization with configurable strategies:
 **Steps:**
 ```bash
 # 1. Clone the repository
-git clone https://github.com/arwahdevops/dbsync.git # Replace with your repo URL
+git clone https://github.com/arwahdevops/dbsync.git
 cd dbsync
 
 # 2. Install dependencies (including Vault client if needed)

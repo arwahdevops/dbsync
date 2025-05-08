@@ -1,132 +1,241 @@
+// internal/sync/schema_alter.go
 package sync
 
 import (
-	// "fmt" // <-- HAPUS
-	// "reflect" // Tidak perlu di sini
-	// "regexp" // Tidak perlu di sini
-	// "strconv" // Tidak perlu di sini
-	// "strings" // <-- HAPUS
+	"strings" // Diperlukan untuk strings.Join
 
 	"go.uber.org/zap"
-	// "github.com/arwahdevops/dbsync/internal/utils" // Tidak perlu di sini
+	// utils tidak secara langsung digunakan di sini, tapi oleh helper DDL
 )
 
-// --- Logika Inti untuk Strategi ALTER ---
-
 // generateAlterDDLs menghasilkan DDL untuk mengubah skema tujuan agar cocok dengan sumber.
-func (s *SchemaSyncer) generateAlterDDLs(table string,
-	srcCols []ColumnInfo, srcIdxs []IndexInfo, srcCons []ConstraintInfo,
-	dstCols []ColumnInfo, dstIdxs []IndexInfo, dstCons []ConstraintInfo) (
-	alterColumnDDLs []string, indexDDLs []string, constraintDDLs []string, err error) {
+// Ini adalah fungsi koordinator utama untuk strategi ALTER.
+func (s *SchemaSyncer) generateAlterDDLs(
+	table string,
+	srcColumns []ColumnInfo, srcIndexes []IndexInfo, srcConstraints []ConstraintInfo,
+	dstColumns []ColumnInfo, dstIndexes []IndexInfo, dstConstraints []ConstraintInfo,
+) (
+	alterColumnDDLsJoined string, // Akan berisi semua DDL ALTER COLUMN, digabung dengan ;
+	finalIndexDDLs []string,      // Berisi DROP INDEX dan CREATE INDEX
+	finalConstraintDDLs []string, // Berisi DROP CONSTRAINT dan ADD CONSTRAINT
+	err error,
+) {
+	log := s.logger.With(zap.String("table", table), zap.String("strategy", "alter"), zap.String("dst_dialect", s.dstDialect))
+	log.Info("Starting generation of ALTER DDLs")
 
-	log := s.logger.With(zap.String("table", table), zap.String("dialect", s.dstDialect))
-	alterColumnDDLs = make([]string, 0)
-	indexDDLs = make([]string, 0)      // Holds DROP INDEX and CREATE INDEX
-	constraintDDLs = make([]string, 0) // Holds DROP CONSTRAINT and ADD CONSTRAINT
+	// Inisialisasi slice untuk DDL
+	var collectedAlterColumnDDLs []string
+	finalIndexDDLs = make([]string, 0)
+	finalConstraintDDLs = make([]string, 0)
 
-	srcColMap := make(map[string]ColumnInfo); for _, c := range srcCols { srcColMap[c.Name] = c }
-	dstColMap := make(map[string]ColumnInfo); for _, c := range dstCols { dstColMap[c.Name] = c }
-	srcIdxMap := make(map[string]IndexInfo); for _, i := range srcIdxs { srcIdxMap[i.Name] = i }
-	dstIdxMap := make(map[string]IndexInfo); for _, i := range dstIdxs { dstIdxMap[i.Name] = i }
-	srcConsMap := make(map[string]ConstraintInfo); for _, c := range srcCons { srcConsMap[c.Name] = c }
-	dstConsMap := make(map[string]ConstraintInfo); for _, c := range dstCons { dstConsMap[c.Name] = c }
+	// Buat map untuk pencarian cepat objek sumber dan tujuan
+	srcColMap := make(map[string]ColumnInfo); for _, c := range srcColumns { srcColMap[c.Name] = c }
+	dstColMap := make(map[string]ColumnInfo); for _, c := range dstColumns { dstColMap[c.Name] = c }
 
-	// --- Phase 1: Generate DROP statements for constraints/indexes not in source ---
+	srcIdxMap := make(map[string]IndexInfo); for _, i := range srcIndexes { srcIdxMap[i.Name] = i }
+	dstIdxMap := make(map[string]IndexInfo); for _, i := range dstIndexes { dstIdxMap[i.Name] = i }
+
+	srcConsMap := make(map[string]ConstraintInfo); for _, c := range srcConstraints { srcConsMap[c.Name] = c }
+	dstConsMap := make(map[string]ConstraintInfo); for _, c := range dstConstraints { dstConsMap[c.Name] = c }
+
+
+	// --- Tahap 1: Hasilkan DDL DROP untuk objek di tujuan yang tidak ada di sumber atau dimodifikasi ---
+	// Urutan drop: FK, Constraint lain (UNIQUE, CHECK), baru Indeks.
+	// Ini untuk menghindari masalah dependensi.
+
+	log.Debug("Phase 1: Generating DROP DDLs for modified/removed constraints and indexes")
+
+	// Constraints (FK, UNIQUE, CHECK) yang akan di-drop atau di-drop-dan-dibuat-ulang
 	constraintsToDrop := []ConstraintInfo{}
-	indexesToDrop := []IndexInfo{}
-	constraintsToModify := []struct{ Src, Dst ConstraintInfo }{}
-	indexesToModify := []struct{ Src, Dst IndexInfo }{}
+	constraintsToRecreate := []struct{ Src, Dst ConstraintInfo }{} // Untuk yang dimodifikasi
 
-	for name, dc := range dstConsMap {
-		if sc, exists := srcConsMap[name]; !exists && dc.Type != "PRIMARY KEY" {
+	for dstConsName, dc := range dstConsMap {
+		if dc.Type == "PRIMARY KEY" { // PK biasanya tidak di-drop/add dengan cara ini dalam strategi ALTER
+			continue
+		}
+		sc, srcConsExists := srcConsMap[dstConsName]
+		if !srcConsExists {
+			log.Debug("Constraint exists in destination but not in source, marking for DROP", zap.String("constraint", dstConsName))
 			constraintsToDrop = append(constraintsToDrop, dc)
-		} else if exists && dc.Type != "PRIMARY KEY" {
-			if s.needsConstraintModification(sc, dc, log) { // Panggil dari schema_compare.go
-				constraintsToModify = append(constraintsToModify, struct{ Src, Dst ConstraintInfo }{sc, dc})
-			}
-		}
-	}
-	for name, di := range dstIdxMap {
-		if si, exists := srcIdxMap[name]; !exists && !di.IsPrimary {
-			indexesToDrop = append(indexesToDrop, di)
-		} else if exists && !di.IsPrimary {
-			if s.needsIndexModification(si, di, log) { // Panggil dari schema_compare.go
-				indexesToModify = append(indexesToModify, struct{ Src, Dst IndexInfo }{si, di})
-			}
-		}
-	}
-
-	// Hasilkan DDL Drop (prioritaskan constraint sebelum index)
-	for _, c := range constraintsToDrop {
-		ddl, dropErr := s.generateDropConstraintDDL(table, c) // Panggil dari schema_ddl_alter.go
-		if dropErr == nil { constraintDDLs = append(constraintDDLs, ddl) } else { log.Error("Failed gen drop cons", zap.Error(dropErr)) }
-	}
-	for _, i := range indexesToDrop {
-		ddl, dropErr := s.generateDropIndexDDL(table, i) // Panggil dari schema_ddl_alter.go
-		if dropErr == nil { indexDDLs = append(indexDDLs, ddl) } else { log.Error("Failed gen drop idx", zap.Error(dropErr)) }
-	}
-	// Untuk modifikasi, strategi paling aman adalah Drop + Add
-	for _, mod := range constraintsToModify {
-		log.Warn("Constraint modification detected, performing DROP+ADD", zap.String("constraint", mod.Src.Name))
-		ddlDrop, eDrop := s.generateDropConstraintDDL(table, mod.Dst); if eDrop == nil { constraintDDLs = append(constraintDDLs, ddlDrop) } else { log.Error("Failed gen drop cons (modify)", zap.Error(eDrop)) }
-	}
-	for _, mod := range indexesToModify {
-		log.Warn("Index modification detected, performing DROP+ADD", zap.String("index", mod.Src.Name))
-		ddlDrop, eDrop := s.generateDropIndexDDL(table, mod.Dst); if eDrop == nil { indexDDLs = append(indexDDLs, ddlDrop) } else { log.Error("Failed gen drop idx (modify)", zap.Error(eDrop)) }
-	}
-
-	// --- Phase 2: Generate Column ADD/DROP/MODIFY ---
-	columnsToDrop := []ColumnInfo{}
-	columnsToAdd := []ColumnInfo{}
-	columnsToModify := []struct{ Src, Dst ColumnInfo }{}
-
-	for name, sc := range srcColMap {
-		if dc, exists := dstColMap[name]; !exists {
-			columnsToAdd = append(columnsToAdd, sc)
 		} else {
-			diffs := s.getColumnModifications(sc, dc, log) // Panggil dari schema_compare.go
-			if len(diffs) > 0 {
-				columnsToModify = append(columnsToModify, struct{ Src, Dst ColumnInfo }{sc, dc})
+			// Constraint ada di kedua sisi, cek apakah perlu modifikasi
+			// s.needsConstraintModification diambil dari schema_compare.go
+			if s.needsConstraintModification(sc, dc, log) {
+				log.Debug("Constraint exists in both but needs modification, marking for DROP+ADD", zap.String("constraint", dstConsName))
+				constraintsToRecreate = append(constraintsToRecreate, struct{ Src, Dst ConstraintInfo }{sc, dc})
 			}
 		}
 	}
-	for name, dc := range dstColMap {
-		if _, exists := srcColMap[name]; !exists {
-			columnsToDrop = append(columnsToDrop, dc)
+
+	// Tambahkan DDL DROP untuk constraint yang perlu di-drop atau dibuat ulang
+	for _, cons := range constraintsToDrop {
+		ddl, dropErr := s.generateDropConstraintDDL(table, cons) // Dari schema_ddl_alter.go
+		if dropErr == nil && ddl != "" {
+			finalConstraintDDLs = append(finalConstraintDDLs, ddl)
+		} else if dropErr != nil {
+			log.Error("Failed to generate DROP CONSTRAINT DDL", zap.String("constraint", cons.Name), zap.Error(dropErr))
+			// Pertimbangkan apakah error ini fatal atau bisa diabaikan jika SKIP_FAILED_TABLES aktif
 		}
 	}
-	// Generate column DDLs (Urutan: Add, Modify, Drop)
-	for _, col := range columnsToAdd {
-		ddl, addErr := s.generateAddColumnDDL(table, col); if addErr == nil { alterColumnDDLs = append(alterColumnDDLs, ddl) } else { log.Error("Failed gen add col", zap.Error(addErr)) }
+	for _, modCons := range constraintsToRecreate {
+		ddl, dropErr := s.generateDropConstraintDDL(table, modCons.Dst)
+		if dropErr == nil && ddl != "" {
+			finalConstraintDDLs = append(finalConstraintDDLs, ddl)
+		} else if dropErr != nil {
+			log.Error("Failed to generate DROP CONSTRAINT DDL (for recreate)", zap.String("constraint", modCons.Dst.Name), zap.Error(dropErr))
+		}
 	}
-	for _, mod := range columnsToModify {
-		modifyDDLs := s.generateModifyColumnDDLs(table, mod.Src, mod.Dst, log); alterColumnDDLs = append(alterColumnDDLs, modifyDDLs...)
+
+	// Indeks yang akan di-drop atau di-drop-dan-dibuat-ulang
+	indexesToDrop := []IndexInfo{}
+	indexesToRecreate := []struct{ Src, Dst IndexInfo }{} // Untuk yang dimodifikasi
+
+	for dstIdxName, di := range dstIdxMap {
+		if di.IsPrimary { // PK Indeks biasanya tidak di-drop/add dengan cara ini
+			continue
+		}
+		si, srcIdxExists := srcIdxMap[dstIdxName]
+		if !srcIdxExists {
+			log.Debug("Index exists in destination but not in source, marking for DROP", zap.String("index", dstIdxName))
+			indexesToDrop = append(indexesToDrop, di)
+		} else {
+			// Indeks ada di kedua sisi, cek apakah perlu modifikasi
+			// s.needsIndexModification diambil dari schema_compare.go
+			if s.needsIndexModification(si, di, log) {
+				log.Debug("Index exists in both but needs modification, marking for DROP+ADD", zap.String("index", dstIdxName))
+				indexesToRecreate = append(indexesToRecreate, struct{ Src, Dst IndexInfo }{si, di})
+			}
+		}
 	}
-	for _, col := range columnsToDrop {
-		ddl, dropErr := s.generateDropColumnDDL(table, col); if dropErr == nil { alterColumnDDLs = append(alterColumnDDLs, ddl) } else { log.Error("Failed gen drop col", zap.Error(dropErr)) }
+	// Tambahkan DDL DROP untuk indeks
+	for _, idx := range indexesToDrop {
+		ddl, dropErr := s.generateDropIndexDDL(table, idx) // Dari schema_ddl_alter.go
+		if dropErr == nil && ddl != "" {
+			finalIndexDDLs = append(finalIndexDDLs, ddl)
+		} else if dropErr != nil {
+			log.Error("Failed to generate DROP INDEX DDL", zap.String("index", idx.Name), zap.Error(dropErr))
+		}
+	}
+	for _, modIdx := range indexesToRecreate {
+		ddl, dropErr := s.generateDropIndexDDL(table, modIdx.Dst)
+		if dropErr == nil && ddl != "" {
+			finalIndexDDLs = append(finalIndexDDLs, ddl)
+		} else if dropErr != nil {
+			log.Error("Failed to generate DROP INDEX DDL (for recreate)", zap.String("index", modIdx.Dst.Name), zap.Error(dropErr))
+		}
 	}
 
 
-	// --- Phase 3: Generate ADD statements for constraints/indexes not in destination (or modified) ---
+	// --- Tahap 2: Hasilkan DDL Kolom (ADD, DROP, MODIFY) ---
+	log.Debug("Phase 2: Generating ADD/DROP/MODIFY COLUMN DDLs")
+	// Kolom yang akan di-drop dari tujuan
+	for dstColName, dc := range dstColMap {
+		if _, srcColExists := srcColMap[dstColName]; !srcColExists {
+			log.Debug("Column exists in destination but not in source, marking for DROP", zap.String("column", dstColName))
+			ddl, dropErr := s.generateDropColumnDDL(table, dc) // Dari schema_ddl_alter.go
+			if dropErr == nil && ddl != "" {
+				collectedAlterColumnDDLs = append(collectedAlterColumnDDLs, ddl)
+			} else if dropErr != nil {
+				log.Error("Failed to generate DROP COLUMN DDL", zap.String("column", dc.Name), zap.Error(dropErr))
+			}
+		}
+	}
+
+	// Kolom yang akan di-add ke tujuan atau di-modify
+	for srcColName, sc := range srcColMap {
+		dc, dstColExists := dstColMap[srcColName]
+		if !dstColExists {
+			log.Debug("Column exists in source but not in destination, marking for ADD", zap.String("column", srcColName))
+			ddl, addErr := s.generateAddColumnDDL(table, sc) // Dari schema_ddl_alter.go
+			if addErr == nil && ddl != "" {
+				collectedAlterColumnDDLs = append(collectedAlterColumnDDLs, ddl)
+			} else if addErr != nil {
+				log.Error("Failed to generate ADD COLUMN DDL", zap.String("column", sc.Name), zap.Error(addErr))
+			}
+		} else {
+			// Kolom ada di kedua sisi, cek apakah perlu modifikasi
+			// s.generateModifyColumnDDLs adalah dispatcher di schema_ddl_alter.go
+			// yang memanggil s.getColumnModifications di dalamnya.
+			modifyDDLs := s.generateModifyColumnDDLs(table, sc, dc, log)
+			if len(modifyDDLs) > 0 {
+				log.Debug("Column exists in both and needs modification", zap.String("column", srcColName), zap.Int("num_modify_ddls", len(modifyDDLs)))
+				collectedAlterColumnDDLs = append(collectedAlterColumnDDLs, modifyDDLs...)
+			}
+		}
+	}
+	// Gabungkan semua DDL ALTER COLUMN menjadi satu string jika ada
+	if len(collectedAlterColumnDDLs) > 0 {
+		// Urutkan DDL kolom (misalnya, DROP dulu, baru ADD, baru MODIFY)
+		// Ini bisa rumit. Untuk sekarang, kita gabungkan sesuai urutan deteksi.
+		// Pengurutan yang lebih baik bisa dilakukan di `ExecuteDDLs`.
+		alterColumnDDLsJoined = strings.Join(collectedAlterColumnDDLs, ";\n")
+		// Tambahkan titik koma di akhir jika belum ada, untuk konsistensi
+		if !strings.HasSuffix(alterColumnDDLsJoined, ";") {
+			alterColumnDDLsJoined += ";"
+		}
+	}
+
+
+	// --- Tahap 3: Hasilkan DDL ADD untuk objek baru atau yang dibuat ulang ---
+	log.Debug("Phase 3: Generating ADD DDLs for new/recreated constraints and indexes")
+
+	// Indeks yang akan ditambahkan (baru atau dibuat ulang)
 	indexesToAdd := []IndexInfo{}
-	constraintsToAdd := []ConstraintInfo{}
-    for name, si := range srcIdxMap {
-        needsAdd := false
-		if _, exists := dstIdxMap[name]; !exists && !si.IsPrimary { needsAdd = true } else { for _, mod := range indexesToModify { if mod.Src.Name == name { needsAdd = true; break } } }
-		if needsAdd { indexesToAdd = append(indexesToAdd, si) }
-    }
-    for name, sc := range srcConsMap {
-         needsAdd := false
-		 if _, exists := dstConsMap[name]; !exists && sc.Type != "PRIMARY KEY" { needsAdd = true } else { for _, mod := range constraintsToModify { if mod.Src.Name == name { needsAdd = true; break } } }
-		 if needsAdd { constraintsToAdd = append(constraintsToAdd, sc) }
-    }
-	// Append ADD DDLs
-	indexDDLs = append(indexDDLs, s.generateCreateIndexDDLs(table, indexesToAdd)...) // Panggil dari schema_ddl_create.go
-	constraintDDLs = append(constraintDDLs, s.generateAddConstraintDDLs(table, constraintsToAdd)...) // Panggil dari schema_ddl_create.go
+	for srcIdxName, si := range srcIdxMap {
+		if si.IsPrimary { continue } // PK Indeks di-handle oleh CREATE TABLE atau sudah ada
 
+		_, dstIdxExists := dstIdxMap[srcIdxName]
+		isRecreated := false
+		for _, modIdx := range indexesToRecreate {
+			if modIdx.Src.Name == srcIdxName {
+				isRecreated = true
+				break
+			}
+		}
 
-	if len(alterColumnDDLs) == 0 && len(indexDDLs) == 0 && len(constraintDDLs) == 0 {
-		log.Info("No schema differences found requiring ALTER.")
+		if !dstIdxExists || isRecreated {
+			log.Debug("Marking index for ADD (either new or recreated)", zap.String("index", srcIdxName))
+			indexesToAdd = append(indexesToAdd, si)
+		}
 	}
-	return
+	// Tambahkan DDL CREATE INDEX ke finalIndexDDLs
+	// s.generateCreateIndexDDLs berasal dari schema_ddl_create.go
+	addIndexDDLs := s.generateCreateIndexDDLs(table, indexesToAdd)
+	finalIndexDDLs = append(finalIndexDDLs, addIndexDDLs...)
+
+
+	// Constraints yang akan ditambahkan (baru atau dibuat ulang)
+	constraintsToAdd := []ConstraintInfo{}
+	for srcConsName, sc := range srcConsMap {
+		if sc.Type == "PRIMARY KEY" { continue } // PK sudah ada
+
+		_, dstConsExists := dstConsMap[srcConsName]
+		isRecreated := false
+		for _, modCons := range constraintsToRecreate {
+			if modCons.Src.Name == srcConsName {
+				isRecreated = true
+				break
+			}
+		}
+		if !dstConsExists || isRecreated {
+			log.Debug("Marking constraint for ADD (either new or recreated)", zap.String("constraint", srcConsName))
+			constraintsToAdd = append(constraintsToAdd, sc)
+		}
+	}
+	// Tambahkan DDL ADD CONSTRAINT ke finalConstraintDDLs
+	// s.generateAddConstraintDDLs berasal dari schema_ddl_create.go
+	addConstraintDDLs := s.generateAddConstraintDDLs(table, constraintsToAdd)
+	finalConstraintDDLs = append(finalConstraintDDLs, addConstraintDDLs...)
+
+	if alterColumnDDLsJoined == "" && len(finalIndexDDLs) == 0 && len(finalConstraintDDLs) == 0 {
+		log.Info("No schema differences found requiring ALTER DDLs.")
+	} else {
+		log.Info("Finished generating ALTER DDLs.",
+			zap.Bool("has_column_alters", alterColumnDDLsJoined != ""),
+			zap.Int("num_index_ddls", len(finalIndexDDLs)),
+			zap.Int("num_constraint_ddls", len(finalConstraintDDLs)),
+		)
+	}
+
+	return // alterColumnDDLsJoined, finalIndexDDLs, finalConstraintDDLs, nil
 }

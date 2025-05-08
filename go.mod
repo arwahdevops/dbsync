@@ -4,6 +4,7 @@ go 1.24.2
 
 require (
 	github.com/caarlos0/env/v8 v8.0.0
+	github.com/cockroachdb/apd/v3 v3.2.1
 	github.com/hashicorp/vault/api v1.16.0
 	github.com/joho/godotenv v1.5.1
 	github.com/prometheus/client_golang v1.22.0

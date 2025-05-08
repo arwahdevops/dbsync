@@ -1,9 +1,12 @@
+// internal/sync/full_sync.go
 package sync
 
 import (
 	"context"
+	"errors" // Digunakan untuk context.DeadlineExceeded
 	"fmt"
 	"sort"
+	"strconv" // <-- Import yang ditambahkan
 	"strings"
 	"sync"
 	"time"
@@ -27,26 +30,30 @@ type FullSync struct {
 	metrics      *metrics.Store
 }
 
+// SyncResult menyimpan hasil sinkronisasi untuk satu tabel.
 type SyncResult struct {
-	Table             string
-	SchemaSyncSkipped bool
-	SchemaError       error
-	DataError         error
-	ConstraintError   error
-	RowsSynced        int64
-	Batches           int
-	Duration          time.Duration
-	Skipped           bool
+	Table                    string
+	SchemaSyncSkipped        bool          // Apakah sync skema dilewati karena strategy=none
+	SchemaAnalysisError      error         // Error saat analisis/generasi DDL
+	SchemaExecutionError     error         // Error saat eksekusi DDL tabel (CREATE/ALTER)
+	DataError                error         // Error saat sinkronisasi data
+	ConstraintExecutionError error         // Error saat eksekusi DDL indeks/constraint (setelah data)
+	SkipReason               string        // Alasan mengapa pemrosesan tabel dilewati
+	RowsSynced               int64
+	Batches                  int
+	Duration                 time.Duration
+	Skipped                  bool          // Apakah pemrosesan tabel ini dilewati sepenuhnya (karena error fatal + SkipFailedTables=false, atau context cancelled)
 }
+
 
 var _ FullSyncInterface = (*FullSync)(nil)
 
 func NewFullSync(srcConn, dstConn *db.Connector, cfg *config.Config, logger *zap.Logger, metricsStore *metrics.Store) *FullSync {
 	return &FullSync{
-		srcConn:     srcConn,
-		dstConn:     dstConn,
-		cfg:         cfg,
-		logger:      logger.Named("full-sync"),
+		srcConn:      srcConn,
+		dstConn:      dstConn,
+		cfg:          cfg,
+		logger:       logger.Named("full-sync"),
 		schemaSyncer: NewSchemaSyncer(
 			srcConn.DB,
 			dstConn.DB,
@@ -67,10 +74,10 @@ func (f *FullSync) Run(ctx context.Context) map[string]SyncResult {
 		zap.String("schema_strategy", string(f.cfg.SchemaSyncStrategy)),
 	)
 	f.metrics.SyncRunning.Set(1)
-	defer f.metrics.SyncRunning.Set(0)
+	defer f.metrics.SyncRunning.Set(0) // Set ke 0 saat Run selesai
 
 	results := make(map[string]SyncResult)
-	tables, err := f.listTables(ctx)
+	tables, err := f.listTables(ctx) // Gunakan context di listTables
 	if err != nil {
 		f.logger.Error("Failed to list source tables", zap.Error(err))
 		f.metrics.SyncErrorsTotal.WithLabelValues("list_tables", "").Inc()
@@ -79,7 +86,7 @@ func (f *FullSync) Run(ctx context.Context) map[string]SyncResult {
 
 	if len(tables) == 0 {
 		f.logger.Warn("No tables found in source database to synchronize")
-		f.metrics.SyncDuration.Observe(time.Since(startTime).Seconds()) // Observe duration even if no tables
+		f.metrics.SyncDuration.Observe(time.Since(startTime).Seconds())
 		return results
 	}
 
@@ -96,9 +103,10 @@ func (f *FullSync) Run(ctx context.Context) map[string]SyncResult {
 			f.logger.Warn("Context cancelled before starting sync for remaining tables",
 				zap.String("first_skipped_table", tableName),
 				zap.Int("remaining_count", len(remainingTables)),
+				zap.Error(ctx.Err()),
 			)
 			for _, tbl := range remainingTables {
-				results[tbl] = SyncResult{Table: tbl, Skipped: true, SchemaError: ctx.Err()}
+				results[tbl] = SyncResult{Table: tbl, Skipped: true, SkipReason: "Context cancelled before start", DataError: ctx.Err()}
 			}
 			goto endloop
 		default:
@@ -108,179 +116,195 @@ func (f *FullSync) Run(ctx context.Context) map[string]SyncResult {
 		go func(tbl string) {
 			defer wg.Done()
 
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				f.logger.Warn("Context cancelled while waiting for worker slot", zap.String("table", tbl))
-				resultChan <- SyncResult{Table: tbl, Skipped: true, SchemaError: ctx.Err()}
-				return
-			}
-
 			log := f.logger.With(zap.String("table", tbl))
 			start := time.Now()
 			result := SyncResult{Table: tbl}
-			syncCompletedWithoutError := false
 
 			defer func() {
 				result.Duration = time.Since(start)
 				f.metrics.TableSyncDuration.WithLabelValues(tbl).Observe(result.Duration.Seconds())
 
-				if syncCompletedWithoutError {
-					log.Info("Table sync finished successfully",
-						zap.Duration("duration", result.Duration),
-						zap.Int64("rows_synced", result.RowsSynced),
-						zap.Int("batches", result.Batches),
-					)
+				logFields := []zap.Field{
+					zap.Duration("duration", result.Duration),
+					zap.Int64("rows_synced", result.RowsSynced),
+					zap.Int("batches_processed", result.Batches),
+					zap.Bool("schema_sync_skipped_explicitly", result.SchemaSyncSkipped),
+				}
+
+				if result.Skipped {
+					logFields = append(logFields, zap.String("skip_reason", result.SkipReason))
+					if result.SchemaAnalysisError != nil { logFields = append(logFields, zap.NamedError("cause_schema_analysis_error", result.SchemaAnalysisError)) }
+					if result.SchemaExecutionError != nil { logFields = append(logFields, zap.NamedError("cause_schema_execution_error", result.SchemaExecutionError)) }
+					if result.DataError != nil { logFields = append(logFields, zap.NamedError("cause_data_error", result.DataError)) }
+					log.Warn("Table processing was skipped", logFields...)
+				} else if result.SchemaAnalysisError != nil || result.SchemaExecutionError != nil || result.DataError != nil {
+					if result.SchemaAnalysisError != nil { logFields = append(logFields, zap.NamedError("schema_analysis_error", result.SchemaAnalysisError)) }
+					if result.SchemaExecutionError != nil { logFields = append(logFields, zap.NamedError("schema_execution_error", result.SchemaExecutionError)) }
+					if result.DataError != nil { logFields = append(logFields, zap.NamedError("data_error", result.DataError)) }
+					if result.ConstraintExecutionError != nil { logFields = append(logFields, zap.NamedError("constraint_execution_error", result.ConstraintExecutionError)) }
+					log.Error("Table sync finished with critical errors", logFields...)
+				} else if result.ConstraintExecutionError != nil {
+					logFields = append(logFields, zap.NamedError("constraint_execution_error", result.ConstraintExecutionError))
+					log.Warn("Table sync data SUCCEEDED, but applying constraints/indexes FAILED", logFields...)
 					f.metrics.TableSyncSuccessTotal.WithLabelValues(tbl).Inc()
-				} else if !result.Skipped {
-					log.Error("Table sync finished with errors",
-						zap.Duration("duration", result.Duration),
-						zap.NamedError("schema_error", result.SchemaError),
-						zap.NamedError("data_error", result.DataError),
-						zap.NamedError("constraint_error", result.ConstraintError),
-					)
 				} else {
-					reasonFields := []zap.Field{zap.Duration("duration", result.Duration)}
-					if result.SchemaError != nil {
-						reasonFields = append(reasonFields, zap.NamedError("reason_schema_error", result.SchemaError))
-					}
-					if result.DataError != nil {
-						reasonFields = append(reasonFields, zap.NamedError("reason_data_error", result.DataError))
-					}
-					if result.SchemaSyncSkipped {
-						reasonFields = append(reasonFields, zap.Bool("schema_sync_skipped_explicitly", result.SchemaSyncSkipped))
-					}
-					log.Warn("Table sync was skipped", reasonFields...)
+					log.Info("Table sync finished successfully", logFields...)
+					f.metrics.TableSyncSuccessTotal.WithLabelValues(tbl).Inc()
 				}
 				resultChan <- result
 			}()
 
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				log.Warn("Context cancelled while waiting for worker slot", zap.Error(ctx.Err()))
+				result.Skipped = true
+				result.SkipReason = "Context cancelled while waiting for worker"
+				result.DataError = ctx.Err()
+				return
+			}
+
 			tableCtx, cancel := context.WithTimeout(ctx, f.cfg.TableTimeout)
 			defer cancel()
 
-			// 1. Schema Analysis & DDL Generation
+			// --- Tahap 1: Analisis Skema & Pembuatan DDL ---
 			log.Info("Starting schema analysis/generation")
 			schemaResult, schemaErr := f.schemaSyncer.SyncTableSchema(tableCtx, tbl, f.cfg.SchemaSyncStrategy)
 			if schemaErr != nil {
 				log.Error("Schema analysis/generation failed", zap.Error(schemaErr))
-				result.SchemaError = schemaErr
+				result.SchemaAnalysisError = schemaErr
 				f.metrics.SyncErrorsTotal.WithLabelValues("schema_analysis", tbl).Inc()
 				if !f.cfg.SkipFailedTables {
+					result.Skipped = true
+					result.SkipReason = "Schema analysis failed (SkipFailedTables=false)"
 					return
 				}
 				result.Skipped = true
+				result.SkipReason = "Schema analysis failed (SkipFailedTables=true)"
 				return
 			}
 			if f.cfg.SchemaSyncStrategy == config.SchemaSyncNone {
 				result.SchemaSyncSkipped = true
 				log.Info("Schema sync skipped due to 'none' strategy")
-			} else {
+			} else if schemaResult != nil {
 				log.Info("Schema analysis/generation complete",
 					zap.Bool("table_ddl_present", schemaResult.TableDDL != ""),
-					zap.Int("index_ddls", len(schemaResult.IndexDDLs)),
-					zap.Int("constraint_ddls", len(schemaResult.ConstraintDDLs)),
+					zap.Int("index_ddls_count", len(schemaResult.IndexDDLs)),
+					zap.Int("constraint_ddls_count", len(schemaResult.ConstraintDDLs)),
+					zap.Strings("detected_pks", schemaResult.PrimaryKeys),
 				)
 			}
-
 			if tableCtx.Err() != nil {
-				log.Error("Context cancelled/timed out after schema analysis", zap.Error(tableCtx.Err()))
-				result.SchemaError = tableCtx.Err()
+				log.Error("Context cancelled or timed out after schema analysis", zap.Error(tableCtx.Err()))
+				result.SchemaAnalysisError = fmt.Errorf("context error after schema analysis: %w", tableCtx.Err())
 				result.Skipped = true
+				result.SkipReason = "Context cancelled/timed out after schema analysis"
 				return
 			}
 
-			// 2. Execute Table DDL
-			tableStructureDDLs := &SchemaExecutionResult{
-				TableDDL: schemaResult.TableDDL,
-			}
-			if !result.SchemaSyncSkipped && tableStructureDDLs.TableDDL != "" {
+			// --- Tahap 2: Eksekusi DDL Struktur Tabel (CREATE/ALTER) ---
+			if !result.SchemaSyncSkipped && schemaResult != nil && schemaResult.TableDDL != "" {
 				log.Info("Starting table DDL execution (CREATE/ALTER)")
-				schemaErr = f.schemaSyncer.ExecuteDDLs(tableCtx, tbl, tableStructureDDLs)
-				if schemaErr != nil {
-					log.Error("Table DDL execution failed", zap.Error(schemaErr))
-					result.SchemaError = schemaErr
+				tableStructureDDLs := &SchemaExecutionResult{ TableDDL: schemaResult.TableDDL }
+				schemaExecErr := f.schemaSyncer.ExecuteDDLs(tableCtx, tbl, tableStructureDDLs)
+				if schemaExecErr != nil {
+					log.Error("Table DDL execution failed", zap.Error(schemaExecErr))
+					result.SchemaExecutionError = schemaExecErr
 					f.metrics.SyncErrorsTotal.WithLabelValues("schema_execution", tbl).Inc()
 					if !f.cfg.SkipFailedTables {
+						result.Skipped = true
+						result.SkipReason = "Table DDL execution failed (SkipFailedTables=false)"
 						return
 					}
-					result.Skipped = true
-					return
+					log.Warn("Table DDL execution failed (SkipFailedTables=true), attempting to continue with data sync. This might lead to unexpected results if schema is incorrect.")
+				} else {
+					log.Info("Table DDL execution complete")
 				}
-				log.Info("Table DDL execution complete")
+			} else if !result.SchemaSyncSkipped {
+				log.Info("No table structure DDL (CREATE/ALTER) to execute.")
 			}
-
 			if tableCtx.Err() != nil {
-				log.Error("Context cancelled/timed out after DDL execution", zap.Error(tableCtx.Err()))
-				result.SchemaError = tableCtx.Err()
+				log.Error("Context cancelled or timed out after DDL execution", zap.Error(tableCtx.Err()))
+				result.SchemaExecutionError = fmt.Errorf("context error after DDL execution: %w", tableCtx.Err())
 				result.Skipped = true
+				result.SkipReason = "Context cancelled/timed out after DDL execution"
 				return
 			}
 
-			// 3. Data Synchronization
-			pkColumns := schemaResult.PrimaryKeys
-			if len(pkColumns) == 0 && f.cfg.SchemaSyncStrategy != config.SchemaSyncNone {
-				log.Warn("Skipping data sync because no primary key was found and schema sync is enabled.")
-				result.Skipped = true
-				// schema part was ok, but data can't be synced properly.
-				// if schemaResult.TableDDL != "" && result.SchemaError == nil { syncCompletedWithoutError = true } // Consider this scenario. For now, no PK is a non-complete sync.
-				return
+			// --- Tahap 3: Sinkronisasi Data ---
+			pkColumns := []string{}
+			if schemaResult != nil {
+				pkColumns = schemaResult.PrimaryKeys
 			}
-			if len(pkColumns) == 0 && f.cfg.SchemaSyncStrategy == config.SchemaSyncNone {
-				log.Warn("Schema sync is 'none' and no primary key detected. Data sync will attempt full table load without pagination, which is unsafe for large tables!")
-			}
+			shouldSkipData := (result.SchemaExecutionError != nil && !f.cfg.SkipFailedTables)
 
-			log.Info("Starting data synchronization")
-			rows, batches, dataErr := f.syncData(tableCtx, tbl, pkColumns)
-			result.RowsSynced = rows
-			result.Batches = batches
-			if dataErr != nil {
-				log.Error("Data sync failed", zap.Error(dataErr))
-				result.DataError = dataErr
-				f.metrics.SyncErrorsTotal.WithLabelValues("data_sync", tbl).Inc()
-				if !f.cfg.SkipFailedTables {
-					return
+			if !shouldSkipData {
+				if len(pkColumns) == 0 && f.cfg.SchemaSyncStrategy != config.SchemaSyncNone {
+					log.Warn("Data sync requires primary keys for reliable pagination, especially with ALTER/DROP_CREATE strategies. No primary key found/generated.", zap.Strings("retrieved_pks", pkColumns))
+					log.Warn("Proceeding with data sync without primary key (schema strategy is not 'none'). This is risky for large tables or ALTER strategy.")
+				} else if len(pkColumns) == 0 && f.cfg.SchemaSyncStrategy == config.SchemaSyncNone {
+					log.Warn("Schema sync is 'none' and no primary key detected. Data sync will attempt full table load without pagination, which is unsafe for large tables!")
 				}
-				// Don't mark as skipped, some data might have synced
-				return
-			}
-			log.Info("Data synchronization complete")
 
-			if tableCtx.Err() != nil {
-				log.Error("Context cancelled or timed out during/after data sync", zap.Error(tableCtx.Err()))
-				result.DataError = tableCtx.Err()
-				return
-			}
-
-			// 4. Execute Index & Constraint DDLs
-			indexAndConstraintDDLs := &SchemaExecutionResult{
-				IndexDDLs:      schemaResult.IndexDDLs,
-				ConstraintDDLs: schemaResult.ConstraintDDLs,
-			}
-			if !result.SchemaSyncSkipped && (len(indexAndConstraintDDLs.IndexDDLs) > 0 || len(indexAndConstraintDDLs.ConstraintDDLs) > 0) {
-				log.Info("Applying indexes and constraints after data sync")
-				constraintErr := f.schemaSyncer.ExecuteDDLs(tableCtx, tbl, indexAndConstraintDDLs)
-				if constraintErr != nil {
-					log.Error("Failed to apply indexes/constraints after data sync", zap.Error(constraintErr))
-					result.ConstraintError = constraintErr
-					f.metrics.SyncErrorsTotal.WithLabelValues("constraint_apply", tbl).Inc()
+				log.Info("Starting data synchronization")
+				rows, batches, dataErr := f.syncData(tableCtx, tbl, pkColumns)
+				result.RowsSynced = rows
+				result.Batches = batches
+				if dataErr != nil {
+					log.Error("Data sync failed", zap.Error(dataErr))
+					result.DataError = dataErr
+					f.metrics.SyncErrorsTotal.WithLabelValues("data_sync", tbl).Inc()
 					if !f.cfg.SkipFailedTables {
+						result.Skipped = true
+						result.SkipReason = "Data sync failed (SkipFailedTables=false)"
 						return
 					}
-					return
+					log.Warn("Data sync failed (SkipFailedTables=true), attempting to continue with constraint/index application.")
+				} else {
+					log.Info("Data synchronization complete")
 				}
-				log.Info("Indexes and constraints applied successfully")
+			} else {
+				log.Warn("Skipping data synchronization for this table due to previous critical schema errors.", zap.NamedError("schema_exec_error", result.SchemaExecutionError))
 			}
 
 			if tableCtx.Err() != nil {
-				log.Error("Context cancelled or timed out during constraint application", zap.Error(tableCtx.Err()))
-				if result.ConstraintError == nil {
-					result.ConstraintError = tableCtx.Err()
-				}
+				log.Error("Context cancelled or timed out during/after data sync phase", zap.Error(tableCtx.Err()))
+				if result.DataError == nil { result.DataError = fmt.Errorf("context error after data sync phase: %w", tableCtx.Err()) }
+				result.Skipped = true
+				result.SkipReason = "Context cancelled/timed out during/after data sync phase"
 				return
 			}
 
-			syncCompletedWithoutError = true
+			// --- Tahap 4: Eksekusi DDL Indeks & Constraint ---
+			shouldSkipConstraints := ( (result.SchemaExecutionError != nil || result.DataError != nil) && !f.cfg.SkipFailedTables )
+
+			if !result.SchemaSyncSkipped && schemaResult != nil && (len(schemaResult.IndexDDLs) > 0 || len(schemaResult.ConstraintDDLs) > 0) {
+				if shouldSkipConstraints {
+					log.Warn("Skipping constraint/index application due to previous critical schema/data errors.")
+				} else {
+					log.Info("Applying indexes and constraints after data sync")
+					indexAndConstraintDDLs := &SchemaExecutionResult{
+						IndexDDLs:      schemaResult.IndexDDLs,
+						ConstraintDDLs: schemaResult.ConstraintDDLs,
+					}
+					constraintErr := f.schemaSyncer.ExecuteDDLs(tableCtx, tbl, indexAndConstraintDDLs)
+					if constraintErr != nil {
+						log.Error("Failed to apply indexes/constraints after data sync", zap.Error(constraintErr))
+						result.ConstraintExecutionError = constraintErr
+						f.metrics.SyncErrorsTotal.WithLabelValues("constraint_apply", tbl).Inc()
+					} else {
+						log.Info("Indexes and constraints applied successfully")
+					}
+				}
+			} else if !result.SchemaSyncSkipped {
+				log.Info("No index or constraint DDLs to execute.")
+			}
+
+			if tableCtx.Err() != nil {
+				log.Error("Context cancelled or timed out during constraint application phase", zap.Error(tableCtx.Err()))
+				if result.ConstraintExecutionError == nil { result.ConstraintExecutionError = fmt.Errorf("context error during constraint application: %w", tableCtx.Err()) }
+			}
 
 		}(tableName)
 	}
@@ -291,6 +315,8 @@ endloop:
 		wg.Wait()
 		close(resultChan)
 		close(sem)
+		// PERBAIKAN: Gunakan f.logger
+		f.logger.Debug("All table processing goroutines finished.")
 	}()
 
 	for res := range resultChan {
@@ -299,7 +325,7 @@ endloop:
 
 	f.logger.Info("Full synchronization run finished",
 		zap.Duration("total_duration", time.Since(startTime)),
-		zap.Int("total_tables_processed", len(results)),
+		zap.Int("total_tables_processed_or_skipped", len(results)),
 	)
 	f.metrics.SyncDuration.Observe(time.Since(startTime).Seconds())
 
@@ -310,89 +336,86 @@ endloop:
 func (f *FullSync) syncData(ctx context.Context, table string, pkColumns []string) (totalRowsSynced int64, batches int, err error) {
 	log := f.logger.With(zap.String("table", table), zap.Strings("pk_columns", pkColumns))
 
-	// --- Get Total Rows (for progress logging, optional but recommended) ---
 	var totalRows int64 = -1
-	// Gunakan ctx dari parameter fungsi sebagai parent.
-	// Jika ctx (misalnya dari TABLE_TIMEOUT) dibatalkan, query hitung juga akan dibatalkan.
-	countCtx, countCancel := context.WithTimeout(ctx, 15*time.Second) // Timeout 15 detik spesifik untuk query hitung
-
+	countCtx, countCancel := context.WithTimeout(ctx, 15*time.Second)
 	countErr := f.srcConn.DB.WithContext(countCtx).Table(table).Count(&totalRows).Error
-	countCancel() // Selalu panggil cancel setelah query selesai atau timeout
+	countCancel()
 
 	if countErr != nil {
-		// Cek jenis error untuk logging yang lebih informatif
-		if countErr == context.DeadlineExceeded { // Jika errornya adalah timeout dari countCtx sendiri
-			log.Warn("Counting total source rows timed out",
-				zap.Duration("count_query_timeout", 15*time.Second),
-				zap.Error(countErr),
-			)
-		} else if ctx.Err() == context.Canceled { // Jika ctx utama yang dibatalkan (misal TABLE_TIMEOUT atau SIGINT)
-			log.Warn("Counting total source rows cancelled by main table context",
-				zap.NamedError("main_context_error", ctx.Err()),
-				zap.NamedError("count_query_error_if_any", countErr),
-			)
-		} else { // Error lain dari database saat Count
-			log.Warn("Could not count total source rows for progress tracking due to DB error",
-				zap.Error(countErr),
-			)
+		logFields := []zap.Field{zap.Error(countErr)}
+		if errors.Is(countErr, context.DeadlineExceeded) {
+			logFields = append(logFields, zap.Duration("count_query_timeout", 15*time.Second))
+			log.Warn("Counting total source rows timed out.", logFields...)
+		} else if errors.Is(ctx.Err(), context.Canceled) {
+			logFields = append(logFields, zap.NamedError("main_context_error", ctx.Err()))
+			log.Warn("Counting total source rows cancelled by main table context.", logFields...)
+		} else if countErr == gorm.ErrRecordNotFound {
+			log.Debug("Source table appears empty based on Count().")
+			totalRows = 0
+		} else {
+			log.Warn("Could not count total source rows for progress tracking due to DB error.", logFields...)
 		}
-		// Kegagalan count tidak fatal untuk data sync, jadi jangan return error di sini.
 	} else {
-		log.Debug("Total source rows to sync", zap.Int64("count", totalRows))
+		log.Info("Approximate total source rows to sync", zap.Int64("count", totalRows))
 	}
 
-	// --- Determine Order By Clause ---
+
 	var orderByClause string
 	var quotedPKColumns, pkPlaceholders []string
-	var sortErr error
 	canPaginate := len(pkColumns) > 0
 	if canPaginate {
+		var sortErr error
 		orderByClause, quotedPKColumns, pkPlaceholders, sortErr = f.buildPaginationClauses(pkColumns, f.srcConn.Dialect)
 		if sortErr != nil {
-			return 0, 0, fmt.Errorf("failed to build pagination clauses: %w", sortErr)
+			return 0, 0, fmt.Errorf("failed to build pagination clauses for table '%s': %w", table, sortErr)
 		}
 		log.Debug("Using pagination", zap.String("order_by", orderByClause))
 	} else {
-		log.Warn("No primary key found - attempting full table load without pagination (unsafe for large tables)")
-		orderByClause = "" // No order needed if loading all at once
+		log.Warn("No primary key provided/found - attempting full table load without pagination. This is potentially unsafe and slow for large tables!")
+		orderByClause = ""
 	}
 
-	// --- Pagination/Load Loop ---
+	var revertFunc func() error
+	if f.cfg.DisableFKDuringSync {
+		var disableErr error
+		revertFunc, disableErr = f.toggleForeignKeys(ctx, f.dstConn, false, log)
+		if disableErr != nil {
+			log.Error("Attempt to disable foreign keys before data sync failed, proceeding anyway...", zap.Error(disableErr))
+		}
+		if revertFunc != nil {
+			defer func() {
+				log.Info("Attempting to re-enable foreign keys after data sync attempt")
+				revertCtx, revertCancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer revertCancel()
+				enableErr := f.revertFKsWithContext(revertCtx, revertFunc)
+				if enableErr != nil {
+					log.Error("Failed to re-enable foreign keys after data sync", zap.Error(enableErr))
+				} else {
+					log.Info("Foreign keys re-enabled/reverted successfully")
+				}
+			}()
+		}
+	}
+
 	var lastPKValues []interface{}
 	totalRowsSynced = 0
 	batches = 0
 	progressLogThreshold := 100
 	noDataCounter := 0
 
-	// --- Attempt to Disable FKs during data load (EXPERIMENTAL) ---
-	fkReEnableFunc, disableErr := f.toggleForeignKeys(ctx, f.dstConn, false, log)
-	if disableErr != nil {
-		log.Error("Attempt to disable foreign keys before data sync failed, proceeding anyway...", zap.Error(disableErr))
-	}
-	if fkReEnableFunc != nil {
-		defer func() {
-			log.Info("Attempting to re-enable foreign keys after data sync attempt")
-			revertCtx, revertCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer revertCancel()
-			enableErr := f.revertFKsWithContext(revertCtx, fkReEnableFunc)
-			if enableErr != nil {
-				log.Error("Failed to re-enable foreign keys after data sync", zap.Error(enableErr))
-			} else {
-				log.Info("Foreign keys re-enabled successfully")
-			}
-		}()
-	}
-
 	for {
-		if ctx.Err() != nil {
-			log.Warn("Context cancelled during data sync loop", zap.Error(ctx.Err()))
-			return totalRowsSynced, batches, ctx.Err()
+		if err := ctx.Err(); err != nil {
+			log.Warn("Context cancelled during data sync loop", zap.Error(err))
+			return totalRowsSynced, batches, err
 		}
 
 		var batch []map[string]interface{}
 		query := f.srcConn.DB.WithContext(ctx).Table(table)
 
 		if canPaginate && lastPKValues != nil {
+			if len(quotedPKColumns) == 0 || len(pkPlaceholders) == 0 {
+				return totalRowsSynced, batches, fmt.Errorf("internal error: pagination columns/placeholders not initialized for table '%s'", table)
+			}
 			whereClause, args := f.buildWhereClause(quotedPKColumns, pkPlaceholders, lastPKValues)
 			log.Debug("Applying WHERE clause for next page", zap.String("clause", whereClause), zap.Any("args", args))
 			query = query.Where(whereClause, args...)
@@ -403,81 +426,92 @@ func (f *FullSync) syncData(ctx context.Context, table string, pkColumns []strin
 		}
 		query = query.Limit(f.cfg.BatchSize)
 
-		log.Debug("Fetching next batch")
+		log.Debug("Fetching next batch from source", zap.Int("limit", f.cfg.BatchSize))
 		fetchStartTime := time.Now()
 		fetchErr := query.Find(&batch).Error
 		fetchDuration := time.Since(fetchStartTime)
-		log.Debug("Batch fetch complete", zap.Duration("fetch_duration", fetchDuration), zap.Int("rows_fetched", len(batch)))
 
 		if fetchErr != nil {
 			log.Error("Failed to fetch data batch from source", zap.Error(fetchErr))
-			return totalRowsSynced, batches, fmt.Errorf("failed to fetch batch from %s: %w", table, fetchErr)
+			return totalRowsSynced, batches, fmt.Errorf("failed to fetch batch from '%s': %w", table, fetchErr)
 		}
 
-		if len(batch) == 0 {
+		rowsFetched := len(batch)
+		log.Debug("Batch fetch complete", zap.Duration("fetch_duration", fetchDuration), zap.Int("rows_fetched", rowsFetched))
+
+
+		if rowsFetched == 0 {
 			if lastPKValues == nil && totalRowsSynced == 0 {
 				log.Info("Source table is empty or first fetch returned no data.")
 			} else {
-				log.Debug("No more data found in source table for this page.")
+				log.Info("No more data found in source table for this page or table completed.")
 			}
 			if canPaginate && lastPKValues != nil {
 				noDataCounter++
-				if noDataCounter > 3 {
-					log.Error("Potential pagination issue: Multiple empty batches received consecutively.", zap.Any("last_pk_values", lastPKValues))
-					return totalRowsSynced, batches, fmt.Errorf("potential pagination issue: multiple empty batches received for table %s", table)
+				if noDataCounter >= 3 {
+					log.Error("Potential pagination issue: Multiple consecutive empty batches received.",
+						zap.Any("last_pk_values", lastPKValues))
+					return totalRowsSynced, batches, fmt.Errorf("potential pagination issue: multiple empty batches received for table '%s' after syncing %d rows", table, totalRowsSynced)
 				}
 			}
 			break
 		}
 		noDataCounter = 0
 
-		log.Debug("Syncing batch to destination", zap.Int("rows_in_batch", len(batch)))
+		log.Debug("Syncing batch to destination", zap.Int("rows_in_batch", rowsFetched))
 		syncBatchStartTime := time.Now()
 		batchErr := f.syncBatchWithRetry(ctx, table, batch)
 		syncDuration := time.Since(syncBatchStartTime)
 		log.Debug("Batch sync attempt complete", zap.Duration("sync_duration", syncDuration))
 
 		if batchErr != nil {
-			return totalRowsSynced, batches, fmt.Errorf("failed to sync batch to %s: %w", table, batchErr)
+			return totalRowsSynced, batches, fmt.Errorf("failed to sync batch to table '%s': %w", table, batchErr)
 		}
 
 		batches++
-		batchSize := int64(len(batch))
-		totalRowsSynced += batchSize
+		batchSizeSynced := int64(rowsFetched)
+		totalRowsSynced += batchSizeSynced
+		f.metrics.RowsSyncedTotal.WithLabelValues(table).Add(float64(batchSizeSynced))
 
 		if canPaginate {
-			lastRow := batch[len(batch)-1]
-			sortedPKNames, _ := f.getSortedPKNames(pkColumns)
+			lastRow := batch[rowsFetched-1]
+			sortedPKNames, sortErr := f.getSortedPKNames(pkColumns)
+			if sortErr != nil {
+				return totalRowsSynced, batches, fmt.Errorf("failed to get sorted PK names for pagination update in table '%s': %w", table, sortErr)
+			}
+
 			newLastPKValues := make([]interface{}, len(sortedPKNames))
 			pkFound := true
+			missingPK := "" // Simpan nama PK yang hilang untuk logging
 			for i, pkName := range sortedPKNames {
 				val, ok := lastRow[pkName]
 				if !ok {
-					log.Error("PK column missing in fetched data", zap.String("missing_pk", pkName))
+					log.Error("Primary key column missing in fetched source data, cannot continue pagination reliably.", zap.String("missing_pk_column", pkName))
 					pkFound = false
+					missingPK = pkName // Simpan nama yang hilang
 					break
 				}
 				newLastPKValues[i] = val
 			}
 			if !pkFound {
-				return totalRowsSynced, batches, fmt.Errorf("PK column missing in fetched data for %s", table)
+				return totalRowsSynced, batches, fmt.Errorf("PK column '%s' missing in fetched data for table '%s', stopping sync", missingPK, table)
 			}
 			lastPKValues = newLastPKValues
 		} else {
-			log.Info("Full table load complete (no pagination).")
+			log.Info("Full table load completed in a single batch (no pagination).")
 			break
 		}
 
-		if batches%progressLogThreshold == 0 || (totalRows > 0 && totalRowsSynced >= totalRows) {
+		if batches%progressLogThreshold == 0 || (totalRows >= 0 && totalRowsSynced >= totalRows && rowsFetched > 0) {
 			progressPercent := -1.0
 			if totalRows > 0 {
 				progressPercent = (float64(totalRowsSynced) / float64(totalRows)) * 100
 			}
 			log.Info("Data sync progress",
-				zap.Int("batch_num", batches),
-				zap.Int64("rows_synced_cumulative", totalRowsSynced),
-				zap.Int64("total_rows_approx", totalRows),
-				zap.Float64("progress_percent_approx", progressPercent),
+				zap.Int("batch_number", batches),
+				zap.Int64("cumulative_rows_synced", totalRowsSynced),
+				zap.Int64("approx_total_rows", totalRows),
+				zap.Float64("approx_progress_percent", progressPercent),
 			)
 		}
 	}
@@ -486,9 +520,13 @@ func (f *FullSync) syncData(ctx context.Context, table string, pkColumns []strin
 	return totalRowsSynced, batches, nil
 }
 
-// syncBatchWithRetry attempts to insert a batch with retry logic.
+// syncBatchWithRetry attempts to insert/upsert a batch with retry logic.
 func (f *FullSync) syncBatchWithRetry(ctx context.Context, table string, batch []map[string]interface{}) error {
 	log := f.logger.With(zap.String("table", table), zap.Int("batch_size", len(batch)))
+	if len(batch) == 0 {
+		log.Debug("syncBatchWithRetry called with empty batch, skipping.")
+		return nil
+	}
 	var lastErr error
 	batchStartTime := time.Now()
 	statusLabel := "failure_unknown"
@@ -496,7 +534,6 @@ func (f *FullSync) syncBatchWithRetry(ctx context.Context, table string, batch [
 	defer func() {
 		f.metrics.BatchProcessingDuration.WithLabelValues(table, statusLabel).Observe(time.Since(batchStartTime).Seconds())
 		if strings.HasPrefix(statusLabel, "success") {
-			f.metrics.RowsSyncedTotal.WithLabelValues(table).Add(float64(len(batch)))
 			f.metrics.BatchesProcessedTotal.WithLabelValues(table).Inc()
 		} else {
 			f.metrics.BatchErrorsTotal.WithLabelValues(table).Inc()
@@ -505,92 +542,110 @@ func (f *FullSync) syncBatchWithRetry(ctx context.Context, table string, batch [
 
 	for attempt := 0; attempt <= f.cfg.MaxRetries; attempt++ {
 		if attempt > 0 {
-			log.Warn("Retrying batch insert", zap.Int("attempt", attempt+1), zap.Int("max_attempts", f.cfg.MaxRetries+1), zap.Duration("retry_interval", f.cfg.RetryInterval), zap.Error(lastErr))
+			log.Warn("Retrying batch insert/upsert",
+				zap.Int("attempt", attempt+1),
+				zap.Int("max_attempts", f.cfg.MaxRetries+1),
+				zap.Duration("retry_interval", f.cfg.RetryInterval),
+				zap.NamedError("previous_error", lastErr))
+
 			timer := time.NewTimer(f.cfg.RetryInterval)
 			select {
 			case <-timer.C:
 			case <-ctx.Done():
 				timer.Stop()
 				log.Error("Context cancelled during batch insert retry wait", zap.Error(ctx.Err()))
-				statusLabel = "failure_context_cancelled"
-				return fmt.Errorf("context cancelled waiting to retry batch insert for %s (attempt %d): %w; last error: %v", table, attempt+1, ctx.Err(), lastErr)
+				statusLabel = "failure_context_cancelled_retry"
+				return fmt.Errorf("context cancelled waiting to retry batch insert for table '%s' (attempt %d): %w; last db error: %v", table, attempt+1, ctx.Err(), lastErr)
 			}
 		}
 
 		txErr := f.dstConn.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			// Gunakan CreateInBatches dengan ukuran batch sama dengan panjang slice `batch`
-			// karena kita ingin seluruh `batch` ini masuk dalam satu transaksi (jika memungkinkan)
-			// atau di-handle oleh GORM sesuai konfigurasinya.
-			// Panjang `batch` ini dikontrol oleh `f.cfg.BatchSize` di `syncData`.
-			// Jika `batch` lebih kecil dari `f.cfg.BatchSize` (misalnya, batch terakhir), itu juga OK.
-			return tx.Clauses(clause.OnConflict{UpdateAll: true}).Table(table).CreateInBatches(batch, len(batch)).Error
+			return tx.Table(table).Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(batch, len(batch)).Error
 		})
 
 		if txErr == nil {
 			statusLabel = "success"
 			if attempt > 0 {
 				statusLabel = "success_retry"
-				log.Info("Batch insert succeeded after retry", zap.Int("attempt", attempt+1))
+				log.Info("Batch insert/upsert succeeded after retry", zap.Int("attempt", attempt+1))
+			} else {
+				log.Debug("Batch insert/upsert succeeded on first attempt.")
 			}
 			return nil
 		}
 		lastErr = txErr
 
-		if ctx.Err() != nil {
-			log.Error("Context cancelled during/after batch transaction attempt", zap.Error(ctx.Err()), zap.Int("attempt", attempt+1), zap.NamedError("transaction_error", lastErr))
-			statusLabel = "failure_context_cancelled"
-			return fmt.Errorf("context cancelled during batch insert for %s (attempt %d): %w; last db error: %v", table, attempt+1, ctx.Err(), lastErr)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			log.Error("Context cancelled during/after batch transaction attempt",
+				zap.Error(ctxErr),
+				zap.Int("attempt", attempt+1),
+				zap.NamedError("transaction_error", lastErr))
+			statusLabel = "failure_context_cancelled_tx"
+			return fmt.Errorf("context cancelled during batch insert for table '%s' (attempt %d): %w; last db error: %v", table, attempt+1, ctxErr, lastErr)
 		}
-		log.Warn("Batch insert attempt failed", zap.Int("attempt", attempt+1), zap.Error(lastErr))
+		log.Warn("Batch insert/upsert attempt failed", zap.Int("attempt", attempt+1), zap.Error(lastErr))
+
 	}
 
-	log.Error("Batch insert failed after maximum retries", zap.Int("max_retries", f.cfg.MaxRetries), zap.Error(lastErr))
+	log.Error("Batch insert/upsert failed after maximum retries",
+		zap.Int("max_retries", f.cfg.MaxRetries),
+		zap.NamedError("final_error", lastErr))
 	statusLabel = "failure_max_retries"
-	return fmt.Errorf("failed to insert batch into %s after %d retries: %w", table, f.cfg.MaxRetries, lastErr)
+	return fmt.Errorf("failed to insert/upsert batch into table '%s' after %d retries: %w", table, f.cfg.MaxRetries, lastErr)
 }
+
 
 // listTables retrieves a list of non-system tables from the source database.
 func (f *FullSync) listTables(ctx context.Context) ([]string, error) {
 	var tables []string
 	var err error
-	dbName := f.cfg.SrcDB.DBName
+	dbCfg := f.cfg.SrcDB
 	dialect := f.srcConn.Dialect
-	log := f.logger.With(zap.String("dialect", dialect), zap.String("database", dbName))
-	log.Info("Listing user tables")
+	log := f.logger.With(zap.String("dialect", dialect), zap.String("database", dbCfg.DBName), zap.String("action", "listTables"))
+	log.Info("Listing user tables from source database")
+
+	db := f.srcConn.DB.WithContext(ctx)
 
 	switch dialect {
 	case "mysql":
-		query := `SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_type = 'BASE TABLE' ORDER BY table_name`
-		err = f.srcConn.DB.WithContext(ctx).Raw(query, dbName).Scan(&tables).Error
+		query := `SELECT table_name FROM information_schema.tables
+				  WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'
+				  AND table_name NOT IN ('sys_config')
+				  ORDER BY table_name`
+		err = db.Raw(query).Scan(&tables).Error
 	case "postgres":
-		query := `SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' ORDER BY table_name`
-		err = f.srcConn.DB.WithContext(ctx).Raw(query).Scan(&tables).Error
+		query := `SELECT table_name FROM information_schema.tables
+				  WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
+				  AND table_name NOT LIKE 'pg_%'
+				  AND table_name NOT LIKE 'sql_%'
+				  ORDER BY table_name`
+		err = db.Raw(query).Scan(&tables).Error
 	case "sqlite":
-		query := `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`
-		err = f.srcConn.DB.WithContext(ctx).Raw(query).Scan(&tables).Error
+		query := `SELECT name FROM sqlite_master
+				  WHERE type='table' AND name NOT LIKE 'sqlite_%'
+				  ORDER BY name`
+		err = db.Raw(query).Scan(&tables).Error
 	default:
 		return nil, fmt.Errorf("unsupported dialect for listing tables: %s", dialect)
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to list tables for %s (%s): %w", dbName, dialect, err)
+		if ctx.Err() != nil {
+			log.Error("Context cancelled during table listing", zap.Error(ctx.Err()), zap.NamedError("db_error", err))
+			return nil, ctx.Err()
+		}
+		log.Error("Failed to execute list tables query", zap.Error(err))
+		return nil, fmt.Errorf("failed to list tables for database '%s' (%s): %w", dbCfg.DBName, dialect, err)
 	}
 
-	tempSchemaSyncer := NewSchemaSyncer(nil, nil, dialect, "", log)
-	filteredTables := make([]string, 0, len(tables))
-	for _, tbl := range tables {
-		if !tempSchemaSyncer.isSystemTable(tbl, dialect) {
-			filteredTables = append(filteredTables, tbl)
-		} else {
-			log.Debug("Filtered out potential system table", zap.String("table", tbl))
-		}
-	}
-	return filteredTables, nil
+	log.Debug("Table listing successful", zap.Int("table_count", len(tables)))
+	return tables, nil
 }
 
+// getSortedPKNames mengurutkan nama kolom PK secara alfabetis.
 func (f *FullSync) getSortedPKNames(pkColumns []string) ([]string, error) {
 	if len(pkColumns) == 0 {
-		return nil, fmt.Errorf("no primary key columns provided for sorting")
+		return []string{}, nil
 	}
 	sortedPKs := make([]string, len(pkColumns))
 	copy(sortedPKs, pkColumns)
@@ -598,12 +653,14 @@ func (f *FullSync) getSortedPKNames(pkColumns []string) ([]string, error) {
 	return sortedPKs, nil
 }
 
+// buildPaginationClauses membangun klausa ORDER BY dan placeholder WHERE.
 func (f *FullSync) buildPaginationClauses(pkColumns []string, dialect string) (orderBy string, quotedPKs []string, placeholders []string, err error) {
 	if len(pkColumns) == 0 {
 		err = fmt.Errorf("cannot build pagination clauses without primary keys")
 		return
 	}
 	sortedPKs, _ := f.getSortedPKNames(pkColumns)
+
 	quotedPKs = make([]string, len(sortedPKs))
 	placeholders = make([]string, len(sortedPKs))
 	orderByParts := make([]string, len(sortedPKs))
@@ -616,9 +673,21 @@ func (f *FullSync) buildPaginationClauses(pkColumns []string, dialect string) (o
 	return
 }
 
+// buildWhereClause membangun klausa WHERE untuk keyset pagination.
 func (f *FullSync) buildWhereClause(quotedSortedPKs []string, placeholders []string, lastPKValues []interface{}) (string, []interface{}) {
 	if len(quotedSortedPKs) == 1 {
 		return fmt.Sprintf("%s > ?", quotedSortedPKs[0]), lastPKValues
+	}
+	if len(quotedSortedPKs) != len(placeholders) || len(quotedSortedPKs) != len(lastPKValues) {
+		f.logger.Error("Mismatch in PK count for building composite WHERE clause",
+			zap.Int("pk_count", len(quotedSortedPKs)),
+			zap.Int("placeholder_count", len(placeholders)),
+			zap.Int("value_count", len(lastPKValues)))
+		// Fallback - ini kemungkinan besar akan salah
+		if len(lastPKValues) > 0 {
+			return fmt.Sprintf("%s > ?", quotedSortedPKs[0]), []interface{}{lastPKValues[0]}
+		}
+		return "1=0", []interface{}{} // Klausa yang selalu false
 	}
 	whereTuple := fmt.Sprintf("(%s)", strings.Join(quotedSortedPKs, ", "))
 	placeholderTuple := fmt.Sprintf("(%s)", strings.Join(placeholders, ", "))
@@ -626,46 +695,59 @@ func (f *FullSync) buildWhereClause(quotedSortedPKs []string, placeholders []str
 	return whereClause, lastPKValues
 }
 
+// revertFKsWithContext memanggil fungsi revert dengan context.
 func (f *FullSync) revertFKsWithContext(ctx context.Context, revertFunc func() error) error {
-	// Idealnya, revertFunc akan menerima context. Jika tidak, kita bisa lakukan ini.
-	// Namun, dalam implementasi toggleForeignKeys, revertFunc sudah menggunakan context internal.
 	if revertFunc == nil {
 		return nil
 	}
+	done := make(chan error, 1)
+	go func() {
+		done <- revertFunc()
+	}()
 
-	// Jika revertFunc tidak menerima context, kita bisa buat goroutine dan select
-	// ch := make(chan error, 1)
-	// go func() {
-	// 	ch <- revertFunc()
-	// }()
-	// select {
-	// case err := <-ch:
-	// 	return err
-	// case <-ctx.Done():
-	// 	return fmt.Errorf("revert FKs cancelled: %w", ctx.Err())
-	// }
-	// Karena revertFunc kita sudah pakai context internal, panggil langsung saja.
-	return revertFunc()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		f.logger.Error("Context cancelled while waiting for FK revert function to complete.", zap.Error(ctx.Err()))
+		return fmt.Errorf("revert FKs cancelled by external context: %w", ctx.Err())
+	}
 }
 
+
+// toggleForeignKeys menonaktifkan atau mengaktifkan kembali foreign key checks/triggers.
 func (f *FullSync) toggleForeignKeys(ctx context.Context, conn *db.Connector, enable bool, log *zap.Logger) (revertFunc func() error, err error) {
-	if !f.cfg.DisableFKDuringSync {
+	if !f.cfg.DisableFKDuringSync && !enable {
+		return nil, nil
+	}
+	if enable && !f.cfg.DisableFKDuringSync {
 		return nil, nil
 	}
 
 	var disableCmd, enableCmd, initialStateCmd, revertCmd string
 	var initialState interface{} = nil
 	var stateStr string
+	var requiresTx bool = false
 
-	switch conn.Dialect {
+	dialect := conn.Dialect
+	log = log.With(zap.String("dialect", dialect))
+
+	switch dialect {
 	case "mysql":
 		initialStateCmd = "SELECT @@FOREIGN_KEY_CHECKS"
 		disableCmd = "SET FOREIGN_KEY_CHECKS = 0;"
+		enableCmd = "SET FOREIGN_KEY_CHECKS = %v;"
 	case "postgres":
 		initialStateCmd = "SHOW session_replication_role"
 		disableCmd = "SET session_replication_role = replica;"
+		enableCmd = "SET session_replication_role = '%s';"
+	case "sqlite":
+		initialStateCmd = "PRAGMA foreign_keys;"
+		disableCmd = "PRAGMA foreign_keys = OFF;"
+		enableCmd = "PRAGMA foreign_keys = %v;"
+		log.Warn("Toggling foreign keys via PRAGMA in SQLite might only affect the current connection, its effectiveness with connection pools needs verification.")
 	default:
-		log.Debug("Foreign key toggling not supported for dialect", zap.String("dialect", conn.Dialect))
+		log.Debug("Foreign key toggling not supported for dialect.")
 		return nil, nil
 	}
 
@@ -674,56 +756,95 @@ func (f *FullSync) toggleForeignKeys(ctx context.Context, conn *db.Connector, en
 		errRead := conn.DB.WithContext(readCtx).Raw(initialStateCmd).Scan(&stateStr).Error
 		readCancel()
 		if errRead != nil {
-			log.Warn("Could not read initial FK/replication state, assuming default", zap.Error(errRead))
-			if conn.Dialect == "mysql" {
-				initialState = "1"
-			} else if conn.Dialect == "postgres" {
-				initialState = "origin"
-			}
+			log.Warn("Could not read initial FK/replication state, assuming default for revert.", zap.Error(errRead))
+			if dialect == "mysql" { initialState = 1 }
+			if dialect == "postgres" { initialState = "origin" }
+			if dialect == "sqlite" { initialState = 1 }
 		} else {
-			initialState = stateStr
-			log.Debug("Read initial FK/replication state", zap.String("state", stateStr), zap.String("dialect", conn.Dialect))
+			log.Info("Read initial FK/replication state.", zap.String("state", stateStr))
+			if dialect == "mysql" || dialect == "sqlite" {
+				// PERBAIKAN: Gunakan strconv
+				initialStateInt, convErr := strconv.Atoi(stateStr)
+				if convErr == nil {
+					initialState = initialStateInt
+				} else {
+					log.Warn("Could not convert initial state to int, using raw string for revert.", zap.String("state", stateStr), zap.Error(convErr))
+					initialState = stateStr
+				}
+			} else {
+				initialState = stateStr
+			}
 		}
 	} else {
-		if conn.Dialect == "mysql" {
-			initialState = "1"
-		} else if conn.Dialect == "postgres" {
-			initialState = "origin"
+		if dialect == "mysql" { initialState = 1 }
+		if dialect == "postgres" { initialState = "origin" }
+		if dialect == "sqlite" { initialState = 1 }
+		log.Warn("No command to read initial FK state, assuming default for revert.", zap.Any("assumed_initial_state", initialState))
+	}
+
+	if dialect == "mysql" || dialect == "sqlite" {
+		stateVal := 1
+		if stateInt, ok := initialState.(int); ok {
+			stateVal = stateInt
+		} else if stateStr, ok := initialState.(string); ok {
+			// PERBAIKAN: Gunakan strconv
+			stateIntConv, convErr := strconv.Atoi(stateStr)
+			if convErr == nil { stateVal = stateIntConv }
 		}
+		enableCmd = fmt.Sprintf(enableCmd, stateVal)
+	} else {
+		stateVal := "origin"
+		if stateStr, ok := initialState.(string); ok {
+			stateVal = stateStr
+		}
+		enableCmd = fmt.Sprintf(enableCmd, stateVal)
 	}
 
-	if conn.Dialect == "mysql" {
-		enableCmd = fmt.Sprintf("SET FOREIGN_KEY_CHECKS = %v;", initialState)
-	} else if conn.Dialect == "postgres" {
-		enableCmd = fmt.Sprintf("SET session_replication_role = '%v';", initialState)
-	}
-
-	targetCmd := disableCmd
-	revertCmd = enableCmd
+	var targetCmd string
 	action := "Disabling"
 	if enable {
 		targetCmd = enableCmd
 		revertCmd = disableCmd
-		action = "Enabling"
+		action = "Enabling (Reverting)"
+	} else {
+		targetCmd = disableCmd
+		revertCmd = enableCmd
+		action = "Disabling"
 	}
 
-	log.Info(action+" foreign key checks/triggers", zap.String("dialect", conn.Dialect), zap.String("command_being_executed", targetCmd))
-	execCtx, execCancel := context.WithTimeout(ctx, 5*time.Second)
-	execErr := conn.DB.WithContext(execCtx).Exec(targetCmd).Error
+	log.Info(action+" foreign key checks/triggers", zap.String("command_being_executed", targetCmd))
+	execCtx, execCancel := context.WithTimeout(ctx, 10*time.Second)
+	var execErr error
+	if requiresTx {
+		execErr = conn.DB.WithContext(execCtx).Transaction(func(tx *gorm.DB) error {
+			return tx.Exec(targetCmd).Error
+		})
+	} else {
+		execErr = conn.DB.WithContext(execCtx).Exec(targetCmd).Error
+	}
 	execCancel()
+
 	if execErr != nil {
 		return nil, fmt.Errorf("failed to execute '%s': %w", targetCmd, execErr)
 	}
 
 	revertFunc = func() error {
-		revertCtxInternal, revertCancelInternal := context.WithTimeout(context.Background(), 10*time.Second)
+		revertCtxInternal, revertCancelInternal := context.WithTimeout(context.Background(), 15*time.Second)
 		defer revertCancelInternal()
-		log.Info("Reverting foreign key checks/triggers state", zap.String("dialect", conn.Dialect), zap.String("command_being_executed", revertCmd))
-		revertErr := conn.DB.WithContext(revertCtxInternal).Exec(revertCmd).Error
-		if revertErr != nil {
-			return fmt.Errorf("failed to execute revert command '%s': %w", revertCmd, revertErr)
+		log.Info("Executing revert command for foreign key checks/triggers", zap.String("revert_command", revertCmd))
+		var revertExecErr error
+		if requiresTx {
+			revertExecErr = conn.DB.WithContext(revertCtxInternal).Transaction(func(tx *gorm.DB) error {
+				return tx.Exec(revertCmd).Error
+			})
+		} else {
+			revertExecErr = conn.DB.WithContext(revertCtxInternal).Exec(revertCmd).Error
+		}
+		if revertExecErr != nil {
+			return fmt.Errorf("failed to execute revert command '%s': %w", revertCmd, revertExecErr)
 		}
 		return nil
 	}
+
 	return revertFunc, nil
 }

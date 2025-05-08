@@ -10,22 +10,18 @@ import (
 )
 
 // generateModifyColumnDDLs generates one or more ALTER statements for column modification.
-// Ini sekarang menjadi dispatcher ke fungsi spesifik dialek.
+// Ini adalah dispatcher ke fungsi spesifik dialek.
+// (Implementasi ini sudah kita review sebelumnya dan tampak baik)
 func (s *SchemaSyncer) generateModifyColumnDDLs(table string, src, dst ColumnInfo, log *zap.Logger) []string {
 	// Dapatkan perbedaan dulu (menggunakan fungsi dari compare_columns.go)
-	// getColumnModifications adalah method dari *SchemaSyncer
 	diffs := s.getColumnModifications(src, dst, log) // `s` sudah menjadi receiver di sini
 
 	if len(diffs) == 0 {
-		// Tidak perlu log di sini karena pemanggil (generateAlterDDLs) akan log jika tidak ada DDL
 		return []string{}
 	}
 
-	// Gunakan logger dari parameter fungsi, yang sudah di-scope dengan benar oleh pemanggil
+	// Gunakan logger dari parameter fungsi, yang sudah di-scope
 	log.Info("Generating ALTER COLUMN DDL(s) due to detected differences.",
-		// table dan column sudah ada di scope logger dari pemanggil (generateAlterDDLs)
-		// zap.String("table", table),
-		// zap.String("column", src.Name),
 		zap.String("dst_dialect", s.dstDialect),
 		zap.Strings("modifications_detected", diffs),
 	)
@@ -47,90 +43,143 @@ func (s *SchemaSyncer) generateModifyColumnDDLs(table string, src, dst ColumnInf
 
 // generateAddColumnDDL generates ALTER TABLE ... ADD COLUMN ...
 func (s *SchemaSyncer) generateAddColumnDDL(table string, col ColumnInfo) (string, error) {
-	log := s.logger.With(zap.String("table", table), zap.String("column", col.Name), zap.String("action", "ADD COLUMN")) // Gunakan s.logger
+	// Logger sudah di-scope oleh pemanggil (generateAlterDDLs)
+	log := s.logger.With(zap.String("table", table), zap.String("column", col.Name), zap.String("action", "ADD COLUMN"))
 
-	if col.IsGenerated {
-		log.Warn("Generating ADD COLUMN DDL for a generated column. Ensure expression is part of dialect-specific definition.")
-	}
+	// MappedType seharusnya sudah diisi oleh pemanggil (populateMappedTypesForSourceColumns)
 	if col.MappedType == "" && !col.IsGenerated {
-		return "", fmt.Errorf("cannot generate ADD COLUMN DDL for column '%s': MappedType is missing", col.Name)
+		errMsg := fmt.Sprintf("cannot generate ADD COLUMN DDL for non-generated column '%s': MappedType is missing", col.Name)
+		log.Error(errMsg)
+		return "", fmt.Errorf(errMsg)
+	}
+	if col.IsGenerated {
+		// Perlu penanganan spesifik dialek untuk sintaks GENERATED AS
+		log.Warn("Generating ADD COLUMN DDL for a generated column. Dialect-specific syntax for GENERATED AS expression is complex and might require manual adjustment or is not fully supported by dbsync.",
+			zap.String("target_type", col.MappedType))
+		// mapColumnDefinition akan mencoba membuat definisi dasar, tapi mungkin perlu disesuaikan.
 	}
 
+	// Dapatkan definisi kolom lengkap dari mapColumnDefinition
+	// (mapColumnDefinition ada di schema_ddl_create.go atau file ini jika dipindah)
 	colDef, err := s.mapColumnDefinition(col)
 	if err != nil {
-		return "", fmt.Errorf("failed to map column definition for ADD COLUMN '%s': %w", col.Name, err)
+		errMsg := fmt.Sprintf("failed to map column definition for ADD COLUMN '%s': %v", col.Name, err)
+		log.Error(errMsg)
+		return "", fmt.Errorf(errMsg)
 	}
 
 	quotedTable := utils.QuoteIdentifier(table, s.dstDialect)
 
+	// Sintaks ADD COLUMN umumnya sama untuk dialek yang didukung
 	switch s.dstDialect {
 	case "mysql", "postgres", "sqlite":
-		return fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s;", quotedTable, colDef), nil
+		// SQLite mendukung ADD COLUMN.
+		// IF NOT EXISTS tidak standar untuk ADD COLUMN.
+		ddl := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s;", quotedTable, colDef)
+		log.Debug("Generated ADD COLUMN DDL.", zap.String("ddl", ddl))
+		return ddl, nil
 	default:
-		return "", fmt.Errorf("unsupported destination dialect '%s' for ADD COLUMN", s.dstDialect)
+		errMsg := fmt.Sprintf("unsupported destination dialect '%s' for ADD COLUMN", s.dstDialect)
+		log.Error(errMsg)
+		return "", fmt.Errorf(errMsg)
 	}
 }
 
 // generateDropColumnDDL generates ALTER TABLE ... DROP COLUMN ...
 func (s *SchemaSyncer) generateDropColumnDDL(table string, col ColumnInfo) (string, error) {
-	// Tidak perlu logger spesifik di sini jika tidak ada keputusan atau logging khusus
-	// Pemanggil (generateAlterDDLs) akan melakukan logging.
-	// log := s.logger.With(...)
+	log := s.logger.With(zap.String("table", table), zap.String("column", col.Name), zap.String("action", "DROP COLUMN"))
 	quotedTable := utils.QuoteIdentifier(table, s.dstDialect)
 	quotedColName := utils.QuoteIdentifier(col.Name, s.dstDialect)
 
+	var ddl string
 	switch s.dstDialect {
 	case "mysql":
-		return fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s;", quotedTable, quotedColName), nil
+		// MySQL tidak mendukung IF EXISTS untuk DROP COLUMN
+		ddl = fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s;", quotedTable, quotedColName)
 	case "postgres":
-		return fmt.Sprintf("ALTER TABLE %s DROP COLUMN IF EXISTS %s;", quotedTable, quotedColName), nil
+		// PostgreSQL mendukung IF EXISTS
+		ddl = fmt.Sprintf("ALTER TABLE %s DROP COLUMN IF EXISTS %s;", quotedTable, quotedColName)
 	case "sqlite":
-		s.logger.Warn("DROP COLUMN support in SQLite depends on version (>= 3.35.0). DDL will be generated.", // Gunakan s.logger
+		// SQLite mendukung DROP COLUMN sejak 3.35.0. Tidak mendukung IF EXISTS.
+		log.Warn("DROP COLUMN support in SQLite depends on version (>= 3.35.0). DDL will be generated without IF EXISTS.",
 			zap.String("table", table), zap.String("column", col.Name))
-		return fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s;", quotedTable, quotedColName), nil
+		ddl = fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s;", quotedTable, quotedColName)
 	default:
-		return "", fmt.Errorf("unsupported destination dialect '%s' for DROP COLUMN", s.dstDialect)
+		errMsg := fmt.Sprintf("unsupported destination dialect '%s' for DROP COLUMN", s.dstDialect)
+		log.Error(errMsg)
+		return "", fmt.Errorf(errMsg)
 	}
+	log.Debug("Generated DROP COLUMN DDL.", zap.String("ddl", ddl))
+	return ddl, nil
 }
 
 // generateDropIndexDDL generates DROP INDEX statement.
 func (s *SchemaSyncer) generateDropIndexDDL(table string, idx IndexInfo) (string, error) {
-	// log := s.logger.With(...)
+	log := s.logger.With(zap.String("table", table), zap.String("index", idx.Name), zap.String("action", "DROP INDEX"))
 	quotedIndexName := utils.QuoteIdentifier(idx.Name, s.dstDialect)
+
+	var ddl string
 	switch s.dstDialect {
 	case "mysql":
+		// DROP INDEX di MySQL memerlukan nama tabel. Tidak mendukung IF EXISTS.
 		quotedTableName := utils.QuoteIdentifier(table, s.dstDialect)
-		return fmt.Sprintf("DROP INDEX %s ON %s;", quotedIndexName, quotedTableName), nil
+		ddl = fmt.Sprintf("DROP INDEX %s ON %s;", quotedIndexName, quotedTableName)
 	case "postgres", "sqlite":
-		return fmt.Sprintf("DROP INDEX IF EXISTS %s;", quotedIndexName), nil
+		// PostgreSQL dan SQLite (sejak 3.34.0 untuk DROP INDEX) mendukung IF EXISTS.
+		ddl = fmt.Sprintf("DROP INDEX IF EXISTS %s;", quotedIndexName)
 	default:
-		return "", fmt.Errorf("unsupported destination dialect '%s' for DROP INDEX", s.dstDialect)
+		errMsg := fmt.Sprintf("unsupported destination dialect '%s' for DROP INDEX", s.dstDialect)
+		log.Error(errMsg)
+		return "", fmt.Errorf(errMsg)
 	}
+	log.Debug("Generated DROP INDEX DDL.", zap.String("ddl", ddl))
+	return ddl, nil
 }
 
 // generateDropConstraintDDL generates DROP CONSTRAINT statement.
 func (s *SchemaSyncer) generateDropConstraintDDL(table string, constraint ConstraintInfo) (string, error) {
-	// log := s.logger.With(...)
+	log := s.logger.With(zap.String("table", table), zap.String("constraint", constraint.Name), zap.String("type", constraint.Type), zap.String("action", "DROP CONSTRAINT"))
 	quotedTable := utils.QuoteIdentifier(table, s.dstDialect)
 	quotedConstraintName := utils.QuoteIdentifier(constraint.Name, s.dstDialect)
 
+	var ddl string
 	switch s.dstDialect {
 	case "mysql":
+		// MySQL memiliki sintaks berbeda untuk jenis constraint yang berbeda
+		// dan umumnya tidak mendukung IF EXISTS untuk DROP CONSTRAINT.
 		switch strings.ToUpper(constraint.Type) {
 		case "FOREIGN KEY":
-			return fmt.Sprintf("ALTER TABLE %s DROP FOREIGN KEY %s;", quotedTable, quotedConstraintName), nil
+			ddl = fmt.Sprintf("ALTER TABLE %s DROP FOREIGN KEY %s;", quotedTable, quotedConstraintName)
 		case "UNIQUE":
-			return fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s;", quotedTable, quotedConstraintName), nil
+			// Unik constraint di MySQL bisa jadi constraint atau index.
+			// Jika dibuat sebagai constraint (misalnya, `ADD CONSTRAINT ... UNIQUE`), gunakan DROP CONSTRAINT.
+			// Jika dibuat sebagai `CREATE UNIQUE INDEX`, gunakan `DROP INDEX`.
+			// Logika pengambilan skema (`getMySQLConstraints`, `getMySQLIndexes`) harus konsisten.
+			// Kita asumsikan `getMySQLConstraints` hanya mengembalikan constraint eksplisit.
+			ddl = fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s;", quotedTable, quotedConstraintName)
+			// Alternatif jika itu adalah indeks:
+			// ddl = fmt.Sprintf("ALTER TABLE %s DROP INDEX %s;", quotedTable, quotedConstraintName)
+			// Perlu cara untuk membedakan UNIQUE constraint vs UNIQUE index di MySQL.
+			log.Debug("Generating DROP CONSTRAINT for MySQL UNIQUE. Ensure this was created as a CONSTRAINT, not just a UNIQUE INDEX.", zap.String("constraint_name", constraint.Name))
 		case "CHECK":
-			return fmt.Sprintf("ALTER TABLE %s DROP CHECK %s;", quotedTable, quotedConstraintName), nil
+			// CHECK didukung sejak MySQL 8.0.16
+			ddl = fmt.Sprintf("ALTER TABLE %s DROP CHECK %s;", quotedTable, quotedConstraintName)
 		case "PRIMARY KEY":
-			return fmt.Sprintf("ALTER TABLE %s DROP PRIMARY KEY;", quotedTable), nil
+			// Hanya ada satu PK, tidak perlu nama.
+			ddl = fmt.Sprintf("ALTER TABLE %s DROP PRIMARY KEY;", quotedTable)
 		default:
-			return "", fmt.Errorf("unsupported constraint type '%s' for DROP CONSTRAINT in MySQL for constraint '%s'", constraint.Type, constraint.Name)
+			errMsg := fmt.Sprintf("unsupported constraint type '%s' for DROP CONSTRAINT in MySQL for constraint '%s'", constraint.Type, constraint.Name)
+			log.Error(errMsg)
+			return "", fmt.Errorf(errMsg)
 		}
 	case "postgres", "sqlite":
-		return fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s;", quotedTable, quotedConstraintName), nil
+		// PostgreSQL dan SQLite menggunakan sintaks umum dan mendukung IF EXISTS.
+		ddl = fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s;", quotedTable, quotedConstraintName)
 	default:
-		return "", fmt.Errorf("unsupported destination dialect '%s' for DROP CONSTRAINT", s.dstDialect)
+		errMsg := fmt.Sprintf("unsupported destination dialect '%s' for DROP CONSTRAINT", s.dstDialect)
+		log.Error(errMsg)
+		return "", fmt.Errorf(errMsg)
 	}
+	log.Debug("Generated DROP CONSTRAINT DDL.", zap.String("ddl", ddl))
+	return ddl, nil
 }

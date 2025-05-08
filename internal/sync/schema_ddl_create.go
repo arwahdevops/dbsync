@@ -4,117 +4,153 @@ package sync
 import (
 	"fmt"
 	"sort"
-	"strconv" // Diimpor karena digunakan oleh formatDefaultValue
+	"strconv" // Dipertahankan karena digunakan oleh formatDefaultValue
 	"strings"
 
 	"go.uber.org/zap"
 
-	"github.com/arwahdevops/dbsync/internal/utils"
+	"github.com/arwahdevops/dbsync/internal/utils" // Diperlukan untuk QuoteIdentifier
 )
 
 // --- DDL Generation for CREATE Strategy ---
 
 // generateCreateTableDDL generates the CREATE TABLE statement.
+// Mengembalikan DDL tabel, daftar nama kolom PK (sudah di-quote dan diurutkan), dan error.
 func (s *SchemaSyncer) generateCreateTableDDL(table string, columns []ColumnInfo) (string, []string, error) {
 	var builder strings.Builder
-	log := s.logger.With(zap.String("table", table), zap.String("action", "CREATE TABLE"))
+	log := s.logger.With(zap.String("table", table), zap.String("action", "CREATE TABLE"), zap.String("dst_dialect", s.dstDialect))
 
 	quotedTable := utils.QuoteIdentifier(table, s.dstDialect)
 	builder.WriteString(fmt.Sprintf("CREATE TABLE %s (\n", quotedTable))
 
-	primaryKeysQuoted := make([]string, 0)
+	primaryKeyColumnNames := make([]string, 0) // Nama kolom PK asli, belum di-quote
 	columnDefs := make([]string, len(columns))
 
+	if len(columns) == 0 {
+		log.Error("Cannot generate CREATE TABLE DDL: no columns provided.")
+		return "", nil, fmt.Errorf("cannot create table '%s' with no columns", table)
+	}
+
 	for i, col := range columns {
+		// MappedType seharusnya sudah diisi oleh pemanggil (SyncTableSchema -> populateMappedTypesForSourceColumns)
 		if col.MappedType == "" && !col.IsGenerated {
-			log.Error("Cannot generate CREATE TABLE DDL: MappedType is missing for non-generated column.",
-				zap.String("column", col.Name))
-			return "", nil, fmt.Errorf("mapped type missing for column '%s' in CREATE TABLE DDL generation for table '%s'", col.Name, table)
+			errMsg := fmt.Sprintf("cannot generate CREATE TABLE DDL for table '%s': MappedType is missing for non-generated column '%s'", table, col.Name)
+			log.Error(errMsg)
+			return "", nil, fmt.Errorf(errMsg)
 		}
 
+		// Panggil mapColumnDefinition untuk mendapatkan definisi lengkap satu kolom
 		columnDef, err := s.mapColumnDefinition(col)
 		if err != nil {
-			return "", nil, fmt.Errorf("failed to map column definition for column '%s' in table '%s': %w", col.Name, table, err)
+			// Error sudah termasuk konteks kolom dari mapColumnDefinition
+			return "", nil, fmt.Errorf("failed to generate column definition for CREATE TABLE '%s': %w", table, err)
 		}
-		columnDefs[i] = "  " + columnDef
+		columnDefs[i] = "  " + columnDef // Tambahkan indentasi
 
 		if col.IsPrimary {
-			primaryKeysQuoted = append(primaryKeysQuoted, utils.QuoteIdentifier(col.Name, s.dstDialect))
+			primaryKeyColumnNames = append(primaryKeyColumnNames, col.Name) // Simpan nama asli
 		}
 	}
 
 	builder.WriteString(strings.Join(columnDefs, ",\n"))
 
-	if len(primaryKeysQuoted) > 0 {
-		sort.Strings(primaryKeysQuoted)
+	// Tambahkan klausa PRIMARY KEY jika ada
+	if len(primaryKeyColumnNames) > 0 {
+		sort.Strings(primaryKeyColumnNames) // Urutkan nama kolom PK untuk konsistensi DDL
+		quotedPKs := make([]string, len(primaryKeyColumnNames))
+		for i, pkName := range primaryKeyColumnNames {
+			quotedPKs[i] = utils.QuoteIdentifier(pkName, s.dstDialect)
+		}
 		builder.WriteString(",\n  PRIMARY KEY (")
-		builder.WriteString(strings.Join(primaryKeysQuoted, ", "))
+		builder.WriteString(strings.Join(quotedPKs, ", "))
 		builder.WriteString(")")
 	}
 
 	builder.WriteString("\n);")
 
 	log.Debug("Generated CREATE TABLE DDL successfully.")
-	return builder.String(), primaryKeysQuoted, nil
+	// Mengembalikan nama PK yang sudah di-quote dan diurutkan
+	quotedAndSortedPKs := make([]string, len(primaryKeyColumnNames))
+	for i, name := range primaryKeyColumnNames { // primaryKeyColumnNames sudah diurutkan
+		quotedAndSortedPKs[i] = utils.QuoteIdentifier(name, s.dstDialect)
+	}
+	return builder.String(), quotedAndSortedPKs, nil
 }
 
-// mapColumnDefinition generates the column definition part of CREATE TABLE or MODIFY COLUMN.
+// mapColumnDefinition generates the column definition part of CREATE TABLE or ADD COLUMN.
+// Ini adalah method dari SchemaSyncer (s).
 func (s *SchemaSyncer) mapColumnDefinition(col ColumnInfo) (string, error) {
 	var definition strings.Builder
-	log := s.logger.With(zap.String("column", col.Name))
+	// Logger di-scope di sini untuk konteks kolom spesifik
+	log := s.logger.With(zap.String("column", col.Name), zap.String("dst_dialect", s.dstDialect), zap.String("action", "mapColumnDefinition"))
 
 	definition.WriteString(utils.QuoteIdentifier(col.Name, s.dstDialect))
 	definition.WriteString(" ")
 
+	// MappedType adalah tipe data tujuan yang sudah diproses (termasuk modifier)
 	targetType := col.MappedType
 	if col.IsGenerated {
-		if targetType == "" { targetType = col.Type }
+		if targetType == "" { targetType = col.Type } // Fallback jika MappedType kosong untuk generated
 		definition.WriteString(targetType)
-		log.Warn("Mapping definition for a GENERATED column. Expression handling might require manual setup or enhanced features.",
-			zap.String("target_type_used", targetType))
+		// TODO: Implementasi sintaks GENERATED AS spesifik dialek jika diperlukan
+		log.Debug("Mapping definition for a GENERATED column. Expression syntax (GENERATED AS...) needs dialect-specific handling not fully implemented.", zap.String("target_type_used", targetType))
 	} else {
+		// Untuk kolom non-generated
 		if targetType == "" {
-			return "", fmt.Errorf("mapped type is missing for non-generated column '%s'", col.Name)
+			errMsg := fmt.Sprintf("mapped type is missing for non-generated column '%s'", col.Name)
+			log.Error(errMsg)
+			return "", fmt.Errorf(errMsg)
 		}
-		definition.WriteString(targetType)
+		definition.WriteString(targetType) // targetType sudah termasuk modifier
 
+		// Tambahkan sintaks AUTO_INCREMENT / IDENTITY
 		if col.AutoIncrement && col.IsPrimary {
+			// Memanggil helper yang ada di file ini atau di schema_ddl_utils.go
 			if autoIncSyntax := s.getAutoIncrementSyntax(targetType); autoIncSyntax != "" {
 				definition.WriteString(" ")
 				definition.WriteString(autoIncSyntax)
 			}
 		}
 
-		if col.DefaultValue.Valid && !col.AutoIncrement && !col.IsGenerated {
-			defaultValue := col.DefaultValue.String
-			// Panggil helper statis dari compare_utils.go
-			// Pastikan tidak ada 's.' di depannya
-			if !isDefaultNullOrFunction(defaultValue) { // <--- Pemanggilan yang benar
+		// Tambahkan DEFAULT value jika relevan
+		if col.DefaultValue.Valid && col.DefaultValue.String != "" && !col.AutoIncrement {
+			// Periksa menggunakan nilai default yang sudah dinormalisasi
+			// `normalizeDefaultValue` dari `compare_utils.go`
+			normalizedDefault := normalizeDefaultValue(col.DefaultValue.String, s.dstDialect) // Gunakan dialek tujuan untuk normalisasi
+			// `isDefaultNullOrFunction` dari `compare_utils.go`
+			if !isDefaultNullOrFunction(normalizedDefault) { // Hanya tambahkan DEFAULT jika itu literal
 				definition.WriteString(" DEFAULT ")
-				definition.WriteString(s.formatDefaultValue(defaultValue, targetType)) // formatDefaultValue tetap method
+				// `formatDefaultValue` akan menangani quoting
+				definition.WriteString(s.formatDefaultValue(col.DefaultValue.String, targetType))
+			} else {
+				log.Debug("Skipping explicit DEFAULT clause because the value is NULL or a DB function.", zap.String("normalized_default", normalizedDefault))
 			}
 		}
 	}
 
+	// Tambahkan NOT NULL
 	if !col.IsNullable {
 		definition.WriteString(" NOT NULL")
 	}
 
+	// Tambahkan Collation jika ada dan relevan
+	// Helper `isStringType` dan `normalizeTypeName` dari `compare_utils.go`
 	if col.Collation.Valid && col.Collation.String != "" && isStringType(normalizeTypeName(targetType)) {
-		collationSyntax := s.getCollationSyntax(col.Collation.String)
-		if collationSyntax != "" {
+		// Helper `getCollationSyntax` dari file ini atau schema_ddl_utils.go
+		if collationSyntax := s.getCollationSyntax(col.Collation.String); collationSyntax != "" {
 			definition.WriteString(" ")
 			definition.WriteString(collationSyntax)
 		}
 	}
 
+	// Tambahkan Comment jika ada dan didukung inline
 	if col.Comment.Valid && col.Comment.String != "" {
-		commentSyntax := s.getCommentSyntax(col.Comment.String)
-		if commentSyntax != "" && s.dstDialect == "mysql" { // Hanya MySQL yang mendukung COMMENT inline
+		// Helper `getCommentSyntax` dari file ini atau schema_ddl_utils.go
+		if commentSyntax := s.getCommentSyntax(col.Comment.String); commentSyntax != "" {
 			definition.WriteString(" ")
 			definition.WriteString(commentSyntax)
-		} else if commentSyntax != "" {
-			log.Debug("Column comment found, but adding it inline is not supported for this dialect. Use COMMENT ON statement if needed.", zap.String("dialect", s.dstDialect), zap.String("comment", col.Comment.String))
+		} else if s.dstDialect != "mysql" {
+			log.Debug("Column comment found, but adding it inline is not supported for this dialect. Use COMMENT ON statement if needed.", zap.String("comment", col.Comment.String))
 		}
 	}
 
@@ -122,32 +158,45 @@ func (s *SchemaSyncer) mapColumnDefinition(col ColumnInfo) (string, error) {
 }
 
 // generateCreateIndexDDLs generates CREATE INDEX statements.
+// Ini adalah method dari SchemaSyncer (s).
 func (s *SchemaSyncer) generateCreateIndexDDLs(table string, indexes []IndexInfo) []string {
 	ddls := make([]string, 0, len(indexes))
-	log := s.logger.With(zap.String("table", table), zap.String("action", "CREATE INDEX"))
+	log := s.logger.With(zap.String("table", table), zap.String("action", "CREATE INDEX"), zap.String("dst_dialect", s.dstDialect))
 	quotedTable := utils.QuoteIdentifier(table, s.dstDialect)
 
 	for _, idx := range indexes {
 		if idx.IsPrimary {
-			log.Debug("Skipping CREATE INDEX DDL generation for PRIMARY KEY index", zap.String("index", idx.Name))
+			log.Debug("Skipping CREATE INDEX DDL generation for PRIMARY KEY index.", zap.String("index", idx.Name))
 			continue
 		}
 		if len(idx.Columns) == 0 {
-			log.Warn("Skipping CREATE INDEX DDL generation due to empty column list", zap.String("index", idx.Name))
+			log.Warn("Skipping CREATE INDEX DDL generation due to empty column list.", zap.String("index", idx.Name))
 			continue
 		}
 
 		quotedIndexName := utils.QuoteIdentifier(idx.Name, s.dstDialect)
 		quotedCols := make([]string, len(idx.Columns))
-		for i, col := range idx.Columns {
-			quotedCols[i] = utils.QuoteIdentifier(col, s.dstDialect)
+		for i, colName := range idx.Columns {
+			quotedCols[i] = utils.QuoteIdentifier(colName, s.dstDialect)
 		}
 
 		uniqueKeyword := ""; if idx.IsUnique { uniqueKeyword = "UNIQUE " }
-		ifExistsKeyword := ""; if s.dstDialect == "postgres" || s.dstDialect == "sqlite" { ifExistsKeyword = "IF NOT EXISTS "}
+		ifNotExistsKeyword := ""
+		if s.dstDialect == "postgres" || s.dstDialect == "sqlite" {
+			ifNotExistsKeyword = "IF NOT EXISTS "
+		} else if s.dstDialect == "mysql" {
+			log.Debug("MySQL does not support IF NOT EXISTS for CREATE INDEX.", zap.String("index", idx.Name))
+		}
+
+		// TODO: Handle idx.IndexType untuk klausa USING di PostgreSQL/MySQL
+		// usingClause := ""
+		// if s.dstDialect == "postgres" && idx.IndexType != "" && strings.ToUpper(idx.IndexType) != "BTREE" { // Asumsi BTREE default
+		//    usingClause = fmt.Sprintf(" USING %s", strings.ToUpper(idx.IndexType))
+		// }
+		// ddl := fmt.Sprintf("CREATE %sINDEX %s%s ON %s%s (%s);", ...)
 
 		ddl := fmt.Sprintf("CREATE %sINDEX %s%s ON %s (%s);",
-			uniqueKeyword, ifExistsKeyword, quotedIndexName, quotedTable, strings.Join(quotedCols, ", "))
+			uniqueKeyword, ifNotExistsKeyword, quotedIndexName, quotedTable, strings.Join(quotedCols, ", "))
 
 		log.Debug("Generated CREATE INDEX DDL", zap.String("ddl", ddl))
 		ddls = append(ddls, ddl)
@@ -156,25 +205,27 @@ func (s *SchemaSyncer) generateCreateIndexDDLs(table string, indexes []IndexInfo
 }
 
 // generateAddConstraintDDLs generates ADD CONSTRAINT statements (for UNIQUE, FK, CHECK).
+// Ini adalah method dari SchemaSyncer (s).
 func (s *SchemaSyncer) generateAddConstraintDDLs(table string, constraints []ConstraintInfo) []string {
 	ddls := make([]string, 0, len(constraints))
-	log := s.logger.With(zap.String("table", table), zap.String("action", "ADD CONSTRAINT"))
+	log := s.logger.With(zap.String("table", table), zap.String("action", "ADD CONSTRAINT"), zap.String("dst_dialect", s.dstDialect))
 	quotedTable := utils.QuoteIdentifier(table, s.dstDialect)
 
 	for _, c := range constraints {
 		if c.Type == "PRIMARY KEY" {
-			log.Debug("Skipping ADD CONSTRAINT DDL generation for PRIMARY KEY", zap.String("constraint", c.Name))
+			log.Debug("Skipping ADD CONSTRAINT DDL generation for PRIMARY KEY.", zap.String("constraint", c.Name))
 			continue
 		}
 		if len(c.Columns) == 0 && c.Type != "CHECK" {
-			log.Warn("Skipping ADD CONSTRAINT DDL generation due to empty column list", zap.String("constraint", c.Name), zap.String("type", c.Type))
+			log.Warn("Skipping ADD CONSTRAINT DDL generation due to empty column list for non-CHECK constraint.",
+				zap.String("constraint", c.Name), zap.String("type", c.Type))
 			continue
 		}
 
 		quotedConstraintName := utils.QuoteIdentifier(c.Name, s.dstDialect)
 		quotedCols := make([]string, len(c.Columns))
-		for i, col := range c.Columns {
-			quotedCols[i] = utils.QuoteIdentifier(col, s.dstDialect)
+		for i, colName := range c.Columns {
+			quotedCols[i] = utils.QuoteIdentifier(colName, s.dstDialect)
 		}
 
 		var ddl string
@@ -186,44 +237,55 @@ func (s *SchemaSyncer) generateAddConstraintDDLs(table string, constraints []Con
 				ddl = fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s UNIQUE (%s);",
 					quotedTable, quotedConstraintName, strings.Join(quotedCols, ", "))
 			} else {
-				log.Warn("Cannot generate ADD UNIQUE CONSTRAINT without columns", zap.String("constraint", c.Name))
+				log.Warn("Cannot generate ADD UNIQUE CONSTRAINT without columns.", zap.String("constraint", c.Name))
 			}
 
 		case "FOREIGN KEY":
 			if len(quotedCols) == 0 || len(c.ForeignColumns) == 0 || c.ForeignTable == "" {
-				log.Warn("Skipping ADD FOREIGN KEY due to missing columns or foreign table info", zap.String("constraint", c.Name))
+				log.Warn("Skipping ADD FOREIGN KEY due to missing info.", zap.String("constraint", c.Name))
 				continue
 			}
 			if len(quotedCols) != len(c.ForeignColumns) {
-				log.Warn("Skipping ADD FOREIGN KEY due to mismatch between local and foreign column counts", zap.String("constraint", c.Name), zap.Int("local_cols", len(quotedCols)), zap.Int("foreign_cols", len(c.ForeignColumns)))
+				log.Warn("Skipping ADD FOREIGN KEY due to column count mismatch.", zap.String("constraint", c.Name))
 				continue
 			}
 
 			quotedForeignTable := utils.QuoteIdentifier(c.ForeignTable, s.dstDialect)
 			quotedForeignCols := make([]string, len(c.ForeignColumns))
-			for i, fcol := range c.ForeignColumns {
-				quotedForeignCols[i] = utils.QuoteIdentifier(fcol, s.dstDialect)
+			for i, fcolName := range c.ForeignColumns {
+				quotedForeignCols[i] = utils.QuoteIdentifier(fcolName, s.dstDialect)
 			}
 
+			// Helper `normalizeFKAction` dari `compare_utils.go`
+			onDeleteAction := normalizeFKAction(c.OnDelete)
+			onUpdateAction := normalizeFKAction(c.OnUpdate)
 			fkActions := ""
-			onDeleteNorm := normalizeFKAction(c.OnDelete); onUpdateNorm := normalizeFKAction(c.OnUpdate)
-			if onDeleteNorm != "NO ACTION" { fkActions += " ON DELETE " + onDeleteNorm }
-			if onUpdateNorm != "NO ACTION" { fkActions += " ON UPDATE " + onUpdateNorm }
+			if onDeleteAction != "NO ACTION" && onDeleteAction != "" { fkActions += " ON DELETE " + onDeleteAction }
+			if onUpdateAction != "NO ACTION" && onUpdateAction != "" { fkActions += " ON UPDATE " + onUpdateAction }
 
-			ddl = fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s)%s;",
+			deferrableClause := ""
+			if s.dstDialect == "postgres" {
+				// Membuat FK deferrable di PG untuk memungkinkan data load yang mungkin melanggar FK sementara
+				deferrableClause = " DEFERRABLE INITIALLY DEFERRED"
+				log.Debug("Adding DEFERRABLE INITIALLY DEFERRED for PostgreSQL FOREIGN KEY constraint.", zap.String("constraint", c.Name))
+			}
+
+			ddl = fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s)%s%s;",
 				quotedTable, quotedConstraintName, strings.Join(quotedCols, ", "),
-				quotedForeignTable, strings.Join(quotedForeignCols, ", "), fkActions)
+				quotedForeignTable, strings.Join(quotedForeignCols, ", "), fkActions, deferrableClause)
 
 		case "CHECK":
 			if c.Definition != "" {
+				// Menggunakan definisi CHECK apa adanya. Normalisasi/validasi lanjutan bisa ditambahkan.
 				ddl = fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s);",
 					quotedTable, quotedConstraintName, c.Definition)
 			} else {
-				log.Warn("Cannot generate ADD CHECK CONSTRAINT without definition", zap.String("constraint", c.Name))
+				log.Warn("Cannot generate ADD CHECK CONSTRAINT without definition.", zap.String("constraint", c.Name))
 			}
 
 		default:
-			log.Warn("Unsupported constraint type for ADD CONSTRAINT DDL generation", zap.String("type", c.Type), zap.String("constraint", c.Name))
+			log.Warn("Unsupported constraint type for ADD CONSTRAINT DDL generation.",
+				zap.String("type", c.Type), zap.String("constraint", c.Name))
 		}
 
 		if ddl != "" {
@@ -236,81 +298,67 @@ func (s *SchemaSyncer) generateAddConstraintDDLs(table string, constraints []Con
 
 // --- Helper untuk DDL Create/Modify ---
 
-// getAutoIncrementSyntax mengembalikan sintaks AUTO_INCREMENT/IDENTITY untuk dialek tujuan.
+// getAutoIncrementSyntax mengembalikan sintaks AUTO_INCREMENT/IDENTITY.
 func (s *SchemaSyncer) getAutoIncrementSyntax(mappedDestType string) string {
-	mappedDestTypeLower := strings.ToLower(mappedDestType)
-	normMappedDestType := normalizeTypeName(mappedDestTypeLower)
-
+	normMappedDestType := normalizeTypeName(mappedDestType)
 	switch s.dstDialect {
 	case "mysql":
-		if isIntegerType(normMappedDestType) {
-			return "AUTO_INCREMENT"
-		}
+		if isIntegerType(normMappedDestType) { return "AUTO_INCREMENT" }
 	case "postgres":
-		if isIntegerType(normMappedDestType) {
-			return "GENERATED BY DEFAULT AS IDENTITY"
-		}
+		if normMappedDestType == "smallint" { return "GENERATED BY DEFAULT AS IDENTITY" }
+		if normMappedDestType == "int" { return "GENERATED BY DEFAULT AS IDENTITY" }
+		if normMappedDestType == "bigint" { return "GENERATED BY DEFAULT AS IDENTITY" }
 	case "sqlite":
-		if normMappedDestType == "integer" {
-			return ""
-		}
+		return "" // Ditangani oleh INTEGER PRIMARY KEY
 	}
 	return ""
 }
 
-// formatDefaultValue memformat nilai default untuk DDL, termasuk quoting jika perlu.
+// formatDefaultValue memformat nilai default untuk DDL.
 func (s *SchemaSyncer) formatDefaultValue(value, mappedDataType string) string {
 	normType := normalizeTypeName(mappedDataType)
-	normValue := normalizeDefaultValue(value)
+	normValue := normalizeDefaultValue(value, s.dstDialect) // Normalisasi dengan dialek tujuan
 
-	switch normValue {
-	case "current_timestamp", "current_date", "current_time", "nextval", "uuid_function", "null":
-		if normValue == "null" { return "NULL"}
-		return value
-	}
+	// `isDefaultNullOrFunction` sudah dicek oleh pemanggil (`mapColumnDefinition`)
+	// Jadi, kita hanya perlu menangani formatting nilai literal di sini.
 
-	if normType == "bool" || normType == "boolean" {
+	// Boolean
+	if normType == "bool" {
 		if normValue == "1" { return "TRUE" }
 		if normValue == "0" { return "FALSE" }
-		s.logger.Warn("Formatting non-standard boolean default", zap.String("original_value", value))
-		return value
 	}
-	if normType == "tinyint" && strings.Contains(mappedDataType, "(1)") {
+	if s.dstDialect == "mysql" && mappedDataType == "tinyint(1)" {
 		if normValue == "1" { return "'1'" }
 		if normValue == "0" { return "'0'" }
-		s.logger.Warn("Formatting non-standard boolean (tinyint(1)) default", zap.String("original_value", value))
-		return value
 	}
 
-	if isNumericType(mappedDataType) { // isNumericType dari compare_utils
-		if _, err := strconv.ParseFloat(value, 64); err == nil { // strconv diimpor di file ini
-			return value
+	// Numerik
+	if isNumericType(normType) {
+		if _, err := strconv.ParseFloat(value, 64); err == nil {
+			return value // Kembalikan angka apa adanya (tanpa quote)
 		}
-		// Panggil helper statis isDefaultNullOrFunction
-		// Pastikan tidak ada 's.' di depannya
-		if !isDefaultNullOrFunction(value) { // <--- Pemanggilan yang benar
-			s.logger.Warn("Formatting potentially non-numeric default for a numeric type", zap.String("value", value), zap.String("type", mappedDataType))
-		}
-		return value
+		// Jika bukan angka valid setelah normalisasi (misal, fungsi yg tidak dikenal lolos filter isDefaultNullOrFunction)
+		s.logger.Warn("Attempting to format a non-standard numeric default. Quoting as string.",
+			zap.String("value", value), zap.String("normalized", normValue), zap.String("type", mappedDataType))
 	}
 
+	// Default: quote sebagai string literal
 	escapedValue := strings.ReplaceAll(value, "'", "''")
 	return fmt.Sprintf("'%s'", escapedValue)
 }
 
-
-// getCollationSyntax mengembalikan klausa COLLATE jika didukung.
+// getCollationSyntax mengembalikan klausa COLLATE.
 func (s *SchemaSyncer) getCollationSyntax(collationName string) string {
 	if collationName == "" { return "" }
 	switch s.dstDialect {
-	case "mysql": return fmt.Sprintf("COLLATE %s", collationName)
+	case "mysql": return fmt.Sprintf("COLLATE %s", utils.QuoteIdentifier(collationName, s.dstDialect))
 	case "postgres": return fmt.Sprintf("COLLATE %s", utils.QuoteIdentifier(collationName, s.dstDialect))
 	case "sqlite": return fmt.Sprintf("COLLATE %s", collationName)
 	default: return ""
 	}
 }
 
-// getCommentSyntax mengembalikan sintaks untuk menambahkan comment inline (hanya MySQL).
+// getCommentSyntax mengembalikan sintaks COMMENT inline (hanya MySQL).
 func (s *SchemaSyncer) getCommentSyntax(comment string) string {
 	if comment == "" { return "" }
 	if s.dstDialect == "mysql" {

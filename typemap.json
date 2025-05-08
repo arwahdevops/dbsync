@@ -1,0 +1,117 @@
+{
+  "type_mappings": [
+    {
+      "source_dialect": "mysql",
+      "target_dialect": "postgres",
+      "mappings": {
+        "tinyint": "SMALLINT",
+        "smallint": "SMALLINT",
+        "mediumint": "INTEGER",
+        "int": "INTEGER",
+        "integer": "INTEGER",
+        "bigint": "BIGINT",
+        "float": "REAL",
+        "double": "DOUBLE PRECISION",
+        "decimal": "NUMERIC",
+        "numeric": "NUMERIC",
+        "char": "CHAR",
+        "varchar": "VARCHAR",
+        "tinytext": "TEXT",
+        "text": "TEXT",
+        "mediumtext": "TEXT",
+        "longtext": "TEXT",
+        "binary": "BYTEA",
+        "varbinary": "BYTEA",
+        "tinyblob": "BYTEA",
+        "blob": "BYTEA",
+        "mediumblob": "BYTEA",
+        "longblob": "BYTEA",
+        "json": "JSONB",
+        "enum": "VARCHAR(255)",
+        "set": "TEXT",
+        "date": "DATE",
+        "time": "TIME WITHOUT TIME ZONE",
+        "datetime": "TIMESTAMP WITHOUT TIME ZONE",
+        "timestamp": "TIMESTAMP WITH TIME ZONE",
+        "year": "SMALLINT"
+      },
+      "special_mappings": [
+        {
+          "source_type_pattern": "^tinyint\\(1\\)$",
+          "target_type": "BOOLEAN"
+        }
+      ]
+    },
+    {
+      "source_dialect": "postgres",
+      "target_dialect": "mysql",
+      "mappings": {
+        "smallint": "SMALLINT",
+        "integer": "INT",
+        "bigint": "BIGINT",
+        "real": "FLOAT",
+        "double precision": "DOUBLE",
+        "numeric": "DECIMAL",
+        "decimal": "DECIMAL",
+        "smallserial": "SMALLINT",
+        "serial": "INT",
+        "bigserial": "BIGINT",
+        "character varying": "VARCHAR",
+        "varchar": "VARCHAR",
+        "character": "CHAR",
+        "char": "CHAR",
+        "text": "LONGTEXT",
+        "bytea": "LONGBLOB",
+        "json": "JSON",
+        "jsonb": "JSON",
+        "uuid": "CHAR(36)",
+        "date": "DATE",
+        "time without time zone": "TIME",
+        "time with time zone": "TIME",
+        "timestamp without time zone": "DATETIME(6)",
+        "timestamp with time zone": "TIMESTAMP(6)",
+        "boolean": "TINYINT(1)",
+        "inet": "VARCHAR(43)",
+        "cidr": "VARCHAR(43)",
+        "macaddr": "VARCHAR(17)",
+        "text[]": "JSON",
+        "integer[]": "JSON",
+        "int4": "INT",  // Alias PostgreSQL
+        "int8": "BIGINT" // Alias PostgreSQL
+      },
+      "special_mappings": []
+    },
+    {
+      "source_dialect": "sqlite",
+      "target_dialect": "postgres",
+      "mappings": {
+        "integer": "BIGINT",
+        "real": "DOUBLE PRECISION",
+        "text": "TEXT",
+        "blob": "BYTEA",
+        "numeric": "NUMERIC",
+        "datetime": "TIMESTAMP WITHOUT TIME ZONE",
+        "date": "DATE",
+        "timestamp": "TIMESTAMP WITHOUT TIME ZONE",
+        "boolean": "BOOLEAN"
+      },
+      "special_mappings": []
+    },
+    {
+      "source_dialect": "sqlite",
+      "target_dialect": "mysql",
+      "mappings": {
+        "integer": "BIGINT",
+        "real": "DOUBLE",
+        "text": "LONGTEXT",
+        "blob": "LONGBLOB",
+        "numeric": "DECIMAL(38,18)",
+        "datetime": "DATETIME(6)",
+        "date": "DATE",
+        "timestamp": "DATETIME(6)",
+        "boolean": "TINYINT(1)"
+      },
+      "special_mappings": []
+    }
+  ]
+}

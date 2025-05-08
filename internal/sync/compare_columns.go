@@ -3,9 +3,10 @@ package sync
 
 import (
 	"fmt"
-	"strconv" // Diperlukan untuk areDefaultsEquivalent
+	"strconv" // Diperlukan untuk parse non-desimal
 	"strings"
 
+	"github.com/cockroachdb/apd/v3" // Untuk perbandingan desimal presisi tinggi
 	"go.uber.org/zap"
 )
 
@@ -14,31 +15,34 @@ import (
 // seperti s.mapDataType atau s.areTypesEquivalent.
 func (s *SchemaSyncer) getColumnModifications(src, dst ColumnInfo, log *zap.Logger) []string {
 	diffs := []string{}
-	log = log.With(zap.String("column", src.Name))
+	// Pastikan logger yang diteruskan sudah memiliki konteks kolom jika memungkinkan
+	// Jika belum, tambahkan di sini:
+	columnLogger := log.With(zap.String("column", src.Name))
 
 	// 1. Tipe Data
 	var srcTypeForComparison string
 	if src.IsGenerated {
-		srcTypeForComparison = src.Type // Untuk generated, bandingkan tipe asli (meskipun mungkin tidak di-ALTER)
-		log.Debug("Column is generated, using original type for comparison (if any)", zap.String("original_type", src.Type))
+		srcTypeForComparison = src.Type // Untuk generated, bandingkan tipe asli
+		columnLogger.Debug("Column is generated, using original source type for type comparison", zap.String("original_src_type", src.Type))
 	} else {
 		srcTypeForComparison = src.MappedType // src.MappedType seharusnya sudah diisi
 		if srcTypeForComparison == "" {
-			log.Error("Source column MappedType is empty and column is not generated. Cannot compare types.",
+			columnLogger.Error("Source column MappedType is empty and column is not generated. Cannot compare types accurately.",
 				zap.String("src_original_type", src.Type))
+			// Tetap coba bandingkan dengan tipe asli sumber jika MappedType kosong, tapi ini kurang ideal
 			diffs = append(diffs, fmt.Sprintf("type (src: %s [MAPPING ERROR], dst: %s)", src.Type, dst.Type))
+			srcTypeForComparison = src.Type // Fallback untuk perbandingan dasar
 		}
 	}
 
-	if srcTypeForComparison != "" { // Lanjutkan hanya jika kita punya tipe sumber untuk dibandingkan
-		if !s.areTypesEquivalent(srcTypeForComparison, dst.Type, src, dst, log) {
-			comparisonTypeString := src.Type
-			// Tampilkan mapped type jika berbeda dan bukan generated, untuk kejelasan
-			if !src.IsGenerated && src.MappedType != "" && src.MappedType != src.Type {
-				comparisonTypeString = fmt.Sprintf("%s [mapped to: %s]", src.Type, src.MappedType)
-			}
-			diffs = append(diffs, fmt.Sprintf("type (src: %s, dst: %s)", comparisonTypeString, dst.Type))
+	// Hanya lanjutkan jika kita punya tipe sumber untuk dibandingkan (meskipun ada error mapping)
+	if !s.areTypesEquivalent(srcTypeForComparison, dst.Type, src, dst, columnLogger) {
+		comparisonTypeString := src.Type
+		// Tampilkan mapped type jika berbeda dan bukan generated, untuk kejelasan
+		if !src.IsGenerated && src.MappedType != "" && src.MappedType != src.Type {
+			comparisonTypeString = fmt.Sprintf("%s [mapped to: %s]", src.Type, src.MappedType)
 		}
+		diffs = append(diffs, fmt.Sprintf("type (src: %s, dst: %s)", comparisonTypeString, dst.Type))
 	}
 
 	// 2. Nullability
@@ -47,16 +51,21 @@ func (s *SchemaSyncer) getColumnModifications(src, dst ColumnInfo, log *zap.Logg
 	}
 
 	// 3. Default Value
+	// Jangan bandingkan default jika salah satu adalah auto_increment atau generated
+	// karena defaultnya di-handle oleh DB atau tidak relevan untuk disinkronkan.
 	if !src.AutoIncrement && !src.IsGenerated && !dst.AutoIncrement && !dst.IsGenerated {
 		srcDefVal := ""; if src.DefaultValue.Valid { srcDefVal = src.DefaultValue.String }
 		dstDefVal := ""; if dst.DefaultValue.Valid { dstDefVal = dst.DefaultValue.String }
 
-		typeForDefaultComparison := src.Type // Default ke tipe asli jika MappedType tidak ada
-		if !src.IsGenerated && src.MappedType != "" {
-			typeForDefaultComparison = src.MappedType
+		// Tipe yang digunakan untuk perbandingan default adalah MappedType dari sumber,
+		// karena itu yang akan di-set di tujuan. Jika MappedType kosong (error mapping),
+		// fallback ke tipe asli sumber.
+		typeForDefaultComparison := src.MappedType
+		if typeForDefaultComparison == "" {
+			typeForDefaultComparison = src.Type
 		}
 
-		if !s.areDefaultsEquivalent(srcDefVal, dstDefVal, typeForDefaultComparison, log) {
+		if !s.areDefaultsEquivalent(srcDefVal, dstDefVal, typeForDefaultComparison, columnLogger) {
 			// Format nilai default untuk logging agar lebih mudah dibaca
 			srcDefLog := "NULL"; if src.DefaultValue.Valid { srcDefLog = fmt.Sprintf("'%s'", src.DefaultValue.String) }
 			dstDefLog := "NULL"; if dst.DefaultValue.Valid { dstDefLog = fmt.Sprintf("'%s'", dst.DefaultValue.String) }
@@ -64,43 +73,44 @@ func (s *SchemaSyncer) getColumnModifications(src, dst ColumnInfo, log *zap.Logg
 		}
 	}
 
-
 	// 4. AutoIncrement Status
 	if src.AutoIncrement != dst.AutoIncrement {
 		diffs = append(diffs, fmt.Sprintf("auto_increment (src: %t, dst: %t)", src.AutoIncrement, dst.AutoIncrement))
-		log.Warn("AutoIncrement/Identity status difference detected. Applying this change via ALTER is often complex or unsupported.",
+		columnLogger.Warn("AutoIncrement/Identity status difference detected. Applying this change via ALTER is often complex or unsupported by dbsync.",
 			zap.Bool("src_auto_inc", src.AutoIncrement), zap.Bool("dst_auto_inc", dst.AutoIncrement))
 	}
 
 	// 5. Generated Column Status & Expression
 	if src.IsGenerated != dst.IsGenerated {
 		diffs = append(diffs, fmt.Sprintf("generated_status (src: %t, dst: %t)", src.IsGenerated, dst.IsGenerated))
-		log.Warn("Generated column status difference detected. Modifying this often requires dropping and re-adding the column or is unsupported.")
+		columnLogger.Warn("Generated column status difference detected. Modifying this often requires dropping and re-adding the column or is unsupported by dbsync.")
 	} else if src.IsGenerated && dst.IsGenerated {
-		// Perbandingan generation_expression saat ini dilewati karena kompleksitas.
-		// Jika ingin diimplementasikan, Anda perlu mengambil GENERATION_EXPRESSION dari kolom tujuan juga.
+		// Perbandingan generation_expression saat ini dilewati karena kompleksitas normalisasi SQL.
+		// Jika src.GenerationExpression dan dst.GenerationExpression diisi saat fetch,
+		// bisa ditambahkan perbandingan string sederhana di sini sebagai deteksi dasar.
 		// srcGenExprVal := ""; if src.GenerationExpression.Valid { srcGenExprVal = src.GenerationExpression.String }
 		// dstGenExprVal := ""; if dst.GenerationExpression.Valid { dstGenExprVal = dst.GenerationExpression.String }
-		// if normalizeSqlExpression(srcGenExprVal) != normalizeSqlExpression(dstGenExprVal) {
+		// if normalizeSqlExpression(srcGenExprVal) != normalizeSqlExpression(dstGenExprVal) { // Perlu normalizeSqlExpression
 		//    diffs = append(diffs, fmt.Sprintf("generation_expression (src: '%s', dst: '%s')", srcGenExprVal, dstGenExprVal))
 		// }
-		log.Debug("Both columns are generated. Expression comparison is currently skipped.")
+		columnLogger.Debug("Both columns are generated. Expression comparison is currently skipped by dbsync.")
 	}
-
 
 	// 6. Collation
 	srcCollation := ""; if src.Collation.Valid { srcCollation = src.Collation.String }
 	dstCollation := ""; if dst.Collation.Valid { dstCollation = dst.Collation.String }
 
-	// Hanya bandingkan collation jika srcTypeForComparison adalah string-like, dan dstType juga string-like
+	// Hanya bandingkan collation jika srcTypeForComparison (setelah mapping) adalah string-like,
+	// dan dstType juga string-like.
 	// Ini untuk menghindari perbandingan collation pada tipe numerik, dll.
+	// srcTypeForComparison sudah diisi di atas (MappedType atau Type jika generated/error).
 	if srcTypeForComparison != "" && isStringType(normalizeTypeName(srcTypeForComparison)) && isStringType(normalizeTypeName(dst.Type)) {
 		if srcCollation != "" || dstCollation != "" { // Hanya bandingkan jika salah satu memiliki collation
-			if !strings.EqualFold(srcCollation, dstCollation) {
-				// Ini bisa menjadi false positive jika satu adalah default collation database
-				// dan yang lain adalah nama spesifik untuk default itu.
-				// Untuk saat ini, perbedaan apa pun dianggap.
-				log.Debug("Collation difference detected", zap.String("src_coll", srcCollation), zap.String("dst_coll", dstCollation))
+			// Perbandingan collation bisa rumit karena "default" collation.
+			// Untuk sekarang, perbedaan apa pun dianggap.
+			// Normalisasi sederhana bisa membantu (misal, lowercase).
+			if !strings.EqualFold(normalizeCollation(srcCollation, s.srcDialect), normalizeCollation(dstCollation, s.dstDialect)) {
+				columnLogger.Debug("Collation difference detected", zap.String("src_coll", srcCollation), zap.String("dst_coll", dstCollation))
 				diffs = append(diffs, fmt.Sprintf("collation (src: %s, dst: %s)", srcCollation, dstCollation))
 			}
 		}
@@ -110,112 +120,146 @@ func (s *SchemaSyncer) getColumnModifications(src, dst ColumnInfo, log *zap.Logg
 	srcComment := ""; if src.Comment.Valid { srcComment = src.Comment.String }
 	dstComment := ""; if dst.Comment.Valid { dstComment = dst.Comment.String }
 	if srcComment != dstComment {
-		log.Debug("Column comment difference detected (considered non-critical for ALTER by default)",
+		columnLogger.Debug("Column comment difference detected (considered non-critical for ALTER by default by dbsync)",
 			zap.String("src_comment", srcComment), zap.String("dst_comment", dstComment))
-		// diffs = append(diffs, fmt.Sprintf("comment (src: '%s', dst: '%s')", srcComment, dstComment)) // Aktifkan jika ingin ALTER COMMENT
+		// Aktifkan baris di bawah jika ingin DDL ALTER COMMENT di-generate (membutuhkan logika DDL terpisah)
+		// diffs = append(diffs, fmt.Sprintf("comment (src: '%s', dst: '%s')", srcComment, dstComment))
 	}
 
 	if len(diffs) > 0 {
-		log.Info("Column differences identified", zap.Strings("differences", diffs))
+		columnLogger.Info("Column differences identified", zap.Strings("differences", diffs))
 	}
 	return diffs
 }
 
 // areTypesEquivalent melakukan perbandingan tipe data yang lebih canggih.
-// `mappedSrcType` adalah tipe sumber yang sudah dimapping ke dialek tujuan (atau tipe asli jika generated).
-// `dstType` adalah tipe asli dari database tujuan.
-func (s *SchemaSyncer) areTypesEquivalent(mappedSrcType, dstType string, srcInfo, dstInfo ColumnInfo, log *zap.Logger) bool {
-	log = log.With(zap.String("column", srcInfo.Name), zap.String("mapped_src_type", mappedSrcType), zap.String("dst_type", dstType))
+// `srcMappedOrOriginalType` adalah tipe sumber yang sudah dimapping ke dialek tujuan (atau tipe asli jika generated/mapping gagal).
+// `dstRawType` adalah tipe asli dari database tujuan.
+func (s *SchemaSyncer) areTypesEquivalent(srcMappedOrOriginalType, dstRawType string, srcInfo, dstInfo ColumnInfo, log *zap.Logger) bool {
+	// Logger sudah memiliki konteks kolom dari pemanggil getColumnModifications
+	log.Debug("Comparing types for equivalence",
+		zap.String("src_mapped_or_original_type", srcMappedOrOriginalType),
+		zap.String("dst_raw_type", dstRawType))
 
-	normMappedSrc, normDst := normalizeTypeName(mappedSrcType), normalizeTypeName(dstType)
-	log.Debug("Normalized types for equivalence check", zap.String("norm_mapped_src", normMappedSrc), zap.String("norm_dst", normDst))
+	normMappedSrc, normDst := normalizeTypeName(srcMappedOrOriginalType), normalizeTypeName(dstRawType)
+	log.Debug("Normalized base types for equivalence check", zap.String("norm_mapped_src", normMappedSrc), zap.String("norm_dst", normDst))
 
 	if normMappedSrc == normDst {
 		// Tipe dasar sama, sekarang bandingkan atribut (panjang, presisi, skala) jika relevan.
-		// Panjang:
-		if (isStringType(normMappedSrc) || isBinaryType(normMappedSrc)) {
-			srcLen := int64(-1); if srcInfo.Length.Valid { srcLen = srcInfo.Length.Int64 } else if strings.Contains(normMappedSrc, "text") || strings.Contains(normMappedSrc, "blob") { srcLen = 0 } // Anggap 0 jika TEXT/BLOB tanpa panjang eksplisit
-			dstLen := int64(-1); if dstInfo.Length.Valid { dstLen = dstInfo.Length.Int64 } else if strings.Contains(normDst, "text") || strings.Contains(normDst, "blob") { dstLen = 0 }
+		// Panjang (untuk string dan binary):
+		if isStringType(normMappedSrc) || isBinaryType(normMappedSrc) {
+			srcLen := int64(-1); if srcInfo.Length.Valid { srcLen = srcInfo.Length.Int64 } else if isLargeTextOrBlob(normMappedSrc) { srcLen = -2 } // -2 untuk tipe besar tanpa panjang eksplisit
+			dstLen := int64(-1); if dstInfo.Length.Valid { dstLen = dstInfo.Length.Int64 } else if isLargeTextOrBlob(normDst) { dstLen = -2 }
 
 			// Jika salah satunya tipe panjang tetap (CHAR, BINARY) dan yang lain variabel (VARCHAR, VARBINARY) dengan panjang sama,
 			// itu dianggap berbeda.
-			isSrcFixed := strings.HasPrefix(normMappedSrc, "char") || strings.HasPrefix(normMappedSrc, "binary") && !strings.HasPrefix(normMappedSrc, "var")
-			isDstFixed := strings.HasPrefix(normDst, "char") || strings.HasPrefix(normDst, "binary") && !strings.HasPrefix(normDst, "var")
-			if isSrcFixed != isDstFixed && srcLen == dstLen && srcLen > 0 {
-				log.Debug("Type fixed/variable mismatch with same length", zap.Bool("src_fixed", isSrcFixed), zap.Bool("dst_fixed", isDstFixed))
+			isSrcFixed := (strings.HasPrefix(normMappedSrc, "char") && !strings.HasPrefix(normMappedSrc, "varchar")) ||
+				(strings.HasPrefix(normMappedSrc, "binary") && !strings.HasPrefix(normMappedSrc, "varbinary"))
+			isDstFixed := (strings.HasPrefix(normDst, "char") && !strings.HasPrefix(normDst, "varchar")) ||
+				(strings.HasPrefix(normDst, "binary") && !strings.HasPrefix(normDst, "varbinary"))
+
+			if isSrcFixed != isDstFixed && srcLen == dstLen && srcLen > 0 { // Panjang harus > 0 untuk perbandingan ini
+				log.Debug("Type fixed/variable nature mismatch with same length", zap.Bool("src_fixed", isSrcFixed), zap.Bool("dst_fixed", isDstFixed), zap.Int64("length", srcLen))
 				return false
 			}
-			
-			// Hanya bandingkan panjang jika keduanya bukan tipe "besar" tanpa panjang eksplisit (misal, TEXT, BLOB)
-			// atau jika keduanya tipe "besar". Perbandingan antara TEXT dan VARCHAR(X) akan gagal di normMappedSrc == normDst.
-			if !(srcLen == 0 && dstLen > 0 && (strings.Contains(normMappedSrc, "text") || strings.Contains(normMappedSrc, "blob"))) &&
-			   !(dstLen == 0 && srcLen > 0 && (strings.Contains(normDst, "text") || strings.Contains(normDst, "blob"))) {
-				if srcLen != dstLen {
-					log.Debug("Type length mismatch", zap.Int64("src_len", srcLen), zap.Int64("dst_len", dstLen))
+
+			// Hanya bandingkan panjang jika keduanya BUKAN tipe "besar" tanpa panjang eksplisit
+			// ATAU jika keduanya adalah tipe "besar" (srcLen == -2 && dstLen == -2).
+			// Perbandingan antara TEXT dan VARCHAR(X) akan gagal di normMappedSrc == normDst.
+			// Jika srcLen == -2 (misal TEXT) dan dstLen > 0 (misal VARCHAR(255)), itu perbedaan.
+			if !(srcLen == -2 && dstLen == -2) && srcLen != dstLen {
+				log.Debug("Type length mismatch", zap.Int64("src_len", srcLen), zap.Int64("dst_len", dstLen))
+				return false
+			}
+		}
+
+		// Presisi & Skala (untuk numerik dan waktu):
+		if isPrecisionRelevant(normMappedSrc) { // DECIMAL, NUMERIC, TIME, TIMESTAMP
+			srcPrec := int64(-1); if srcInfo.Precision.Valid { srcPrec = srcInfo.Precision.Int64 }
+			dstPrec := int64(-1); if dstInfo.Precision.Valid { dstPrec = dstInfo.Precision.Int64 }
+
+			// Untuk tipe waktu, presisi 0 atau tidak diset bisa berarti default DB.
+			// Jika satu 0/-1 dan yang lain >0, itu perbedaan. Jika keduanya 0/-1, OK.
+			// Untuk DECIMAL/NUMERIC, presisi harus cocok jika diset. Jika salah satu tidak diset dan yang lain diset, itu perbedaan.
+			isTimeType := strings.Contains(normMappedSrc, "time") || strings.Contains(normMappedSrc, "timestamp")
+			if isTimeType {
+				if !((srcPrec <= 0 || !srcInfo.Precision.Valid) && (dstPrec <= 0 || !dstInfo.Precision.Valid)) && (srcPrec != dstPrec) {
+					log.Debug("Time type precision mismatch", zap.Int64("src_prec", srcPrec), zap.Int64("dst_prec", dstPrec))
+					return false
+				}
+			} else { // Untuk DECIMAL/NUMERIC
+				if srcInfo.Precision.Valid != dstInfo.Precision.Valid || (srcInfo.Precision.Valid && dstInfo.Precision.Valid && srcPrec != dstPrec) {
+					log.Debug("Decimal/Numeric type precision mismatch or one is not set", zap.Int64("src_prec", srcPrec), zap.Bool("src_prec_valid", srcInfo.Precision.Valid), zap.Int64("dst_prec", dstPrec), zap.Bool("dst_prec_valid", dstInfo.Precision.Valid))
 					return false
 				}
 			}
 		}
+		if isScaleRelevant(normMappedSrc) { // DECIMAL, NUMERIC
+			srcScale := int64(-1); if srcInfo.Scale.Valid { srcScale = srcInfo.Scale.Int64 } else { srcScale = 0 } // Default skala ke 0 jika tidak diset untuk perbandingan
+			dstScale := int64(-1); if dstInfo.Scale.Valid { dstScale = dstInfo.Scale.Int64 } else { dstScale = 0 }
 
-		// Presisi & Skala:
-		if isPrecisionRelevant(normMappedSrc) {
-			srcPrec := int64(-1); if srcInfo.Precision.Valid {srcPrec = srcInfo.Precision.Int64}
-			dstPrec := int64(-1); if dstInfo.Precision.Valid {dstPrec = dstInfo.Precision.Int64}
-			// Untuk tipe waktu, presisi 0 atau tidak diset bisa berarti default DB.
-			// Jika satu 0 dan yang lain >0, itu perbedaan. Jika keduanya 0 atau tidak diset, OK.
-			isTimeType := strings.Contains(normMappedSrc, "time") || strings.Contains(normMappedSrc, "timestamp")
-			if isTimeType && ((srcPrec == 0 || srcPrec == -1) && (dstPrec == 0 || dstPrec == -1)) {
-				// Keduanya default precision untuk time, anggap sama
-			} else if srcPrec != dstPrec {
-				log.Debug("Type precision mismatch", zap.Int64("src_prec", srcPrec), zap.Int64("dst_prec", dstPrec))
+			if srcInfo.Scale.Valid != dstInfo.Scale.Valid || (srcInfo.Scale.Valid && dstInfo.Scale.Valid && srcScale != dstScale) {
+				log.Debug("Decimal/Numeric type scale mismatch or one is not set", zap.Int64("src_scale", srcScale), zap.Bool("src_scale_valid", srcInfo.Scale.Valid), zap.Int64("dst_scale", dstScale), zap.Bool("dst_scale_valid", dstInfo.Scale.Valid))
 				return false
 			}
 		}
-		if isScaleRelevant(normMappedSrc) {
-			srcScale := int64(-1); if srcInfo.Scale.Valid {srcScale = srcInfo.Scale.Int64}
-			dstScale := int64(-1); if dstInfo.Scale.Valid {dstScale = dstInfo.Scale.Int64}
-			if srcScale != dstScale {
-				log.Debug("Type scale mismatch", zap.Int64("src_scale", srcScale), zap.Int64("dst_scale", dstScale))
-				return false
-			}
-		}
-		log.Debug("Types and relevant attributes appear equivalent.")
+		log.Debug("Types and relevant attributes appear equivalent after base type match.")
 		return true
 	}
 
-	// Fallback equivalencies (sebaiknya ada di typemap.json atau special mappings)
+	// Fallback equivalencies (sebaiknya juga bisa dikonfigurasi di typemap.json sebagai special mappings jika mungkin)
+	// MySQL tinyint(1) vs PostgreSQL/SQLite boolean
 	if (s.srcDialect == "mysql" && (s.dstDialect == "postgres" || s.dstDialect == "sqlite")) ||
-	   ((s.srcDialect == "postgres" || s.srcDialect == "sqlite") && s.dstDialect == "mysql") {
-		// tinyint(1) [mysql] vs bool [postgres/sqlite]
-		if (normMappedSrc == "tinyint" && srcInfo.Length.Valid && srcInfo.Length.Int64 == 1 && normDst == "bool") ||
-			(normMappedSrc == "bool" && normDst == "tinyint" && dstInfo.Length.Valid && dstInfo.Length.Int64 == 1) {
-			log.Debug("Equivalent types (tinyint(1) <=> bool) across dialects.")
+		((s.srcDialect == "postgres" || s.srcDialect == "sqlite") && s.dstDialect == "mysql") {
+		isSrcTinyInt1 := normMappedSrc == "tinyint" && srcInfo.Length.Valid && srcInfo.Length.Int64 == 1
+		isDstTinyInt1 := normDst == "tinyint" && dstInfo.Length.Valid && dstInfo.Length.Int64 == 1
+		isSrcBool := normMappedSrc == "bool"
+		isDstBool := normDst == "bool"
+
+		if (isSrcTinyInt1 && isDstBool) || (isSrcBool && isDstTinyInt1) {
+			log.Debug("Equivalent types (tinyint(1) <=> bool) across dialects found.")
 			return true
 		}
 	}
+
+	// MySQL DATETIME vs PostgreSQL TIMESTAMP WITHOUT TIME ZONE
 	if (normMappedSrc == "datetime" && normDst == "timestamp") || (normMappedSrc == "timestamp" && normDst == "datetime") {
-		// Ini adalah perbandingan yang sangat umum antar MySQL (DATETIME) dan PostgreSQL (TIMESTAMP WITHOUT TIME ZONE)
-		// Jika presisi juga dibandingkan dan cocok, maka bisa dianggap ekuivalen.
-		srcPrec := int64(-1); if srcInfo.Precision.Valid {srcPrec = srcInfo.Precision.Int64}
-		dstPrec := int64(-1); if dstInfo.Precision.Valid {dstPrec = dstInfo.Precision.Int64}
-		if ((srcPrec == 0 || srcPrec == -1) && (dstPrec == 0 || dstPrec == -1)) || (srcPrec == dstPrec) {
-			log.Debug("Equivalent types (datetime <=> timestamp) with similar/default precision.")
+		// Ini adalah perbandingan yang sangat umum. Bandingkan juga presisi jika ada.
+		srcPrec := int64(-1); if srcInfo.Precision.Valid { srcPrec = srcInfo.Precision.Int64 }
+		dstPrec := int64(-1); if dstInfo.Precision.Valid { dstPrec = dstInfo.Precision.Int64 }
+		// Anggap presisi default (0 atau -1) sama.
+		if ((srcPrec <= 0 || !srcInfo.Precision.Valid) && (dstPrec <= 0 || !dstInfo.Precision.Valid)) || (srcPrec == dstPrec) {
+			log.Debug("Equivalent types (datetime <=> timestamp) with similar/default precision found.")
 			return true
 		}
-		log.Debug("Types datetime/timestamp differ in precision.", zap.Int64("srcP",srcPrec), zap.Int64("dstP",dstPrec))
-        return false
+		log.Debug("Types datetime/timestamp differ in precision.", zap.Int64("src_prec", srcPrec), zap.Int64("dst_prec", dstPrec))
+		return false
 	}
+
+	// DECIMAL vs NUMERIC (seringkali sinonim)
 	if (normMappedSrc == "decimal" && normDst == "numeric") || (normMappedSrc == "numeric" && normDst == "decimal") {
-		srcPrec := int64(-1); if srcInfo.Precision.Valid {srcPrec = srcInfo.Precision.Int64}
-		dstPrec := int64(-1); if dstInfo.Precision.Valid {dstPrec = dstInfo.Precision.Int64}
-		srcScale := int64(-1); if srcInfo.Scale.Valid {srcScale = srcInfo.Scale.Int64}
-		dstScale := int64(-1); if dstInfo.Scale.Valid {dstScale = dstInfo.Scale.Int64}
-		if srcPrec == dstPrec && srcScale == dstScale {
-			log.Debug("Equivalent types (decimal <=> numeric) with matching precision/scale.")
+		srcPrec := int64(-1); if srcInfo.Precision.Valid { srcPrec = srcInfo.Precision.Int64 }
+		dstPrec := int64(-1); if dstInfo.Precision.Valid { dstPrec = dstInfo.Precision.Int64 }
+		srcScale := int64(-1); if srcInfo.Scale.Valid { srcScale = srcInfo.Scale.Int64 } else { srcScale = 0 }
+		dstScale := int64(-1); if dstInfo.Scale.Valid { dstScale = dstInfo.Scale.Int64 } else { dstScale = 0 }
+
+		// Presisi dan skala harus cocok jika keduanya diset, atau jika salah satu tidak diset, yang lain juga tidak diset (atau default).
+		// Perlu penanganan yang lebih baik jika satu diset dan yang lain tidak (artinya default DB berlaku).
+		// Untuk saat ini, jika satu diset dan yang lain tidak, anggap berbeda.
+		if srcInfo.Precision.Valid == dstInfo.Precision.Valid && srcInfo.Scale.Valid == dstInfo.Scale.Valid {
+			if srcPrec == dstPrec && srcScale == dstScale {
+				log.Debug("Equivalent types (decimal <=> numeric) with matching precision/scale found.")
+				return true
+			}
+		} else if !srcInfo.Precision.Valid && !dstInfo.Precision.Valid && !srcInfo.Scale.Valid && !dstInfo.Scale.Valid {
+			// Keduanya tidak memiliki presisi/skala eksplisit, anggap sama (menggunakan default DB)
+			log.Debug("Equivalent types (decimal <=> numeric) with no explicit precision/scale found.")
 			return true
 		}
-		log.Debug("Types decimal/numeric differ in precision/scale.", zap.Int64("srcP",srcPrec), zap.Int64("dstP",dstPrec), zap.Int64("srcS",srcScale), zap.Int64("dstS",dstScale))
-        return false
+		log.Debug("Types decimal/numeric differ in precision/scale or one has explicit setting while other does not.",
+			zap.Int64("src_prec", srcPrec), zap.Int64("dst_prec", dstPrec),
+			zap.Int64("src_scale", srcScale), zap.Int64("dst_scale", dstScale))
+		return false
 	}
 
 	log.Debug("Types are not equivalent after normalization and all checks.")
@@ -225,10 +269,11 @@ func (s *SchemaSyncer) areTypesEquivalent(mappedSrcType, dstType string, srcInfo
 // areDefaultsEquivalent membandingkan nilai default.
 // `typeForDefaultComparison` adalah tipe dari kolom sumber (bisa MappedType atau tipe asli jika generated/mapping gagal)
 func (s *SchemaSyncer) areDefaultsEquivalent(srcDefRaw, dstDefRaw, typeForDefaultComparison string, log *zap.Logger) bool {
-	normSrcDef := normalizeDefaultValue(srcDefRaw)
-	normDstDef := normalizeDefaultValue(dstDefRaw)
+	// Logger sudah memiliki konteks kolom dari pemanggil getColumnModifications
+	normSrcDef := normalizeDefaultValue(srcDefRaw, s.srcDialect) // Berikan dialek untuk normalisasi yang lebih baik
+	normDstDef := normalizeDefaultValue(dstDefRaw, s.dstDialect)
 
-	log = log.With(
+	log.Debug("Comparing default values",
 		zap.String("src_def_raw", srcDefRaw), zap.String("dst_def_raw", dstDefRaw),
 		zap.String("norm_src_def", normSrcDef), zap.String("norm_dst_def", normDstDef),
 		zap.String("type_for_comparison", typeForDefaultComparison),
@@ -240,40 +285,127 @@ func (s *SchemaSyncer) areDefaultsEquivalent(srcDefRaw, dstDefRaw, typeForDefaul
 	}
 
 	// Jika satu NULL eksplisit ("null") dan yang lain string kosong (tidak ada default), anggap sama.
+	// Ini penting karena beberapa DB mungkin menampilkan NULL sebagai tidak adanya default.
 	if (normSrcDef == "null" && normDstDef == "") || (normSrcDef == "" && normDstDef == "null") {
-		log.Debug("One default is explicit 'null' and other is empty (no default), considered equivalent.")
+		log.Debug("One default is explicit 'null' and other is empty string (no default set), considered equivalent.")
 		return true
 	}
 
-
 	// Perbandingan khusus untuk tipe numerik
-	if isNumericType(typeForDefaultComparison) {
-		srcNum, errSrc := strconv.ParseFloat(normSrcDef, 64)
-		dstNum, errDst := strconv.ParseFloat(normDstDef, 64)
+	normTypeForDefault := normalizeTypeName(typeForDefaultComparison)
+	if isNumericType(normTypeForDefault) { // isNumericType dari compare_utils.go
+		// Gunakan APD untuk DECIMAL/NUMERIC
+		if normTypeForDefault == "decimal" || normTypeForDefault == "numeric" {
+			srcAPD, _, srcErrAPD := apd.NewFromString(stripQuotes(srcDefRaw)) // Coba parse dari raw yang belum dinormalisasi tapi sudah di-strip quote-nya
+			dstAPD, _, dstErrAPD := apd.NewFromString(stripQuotes(dstDefRaw))
 
-		if errSrc == nil && errDst == nil { // Keduanya berhasil diparse sebagai angka
-			if srcNum == dstNum {
-				log.Debug("Numeric default values are equivalent after parsing.", zap.Float64("src_num", srcNum), zap.Float64("dst_num", dstNum))
-				return true
+			if srcErrAPD == nil && dstErrAPD == nil { // Keduanya berhasil diparse sebagai APD
+				if srcAPD.Cmp(dstAPD) == 0 {
+					log.Debug("Decimal/Numeric default values are equivalent using APD.", zap.String("src_apd", srcAPD.String()), zap.String("dst_apd", dstAPD.String()))
+					return true
+				}
+				log.Debug("Decimal/Numeric default values differ using APD.", zap.String("src_apd", srcAPD.String()), zap.String("dst_apd", dstAPD.String()))
+				return false
 			}
-			log.Debug("Numeric default values differ.", zap.Float64("src_num", srcNum), zap.Float64("dst_num", dstNum))
-			return false // Keduanya angka tapi nilainya beda
+			// Jika salah satu gagal parse APD, lanjutkan ke float64 atau perbandingan string
+			log.Debug("Could not parse one or both decimal/numeric defaults as APD, falling back.", zap.Error(srcErrAPD), zap.Error(dstErrAPD))
 		}
 
-		// Jika salah satu angka, yang lain bukan (dan bukan fungsi yang diketahui)
-		isSrcKnownFunc := normSrcDef == "nextval" || normSrcDef == "current_timestamp" || normSrcDef == "current_date" || normSrcDef == "current_time" || normSrcDef == "uuid_function"
-		isDstKnownFunc := normDstDef == "nextval" || normDstDef == "current_timestamp" || normDstDef == "current_date" || normDstDef == "current_time" || normDstDef == "uuid_function"
+		// Coba parse sebagai float64 untuk tipe numerik lain (int, float, double)
+		// Hati-hati dengan string yang merupakan fungsi DB (misal, 'nextval(...)')
+		if !isKnownDbFunction(normSrcDef) && !isKnownDbFunction(normDstDef) {
+			srcNum, errSrcFloat := strconv.ParseFloat(normSrcDef, 64)
+			dstNum, errDstFloat := strconv.ParseFloat(normDstDef, 64)
 
-		if (errSrc == nil && errDst != nil && !isDstKnownFunc) || (errSrc != nil && errDst == nil && !isSrcKnownFunc) {
-			log.Debug("One default is numeric, the other is not (and not a known function).")
-			return false
+			if errSrcFloat == nil && errDstFloat == nil { // Keduanya berhasil diparse sebagai float
+				if srcNum == dstNum {
+					log.Debug("Numeric default values are equivalent after parsing to float64.", zap.Float64("src_num", srcNum), zap.Float64("dst_num", dstNum))
+					return true
+				}
+				log.Debug("Numeric default values (parsed as float64) differ.", zap.Float64("src_num", srcNum), zap.Float64("dst_num", dstNum))
+				return false
+			}
+
+			// Jika salah satu angka, yang lain bukan (dan bukan fungsi yang diketahui)
+			if (errSrcFloat == nil && errDstFloat != nil) || (errSrcFloat != nil && errDstFloat == nil) {
+				log.Debug("One default is float-parsable, the other is not (and neither are known DB functions).")
+				return false
+			}
 		}
 	}
 
-	// Periksa apakah perbedaan hanya pada quoting untuk string.
-	// `normalizeDefaultValue` sudah menghapus quote terluar.
-	// Jika setelah itu masih berbeda, maka memang berbeda.
+	// Perbandingan untuk tipe boolean (setelah normalisasi ke "0" atau "1" atau "true"/"false" oleh normalizeDefaultValue)
+	if normTypeForDefault == "bool" || (normTypeForDefault == "tinyint" && strings.Contains(typeForDefaultComparison, "(1)")) {
+		// normalizeDefaultValue sudah mencoba mengubah ke "0"/"1".
+		// Jika keduanya "0" atau keduanya "1", normSrcDef == normDstDef akan menangkapnya.
+		// Jika ada perbedaan seperti "true" vs "1", perlu penanganan tambahan jika normalizeDefaultValue tidak menanganinya.
+		// (Saat ini, normalizeDefaultValue sudah mengubah true/false ke 1/0).
+	}
 
+
+	// Jika sampai sini, dan normSrcDef != normDstDef, maka dianggap berbeda.
+	// Ini termasuk kasus di mana satu adalah fungsi DB dan yang lain adalah literal, atau keduanya fungsi berbeda.
 	log.Debug("Default values are not equivalent after all checks.")
 	return false
+}
+
+
+// --- Helper Functions (dipindahkan dari compare_utils.go jika hanya dipakai di sini, atau tetap di sana jika dipakai luas) ---
+
+// normalizeCollation (contoh sederhana, mungkin perlu lebih canggih)
+func normalizeCollation(coll, dialect string) string {
+	c := strings.ToLower(strings.TrimSpace(coll))
+	// Contoh: MySQL sering punya _ci, _cs, _bin. PostgreSQL bisa lebih kompleks.
+	// "utf8mb4_unicode_ci" -> "utf8mb4_unicode_ci"
+	// "default" -> "" (atau mapping ke default DB jika diketahui)
+	if c == "default" || c == "" {
+		// Mengembalikan string kosong untuk default bisa jadi pilihan,
+		// tapi ini berarti jika satu sisi eksplisit set default dan sisi lain implisit, akan dianggap beda.
+		// Ini mungkin yang diinginkan.
+		return ""
+	}
+	return c
+}
+
+// isLargeTextOrBlob membantu areTypesEquivalent
+func isLargeTextOrBlob(normalizedTypeName string) bool {
+	return strings.Contains(normalizedTypeName, "text") || // tinytext, text, mediumtext, longtext
+		strings.Contains(normalizedTypeName, "blob") || // tinyblob, blob, mediumblob, longblob
+		normalizedTypeName == "clob" || // Oracle, dll.
+		normalizedTypeName == "bytea" || // PostgreSQL
+		normalizedTypeName == "json" || // JSON types
+		normalizedTypeName == "xml"
+}
+
+// stripQuotes adalah helper kecil untuk membersihkan string default sebelum parsing numerik.
+func stripQuotes(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 {
+		if (s[0] == '\'' && s[len(s)-1] == '\'') ||
+			(s[0] == '"' && s[len(s)-1] == '"') ||
+			(s[0] == '`' && s[len(s)-1] == '`') {
+			return s[1 : len(s)-1]
+		}
+	}
+	return s
+}
+
+// isKnownDbFunction memeriksa apakah string default yang dinormalisasi adalah fungsi DB yang diketahui.
+// Ini digunakan untuk menghindari parse error saat membandingkan default numerik.
+func isKnownDbFunction(normalizedDefaultValue string) bool {
+	// Fungsi-fungsi ini harus cocok dengan output dari normalizeDefaultValue
+	switch normalizedDefaultValue {
+	case "current_timestamp", "current_date", "current_time",
+		"now()", // Beberapa normalisasi mungkin menghasilkan ini
+		"nextval", "uuid_generate_v4()", "gen_random_uuid()", "newid()", "uuid()", // Contoh fungsi UUID
+		"autoincrement", // Mungkin dari SQLite
+		"auto_increment":  // Mungkin dari MySQL setelah normalisasi tertentu
+		return true
+	default:
+		// Cek pola nextval yang lebih umum, misal: nextval('my_seq'::regclass)
+		if strings.HasPrefix(normalizedDefaultValue, "nextval(") {
+			return true
+		}
+		return false
+	}
 }

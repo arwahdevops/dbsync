@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	stdlog "log"
 	"os"
@@ -17,220 +18,282 @@ import (
 
 	"github.com/arwahdevops/dbsync/internal/config"
 	"github.com/arwahdevops/dbsync/internal/db"
-	"github.com/arwahdevops/dbsync/internal/logger"
+	"github.com/arwahdevops/dbsync/internal/logger" // Pastikan ini adalah import yang benar
 	"github.com/arwahdevops/dbsync/internal/metrics"
-	"github.com/arwahdevops/dbsync/internal/secrets" // <-- Impor paket baru
+	"github.com/arwahdevops/dbsync/internal/secrets"
 	"github.com/arwahdevops/dbsync/internal/server"
-	projectSync "github.com/arwahdevops/dbsync/internal/sync" // Impor paket sync internal dengan alias 'projectSync'
+	projectSync "github.com/arwahdevops/dbsync/internal/sync"
+)
+
+var (
+	syncDirectionOverride       string
+	batchSizeOverride           int
+	workersOverride             int
+	schemaSyncStrategyOverride  string
+	typeMappingFilePathOverride string
+	// Tambahkan flag lain yang ingin di-override di sini
 )
 
 func main() {
+	// Definisikan flag CLI
+	flag.StringVar(&syncDirectionOverride, "sync-direction", "", "Override SYNC_DIRECTION (e.g., mysql-to-postgres)")
+	flag.IntVar(&batchSizeOverride, "batch-size", 0, "Override BATCH_SIZE (must be > 0)")
+	flag.IntVar(&workersOverride, "workers", 0, "Override WORKERS (must be > 0)")
+	flag.StringVar(&schemaSyncStrategyOverride, "schema-strategy", "", "Override SCHEMA_SYNC_STRATEGY (drop_create, alter, none)")
+	flag.StringVar(&typeMappingFilePathOverride, "type-map-file", "", "Override TYPE_MAPPING_FILE_PATH")
+	// ... definisi flag lainnya ...
+	flag.Parse()
+
 	// 1. Load environment variables (.env overrides)
+	// stdlog digunakan di sini karena logger.Log belum diinisialisasi
 	if err := godotenv.Overload(".env"); err != nil {
 		stdlog.Printf("Warning: Could not load .env file: %v. Relying on environment variables.\n", err)
 	}
 
-	// 2. Initial config loading to get logging settings
+	// 2. Initial config loading untuk mendapatkan setting logger
 	preCfg := &struct {
 		EnableJsonLogging bool `env:"ENABLE_JSON_LOGGING" envDefault:"false"`
 		DebugMode         bool `env:"DEBUG_MODE" envDefault:"false"`
 	}{}
-	_ = env.Parse(preCfg) // Ignore error for pre-config
+	if err := env.Parse(preCfg); err != nil {
+		stdlog.Fatalf("Failed to parse pre-configuration for logger: %v", err)
+	}
 
-	// 3. Initialize Zap logger based on pre-config
+	// 3. Initialize Zap logger
 	if err := logger.Init(preCfg.DebugMode, preCfg.EnableJsonLogging); err != nil {
 		stdlog.Fatalf("Failed to initialize logger: %v", err)
 	}
-	defer func() { _ = logger.Log.Sync() }()
+	defer func() { _ = logger.Log.Sync() }() // Pastikan log di-flush saat keluar
 
-	// 4. Load and validate full configuration using Zap for logging errors
+	// 4. Load and validate full configuration dari environment variables
 	cfg, err := config.Load()
 	if err != nil {
-		logger.Log.Fatal("Configuration loading error", zap.Error(err))
+		logger.Log.Fatal("Configuration loading error from environment", zap.Error(err))
 	}
-	logLoadedConfig(cfg) // Log config safely
 
-	// 5. Setup context for graceful shutdown
+	// --- Terapkan Override dari Flag CLI SETELAH config.Load() ---
+	applyCliOverrides(cfg)
+
+	// Muat type mappings dari file SETELAH config utama (termasuk path dari CLI) dimuat
+	if err := config.LoadTypeMappings(cfg.TypeMappingFilePath, logger.Log); err != nil {
+		// LoadTypeMappings sudah melakukan logging, tidak perlu fatal di sini jika ia dirancang untuk fallback
+		logger.Log.Warn("Proceeding with potentially limited or no external type mappings due to load error.", zap.Error(err))
+	}
+
+	logLoadedConfig(cfg) // Log konfigurasi final
+
+	// 5. Setup context untuk graceful shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	// 6. Initialize Metrics Store
 	metricsStore := metrics.NewMetricsStore()
 
-	// 7. Initialize Secret Managers (Contoh Vault)
-	// Lakukan ini untuk setiap secret manager yang didukung
+	// 7. Initialize Secret Managers
 	vaultMgr, vaultErr := secrets.NewVaultManager(cfg, logger.Log)
 	if vaultErr != nil {
-		// Log error tapi jangan fatal jika Vault tidak di-enable
-		if cfg.VaultEnabled { // Hanya fatal jika seharusnya aktif
+		if cfg.VaultEnabled {
 			logger.Log.Fatal("Failed to initialize Vault secret manager", zap.Error(vaultErr))
 		} else {
 			logger.Log.Warn("Could not initialize Vault secret manager (Vault not enabled or config error)", zap.Error(vaultErr))
 		}
 	}
-	// Buat slice dari semua secret manager yang aktif (atau bisa diinisialisasi)
-	// Ini memungkinkan loadCredentials mencoba beberapa manager
 	availableSecretManagers := make([]secrets.SecretManager, 0)
-	if vaultMgr != nil { // Hanya tambahkan jika inisialisasi berhasil (meskipun mungkin disabled)
+	if vaultMgr != nil && vaultMgr.IsEnabled() {
 		availableSecretManagers = append(availableSecretManagers, vaultMgr)
 	}
-	// Tambahkan inisialisasi manager lain di sini dan append ke slice
-	// awsMgr, awsErr := secrets.NewAwsSmManager(cfg, logger.Log) ... if awsMgr != nil { availableSecretManagers = append...}
 
-	// 8. Load Credentials (Prioritaskan Env Var, lalu coba Secret Managers)
+	// 8. Load Credentials
 	logger.Log.Info("Loading database credentials...")
-	srcCreds, srcCredsErr := loadCredentials(ctx, cfg, &cfg.SrcDB, "source", availableSecretManagers)
-	if srcCredsErr != nil { logger.Log.Fatal("Failed to load source DB credentials", zap.Error(srcCredsErr)) }
+	srcCreds, srcCredsErr := loadCredentials(ctx, cfg, &cfg.SrcDB, "source", cfg.SrcSecretPath, cfg.SrcUsernameKey, cfg.SrcPasswordKey, availableSecretManagers)
+	if srcCredsErr != nil {
+		logger.Log.Fatal("Failed to load source DB credentials", zap.Error(srcCredsErr))
+	}
+	dstCreds, dstCredsErr := loadCredentials(ctx, cfg, &cfg.DstDB, "destination", cfg.DstSecretPath, cfg.DstUsernameKey, cfg.DstPasswordKey, availableSecretManagers)
+	if dstCredsErr != nil {
+		logger.Log.Fatal("Failed to load destination DB credentials", zap.Error(dstCredsErr))
+	}
 
-	dstCreds, dstCredsErr := loadCredentials(ctx, cfg, &cfg.DstDB, "destination", availableSecretManagers)
-	if dstCredsErr != nil { logger.Log.Fatal("Failed to load destination DB credentials", zap.Error(dstCredsErr)) }
-
-	// 9. Initialize database connections with retry (menggunakan kredensial yang sudah didapat)
+	// 9. Initialize database connections with retry
 	logger.Log.Info("Connecting to databases...")
 	var srcConn, dstConn *db.Connector
 	var dbWg sync.WaitGroup
-	var srcErr, dstErr error
+	var srcErrInner, dstErrInner error
 	dbWg.Add(2)
-
 	go func() {
 		defer dbWg.Done()
-		// Panggil connectDBWithRetry dengan kredensial eksplisit
-		srcConn, srcErr = connectDBWithRetry(ctx, cfg.SrcDB, srcCreds.Username, srcCreds.Password, cfg.MaxRetries, cfg.RetryInterval, "source", metricsStore)
+		srcConn, srcErrInner = connectDBWithRetry(ctx, cfg.SrcDB, srcCreds.Username, srcCreds.Password, cfg.MaxRetries, cfg.RetryInterval, "source", metricsStore)
 	}()
 	go func() {
 		defer dbWg.Done()
-		// Panggil connectDBWithRetry dengan kredensial eksplisit
-		dstConn, dstErr = connectDBWithRetry(ctx, cfg.DstDB, dstCreds.Username, dstCreds.Password, cfg.MaxRetries, cfg.RetryInterval, "destination", metricsStore)
+		dstConn, dstErrInner = connectDBWithRetry(ctx, cfg.DstDB, dstCreds.Username, dstCreds.Password, cfg.MaxRetries, cfg.RetryInterval, "destination", metricsStore)
 	}()
 	dbWg.Wait()
-
-	if srcErr != nil { logger.Log.Fatal("Failed to establish source DB connection", zap.Error(srcErr)) }
-	if dstErr != nil { logger.Log.Fatal("Failed to establish destination DB connection", zap.Error(dstErr)) }
-
-	// Defer closing connections
+	if srcErrInner != nil {
+		logger.Log.Fatal("Failed to establish source DB connection", zap.Error(srcErrInner))
+	}
+	if dstErrInner != nil {
+		logger.Log.Fatal("Failed to establish destination DB connection", zap.Error(dstErrInner))
+	}
 	defer func() {
 		logger.Log.Info("Closing database connections...")
-		if srcConn != nil { if err := srcConn.Close(); err != nil { logger.Log.Error("Error closing source DB", zap.Error(err)) } }
-		if dstConn != nil { if err := dstConn.Close(); err != nil { logger.Log.Error("Error closing destination DB", zap.Error(err)) } }
+		if srcConn != nil {
+			if err := srcConn.Close(); err != nil {
+				logger.Log.Error("Error closing source DB", zap.Error(err))
+			}
+		}
+		if dstConn != nil {
+			if err := dstConn.Close(); err != nil {
+				logger.Log.Error("Error closing destination DB", zap.Error(err))
+			}
+		}
 	}()
 
 	// 10. Optimize connection pools
 	logger.Log.Info("Optimizing database connection pools")
-	if err := srcConn.Optimize(cfg.ConnPoolSize, cfg.ConnMaxLifetime); err != nil { logger.Log.Warn("Failed to optimize source DB pool", zap.Error(err)) }
-	if err := dstConn.Optimize(cfg.ConnPoolSize, cfg.ConnMaxLifetime); err != nil { logger.Log.Warn("Failed to optimize destination DB pool", zap.Error(err)) }
+	if err := srcConn.Optimize(cfg.ConnPoolSize, cfg.ConnMaxLifetime); err != nil {
+		logger.Log.Warn("Failed to optimize source DB pool", zap.Error(err))
+	}
+	if err := dstConn.Optimize(cfg.ConnPoolSize, cfg.ConnMaxLifetime); err != nil {
+		logger.Log.Warn("Failed to optimize destination DB pool", zap.Error(err))
+	}
 
-	// 11. Start HTTP Server for Metrics, Health, Pprof (runs in background)
+	// 11. Start HTTP Server
 	go server.RunHTTPServer(ctx, cfg, metricsStore, srcConn, dstConn, logger.Log)
 
 	// 12. Create and run the synchronization process
 	logger.Log.Info("Starting database synchronization process...")
-	var syncer projectSync.FullSyncInterface = projectSync.NewFullSync(srcConn, dstConn, cfg, logger.Log, metricsStore)
+	syncer := projectSync.NewFullSync(srcConn, dstConn, cfg, logger.Log, metricsStore)
 	results := syncer.Run(ctx)
 
-	// 13. Process and log results after Run finishes
+	// 13. Process and log results
 	logger.Log.Info("Synchronization process finished. Processing results...")
 	exitCode := processResults(results)
 
-	// 14. Wait for shutdown signal if Run finished before signal was received
-	logger.Log.Info("Waiting for shutdown signal (Ctrl+C or SIGTERM)...")
-	<-ctx.Done()
+	// 14. Wait for shutdown or completion
+	if ctx.Err() == nil {
+		logger.Log.Info("Main synchronization logic completed. Waiting for shutdown signal (Ctrl+C or SIGTERM)...")
+		<-ctx.Done()
+	} else {
+		logger.Log.Info("Shutdown signal received during synchronization. Proceeding with cleanup.")
+	}
 
-	logger.Log.Info("Shutdown signal received or process completed. Exiting.", zap.Int("exit_code", exitCode))
+	logger.Log.Info("Shutdown complete. Exiting.", zap.Int("exit_code", exitCode))
 	os.Exit(exitCode)
 }
 
+// applyCliOverrides menerapkan nilai dari flag CLI ke struct Config.
+func applyCliOverrides(cfg *config.Config) {
+	if syncDirectionOverride != "" {
+		logger.Log.Info("Overriding SYNC_DIRECTION with CLI flag", zap.String("env_value", cfg.SyncDirection), zap.String("cli_value", syncDirectionOverride))
+		cfg.SyncDirection = syncDirectionOverride
+	}
+	if batchSizeOverride > 0 {
+		logger.Log.Info("Overriding BATCH_SIZE with CLI flag", zap.Int("env_value", cfg.BatchSize), zap.Int("cli_value", batchSizeOverride))
+		cfg.BatchSize = batchSizeOverride
+	}
+	if workersOverride > 0 {
+		logger.Log.Info("Overriding WORKERS with CLI flag", zap.Int("env_value", cfg.Workers), zap.Int("cli_value", workersOverride))
+		cfg.Workers = workersOverride
+	}
+	if schemaSyncStrategyOverride != "" {
+		logger.Log.Info("Overriding SCHEMA_SYNC_STRATEGY with CLI flag", zap.String("env_value", string(cfg.SchemaSyncStrategy)), zap.String("cli_value", schemaSyncStrategyOverride))
+		cfg.SchemaSyncStrategy = config.SchemaSyncStrategy(strings.ToLower(schemaSyncStrategyOverride))
+	}
+	if typeMappingFilePathOverride != "" {
+		logger.Log.Info("Overriding TYPE_MAPPING_FILE_PATH with CLI flag", zap.String("env_value", cfg.TypeMappingFilePath), zap.String("cli_value", typeMappingFilePathOverride))
+		cfg.TypeMappingFilePath = typeMappingFilePathOverride
+	}
+}
 
-// --- Helper Functions ---
-
-// logLoadedConfig safely logs configuration details.
+// logLoadedConfig
 func logLoadedConfig(cfg *config.Config) {
-	logger.Log.Info("Configuration loaded successfully",
+	logger.Log.Info("Final configuration in use",
 		zap.String("sync_direction", cfg.SyncDirection),
-		// Source DB (sensitive password omitted)
+		zap.Int("batch_size", cfg.BatchSize),
+		zap.Int("workers", cfg.Workers),
+		zap.String("schema_strategy", string(cfg.SchemaSyncStrategy)),
+		zap.String("type_mapping_file_path", cfg.TypeMappingFilePath),
 		zap.String("src_dialect", cfg.SrcDB.Dialect), zap.String("src_host", cfg.SrcDB.Host), zap.Int("src_port", cfg.SrcDB.Port), zap.String("src_user", cfg.SrcDB.User), zap.String("src_dbname", cfg.SrcDB.DBName), zap.String("src_sslmode", cfg.SrcDB.SSLMode),
-		// Destination DB (sensitive password omitted)
 		zap.String("dst_dialect", cfg.DstDB.Dialect), zap.String("dst_host", cfg.DstDB.Host), zap.Int("dst_port", cfg.DstDB.Port), zap.String("dst_user", cfg.DstDB.User), zap.String("dst_dbname", cfg.DstDB.DBName), zap.String("dst_sslmode", cfg.DstDB.SSLMode),
-		// Sync Parameters
-		zap.Int("workers", cfg.Workers), zap.Int("batch_size", cfg.BatchSize), zap.Duration("table_timeout", cfg.TableTimeout), zap.String("schema_strategy", string(cfg.SchemaSyncStrategy)), zap.Bool("skip_failed_tables", cfg.SkipFailedTables), zap.Bool("disable_fk_during_sync", cfg.DisableFKDuringSync),
-		// Retry Parameters
+		zap.Duration("table_timeout", cfg.TableTimeout), zap.Bool("skip_failed_tables", cfg.SkipFailedTables), zap.Bool("disable_fk_during_sync", cfg.DisableFKDuringSync),
 		zap.Int("max_retries", cfg.MaxRetries), zap.Duration("retry_interval", cfg.RetryInterval),
-		// Pool Parameters
 		zap.Int("conn_pool_size", cfg.ConnPoolSize), zap.Duration("conn_max_lifetime", cfg.ConnMaxLifetime),
-		// Observability
-		zap.Bool("json_logging", cfg.EnableJsonLogging), zap.Bool("enable_pprof", cfg.EnablePprof), zap.Int("metrics_port", cfg.MetricsPort),
-		// Vault Config (sensitive token omitted)
-		zap.Bool("vault_enabled", cfg.VaultEnabled), zap.String("vault_addr", cfg.VaultAddr), zap.String("src_secret_path", cfg.SrcSecretPath), zap.String("dst_secret_path", cfg.DstSecretPath),
+		zap.Bool("json_logging", cfg.EnableJsonLogging), zap.Bool("enable_pprof", cfg.EnablePprof), zap.Int("metrics_port", cfg.MetricsPort), zap.Bool("debug_mode", cfg.DebugMode),
+		zap.Bool("vault_enabled", cfg.VaultEnabled), zap.String("vault_addr", cfg.VaultAddr), zap.Bool("vault_token_present", cfg.VaultToken != ""),
+		zap.String("vault_cacert", cfg.VaultCACert), zap.Bool("vault_skip_verify", cfg.VaultSkipVerify),
+		zap.String("src_secret_path", cfg.SrcSecretPath), zap.String("src_username_key", cfg.SrcUsernameKey), zap.String("src_password_key", cfg.SrcPasswordKey),
+		zap.String("dst_secret_path", cfg.DstSecretPath), zap.String("dst_username_key", cfg.DstUsernameKey), zap.String("dst_password_key", cfg.DstPasswordKey),
 	)
 }
 
-// loadCredentials attempts to load DB credentials either directly from config or via secret managers.
+// loadCredentials
 func loadCredentials(
 	ctx context.Context,
 	cfg *config.Config,
-	dbCfg *config.DatabaseConfig, // Pointer ke config DB spesifik (SRC/DST)
-	dbLabel string, // "source" or "destination"
-	secretManagers []secrets.SecretManager, // Terima slice dari semua manager yang diinisialisasi
+	dbCfg *config.DatabaseConfig,
+	dbLabel string,
+	secretPath string,
+	usernameKey string,
+	passwordKey string,
+	secretManagers []secrets.SecretManager,
 ) (*secrets.Credentials, error) {
+	log := logger.Log.With(zap.String("db", dbLabel)) // Menggunakan logger.Log
 
-	log := logger.Log.With(zap.String("db", dbLabel))
-
-	// 1. Prioritaskan password dari environment variable langsung
 	if dbCfg.Password != "" {
-		log.Info("Using password directly from environment variable")
+		log.Info("Using password directly from environment variable for DB.")
 		if dbCfg.User == "" {
-			return nil, fmt.Errorf("password provided for %s DB via env var, but username is missing", dbLabel)
+			return nil, fmt.Errorf("password provided for %s DB via env var, but username (e.g., %s_USER) is missing", dbLabel, strings.ToUpper(dbLabel))
 		}
-		return &secrets.Credentials{
-			Username: dbCfg.User,
-			Password: dbCfg.Password,
-		}, nil
+		return &secrets.Credentials{Username: dbCfg.User, Password: dbCfg.Password}, nil
 	}
-	log.Info("Password not found in environment variable, checking secret managers...")
+	log.Info("Password not found in direct environment variable for this DB. Checking secret managers...")
 
-	// 2. Cek secret managers secara berurutan
-	var secretPath string
-	if dbLabel == "source" { secretPath = cfg.SrcSecretPath } else { secretPath = cfg.DstSecretPath }
-
-	// Hanya coba secret manager jika path-nya ada
 	if secretPath != "" {
+		if len(secretManagers) == 0 {
+			log.Info("Secret path is configured, but no secret managers are active/enabled.")
+		}
 		for _, sm := range secretManagers {
-			if sm != nil && sm.IsEnabled() {
-				log.Info("Attempting to retrieve credentials from configured secret manager", zap.String("manager_type", fmt.Sprintf("%T", sm)), zap.String("path_or_id", secretPath))
-				// Beri timeout pada pengambilan secret?
-				getCtx, cancel := context.WithTimeout(ctx, 15*time.Second) // Timeout 15 detik
-				creds, err := sm.GetCredentials(getCtx, secretPath)
-				cancel() // Selalu panggil cancel
+			log.Info("Attempting to retrieve credentials from configured secret manager",
+				zap.String("manager_type", fmt.Sprintf("%T", sm)),
+				zap.String("path_or_id", secretPath),
+			)
+			getCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			creds, err := sm.GetCredentials(getCtx, secretPath, usernameKey, passwordKey)
+			cancel()
 
-				if err == nil && creds != nil {
-					log.Info("Successfully retrieved credentials from secret manager")
-					if creds.Password == "" { return nil, fmt.Errorf("retrieved credentials for %s, but password field is empty", dbLabel) }
-					// Fallback username jika kosong di secret
-					if creds.Username == "" {
-						log.Warn("Username field empty in retrieved secret, falling back to environment variable username")
-						creds.Username = dbCfg.User
-						if creds.Username == "" { return nil, fmt.Errorf("password retrieved for %s, but username is missing in both secret and env var", dbLabel) }
-					}
-					return creds, nil
-				} else {
-					log.Warn("Failed to retrieve credentials from secret manager", zap.String("manager_type", fmt.Sprintf("%T", sm)), zap.Error(err))
+			if err == nil && creds != nil {
+				log.Info("Successfully retrieved credentials from secret manager.")
+				if creds.Password == "" {
+					return nil, fmt.Errorf("retrieved credentials for %s from %T, but password field is empty", dbLabel, sm)
 				}
+				if creds.Username == "" {
+					log.Warn("Username field empty in retrieved secret. Falling back to DB config username (from env var or default).",
+						zap.String("db_config_user", dbCfg.User))
+					creds.Username = dbCfg.User
+					if creds.Username == "" {
+						return nil, fmt.Errorf("password retrieved for %s, but username is missing in both secret and DB config (e.g., %s_USER)", dbLabel, strings.ToUpper(dbLabel))
+					}
+				}
+				return creds, nil
 			}
+			log.Warn("Failed to retrieve credentials from secret manager. Trying next if available.", // Menggunakan logger.Log.Warn
+				zap.String("manager_type", fmt.Sprintf("%T", sm)),
+				zap.Error(err),
+			)
 		}
 	} else {
-		log.Warn("Secret path/ID is not configured, cannot use secret managers")
+		log.Info("Secret path is not configured for this DB. Cannot use secret managers.")
 	}
 
-
-	// 3. Jika semua gagal (password env kosong DAN secret manager gagal/tidak aktif/tidak dikonfigurasi pathnya)
-	log.Error("Failed to load credentials: Password not found in env vars and no enabled secret manager provided valid credentials for the configured path.")
-	return nil, fmt.Errorf("could not load credentials for %s DB", dbLabel)
+	log.Error("Failed to load credentials for DB: Password not found in env vars, and no enabled secret manager provided valid credentials for the configured path (if any).") // Menggunakan logger.Log.Error
+	return nil, fmt.Errorf("could not load credentials for %s DB. Ensure %s_PASSWORD or Vault (if enabled via VAULT_ENABLED=true and %s_SECRET_PATH is set) is configured correctly", dbLabel, strings.ToUpper(dbLabel), strings.ToUpper(dbLabel))
 }
 
-
-// connectDBWithRetry perlu diubah untuk menerima username/password
+// connectDBWithRetry
 func connectDBWithRetry(
 	ctx context.Context,
-	dbCfg config.DatabaseConfig, // Tetap terima config untuk host, port, dll.
+	dbCfg config.DatabaseConfig,
 	username string,
 	password string,
 	maxRetries int,
@@ -241,15 +304,13 @@ func connectDBWithRetry(
 	gl := logger.GetGormLogger()
 	var lastErr error
 
-	// Bangun DSN menggunakan kredensial yang diterima
-	dsn := buildDSN(dbCfg, username, password) // buildDSN diubah
+	dsn := buildDSN(dbCfg, username, password)
 	if dsn == "" {
 		err := fmt.Errorf("could not build DSN for %s DB (unsupported dialect: %s)", dbLabel, dbCfg.Dialect)
 		metricsStore.SyncErrorsTotal.WithLabelValues("connection", dbLabel).Inc()
 		return nil, err
 	}
 
-	// Logika retry loop sama
 	for i := 0; i <= maxRetries; i++ {
 		attemptStartTime := time.Now()
 		if i > 0 {
@@ -257,12 +318,18 @@ func connectDBWithRetry(
 			timer := time.NewTimer(retryInterval); select { case <-timer.C: case <-ctx.Done(): timer.Stop(); errMsg := fmt.Errorf("cancelled waiting retry %s DB: %w (last error: %v)", dbLabel, ctx.Err(), lastErr); metricsStore.SyncErrorsTotal.WithLabelValues("connection_cancelled", dbLabel).Inc(); return nil, errMsg }
 		}
 
-		logger.Log.Info("Attempting to connect", zap.String("db", dbLabel), zap.String("dialect", dbCfg.Dialect), zap.Int("attempt", i+1))
-		conn, err := db.New(dbCfg.Dialect, dsn, gl) // Gunakan DSN yang sudah dibangun
+		logger.Log.Info("Attempting to connect", zap.String("db", dbLabel), zap.String("dialect", dbCfg.Dialect), zap.String("host", dbCfg.Host), zap.Int("port", dbCfg.Port), zap.String("dbname", dbCfg.DBName), zap.Int("attempt", i+1))
+		conn, err := db.New(dbCfg.Dialect, dsn, gl)
 		if err != nil { lastErr = fmt.Errorf("connect attempt %d/%d failed: %w", i+1, maxRetries+1, err); continue }
 
-		pingErr := conn.Ping(ctx)
-		if pingErr != nil { lastErr = fmt.Errorf("ping attempt %d/%d failed: %w (conn err: %v)", i+1, maxRetries+1, pingErr, err); _ = conn.Close(); continue }
+		pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
+		pingErr := conn.Ping(pingCtx)
+		pingCancel()
+		if pingErr != nil {
+			lastErr = fmt.Errorf("ping attempt %d/%d failed: %w (conn err: %v)", i+1, maxRetries+1, pingErr, err)
+			_ = conn.Close()
+			continue
+		}
 
 		logger.Log.Info("Database connection successful", zap.String("db", dbLabel), zap.Duration("connect_duration", time.Since(attemptStartTime)))
 		return conn, nil
@@ -270,13 +337,11 @@ func connectDBWithRetry(
 
 	logger.Log.Error("Failed to connect to database after all retries", zap.String("db", dbLabel), zap.Int("attempts", maxRetries+1), zap.Error(lastErr))
 	metricsStore.SyncErrorsTotal.WithLabelValues("connection_failed", dbLabel).Inc()
-	return nil, fmt.Errorf("failed to connect to %s DB (%s) after %d attempts: %w", dbLabel, dbCfg.Dialect, maxRetries+1, lastErr)
+	return nil, fmt.Errorf("failed to connect to %s DB (%s at %s:%d) after %d attempts: %w", dbLabel, dbCfg.Dialect, dbCfg.Host, dbCfg.Port, maxRetries+1, lastErr)
 }
 
-
-// buildDSN diubah untuk menerima kredensial
+// buildDSN
 func buildDSN(cfg config.DatabaseConfig, username, password string) string {
-	// Ambil detail lain dari cfg
 	host := cfg.Host
 	port := cfg.Port
 	dbname := cfg.DBName
@@ -284,8 +349,19 @@ func buildDSN(cfg config.DatabaseConfig, username, password string) string {
 
 	switch strings.ToLower(cfg.Dialect) {
 	case "mysql":
-		return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local&timeout=10s&readTimeout=60s&writeTimeout=60s",
-			username, password, host, port, dbname)
+		sslParam := ""
+		if sslmode == "disable" || sslmode == "" {
+			// no param
+		} else if sslmode == "skip-verify" {
+			sslParam = "&tls=skip-verify"
+		} else {
+			sslParam = "&tls=true"
+			if sslmode == "verify-ca" || sslmode == "verify-full" {
+				logger.Log.Warn("MySQL SSL modes 'verify-ca' or 'verify-full' typically require mysql.RegisterTLSConfig for proper setup. Using basic '&tls=true'.", zap.String("sslmode", sslmode))
+			}
+		}
+		return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local&timeout=10s&readTimeout=60s&writeTimeout=60s%s",
+			username, password, host, port, dbname, sslParam)
 	case "postgres":
 		return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s connect_timeout=10",
 			host, port, username, password, dbname, sslmode)
@@ -297,27 +373,93 @@ func buildDSN(cfg config.DatabaseConfig, username, password string) string {
 	}
 }
 
-// processResults (Tidak Berubah, tapi pastikan tipenya projectSync.SyncResult)
+// processResults
 func processResults(results map[string]projectSync.SyncResult) (exitCode int) {
-	successCount := 0; schemaFailCount := 0; dataFailCount := 0; constraintFailCount := 0; skippedCount := 0
+	successCount := 0
+	schemaFailCount := 0
+	dataFailCount := 0
+	constraintFailCount := 0
+	skippedCount := 0
 	totalTables := len(results)
-	if totalTables == 0 { logger.Log.Warn("Sync finished, no tables processed."); return 0 }
 
-	for table, res := range results {
-		fields := []zap.Field{ zap.String("table", table), zap.Duration("duration", res.Duration), zap.Bool("skipped", res.Skipped), zap.Bool("schema_sync_skipped", res.SchemaSyncSkipped), zap.Int64("rows_synced", res.RowsSynced), zap.Int("batches", res.Batches), zap.NamedError("schema_error", res.SchemaError), zap.NamedError("data_error", res.DataError), zap.NamedError("constraint_error", res.ConstraintError), }
-		level := zap.InfoLevel; status := "Success"
-		if res.Skipped { skippedCount++; level = zap.WarnLevel; status = "Skipped"; if res.SchemaError != nil { schemaFailCount++; status = "Skipped (Schema Error)" }; if res.DataError != nil { dataFailCount++; status = "Skipped (Data Error)" }; if res.ConstraintError != nil { constraintFailCount++; status = "Skipped (Constraint Error)" }
-		} else if res.SchemaError != nil { schemaFailCount++; level = zap.ErrorLevel; status = "Schema Failure"
-		} else if res.DataError != nil { dataFailCount++; level = zap.ErrorLevel; status = "Data Failure"
-		} else if res.ConstraintError != nil { constraintFailCount++; level = zap.WarnLevel; status = "Constraint Failure"; successCount++
-		} else { successCount++ }
-		logger.Log.Check(level, "Table sync result: "+status).Write(fields...)
+	if totalTables == 0 {
+		logger.Log.Warn("Sync finished, but no tables were found in the source or all were filtered out.")
+		return 0
 	}
 
-	logger.Log.Info("Synchronization summary", zap.Int("total_tables_attempted", totalTables), zap.Int("successful_data_constraint_sync", successCount), zap.Int("schema_failures", schemaFailCount), zap.Int("data_failures", dataFailCount), zap.Int("constraint_failures", constraintFailCount), zap.Int("skipped", skippedCount))
+	var failedTables []string
+	var constraintFailedTables []string
 
-	if schemaFailCount > 0 || dataFailCount > 0 { logger.Log.Error("Sync completed with critical errors."); return 1 }
-	if constraintFailCount > 0 { logger.Log.Warn("Sync completed successfully for data, but with constraint errors."); return 2 }
-	if skippedCount == totalTables && totalTables > 0 { logger.Log.Warn("Sync completed, but all tables were skipped."); return 3 }
-	logger.Log.Info("Synchronization completed successfully."); return 0
+	for table, res := range results {
+		fields := []zap.Field{
+			zap.String("table", table),
+			zap.Duration("duration", res.Duration),
+			zap.Bool("processing_skipped", res.Skipped),
+			zap.Bool("schema_sync_explicitly_disabled", res.SchemaSyncSkipped),
+			zap.Int64("rows_synced", res.RowsSynced),
+			zap.Int("batches_processed", res.Batches),
+		}
+		if res.SchemaError != nil { fields = append(fields, zap.NamedError("schema_error", res.SchemaError)) }
+		if res.DataError != nil { fields = append(fields, zap.NamedError("data_error", res.DataError)) }
+		if res.ConstraintError != nil { fields = append(fields, zap.NamedError("constraint_error", res.ConstraintError)) }
+
+		level := zap.InfoLevel
+		statusMsg := "Table synchronization SUCCEEDED."
+
+		if res.Skipped {
+			skippedCount++
+			level = zap.WarnLevel
+			statusMsg = "Table processing SKIPPED."
+			// ... (detail alasan skipped seperti sebelumnya)
+		} else if res.SchemaError != nil {
+			schemaFailCount++
+			failedTables = append(failedTables, table)
+			level = zap.ErrorLevel
+			statusMsg = "Table schema synchronization FAILED."
+		} else if res.DataError != nil {
+			dataFailCount++
+			failedTables = append(failedTables, table)
+			level = zap.ErrorLevel
+			statusMsg = "Table data synchronization FAILED."
+		} else if res.ConstraintError != nil {
+			constraintFailCount++
+			constraintFailedTables = append(constraintFailedTables, table)
+			level = zap.WarnLevel
+			statusMsg = "Table data sync SUCCEEDED, but applying constraints FAILED."
+			successCount++
+		} else {
+			successCount++
+		}
+		logger.Log.Check(level, statusMsg).Write(fields...)
+	}
+
+	logger.Log.Info("-------------------- Synchronization Summary --------------------",
+		zap.Int("total_tables_evaluated", totalTables),
+		zap.Int("tables_fully_successful", successCount),
+		zap.Int("tables_with_schema_failures", schemaFailCount),
+		zap.Int("tables_with_data_failures", dataFailCount),
+		zap.Int("tables_with_constraint_failures_only", constraintFailCount),
+		zap.Int("tables_skipped_processing", skippedCount),
+	)
+	if len(failedTables) > 0 {
+		logger.Log.Error("Critical failures occurred for tables (schema or data sync failed)", zap.Strings("tables", failedTables))
+	}
+	if len(constraintFailedTables) > 0 {
+		logger.Log.Warn("Constraint application failures occurred for tables (data was synced)", zap.Strings("tables", constraintFailedTables))
+	}
+
+	if schemaFailCount > 0 || dataFailCount > 0 {
+		logger.Log.Error("Overall synchronization: COMPLETED WITH CRITICAL ERRORS.")
+		return 1
+	}
+	if constraintFailCount > 0 {
+		logger.Log.Warn("Overall synchronization: COMPLETED WITH CONSTRAINT APPLICATION ERRORS (data was synced successfully).")
+		return 2
+	}
+	if skippedCount == totalTables && totalTables > 0 {
+		logger.Log.Warn("Overall synchronization: COMPLETED, BUT ALL TABLES WERE SKIPPED (check logs for reasons).")
+		return 3
+	}
+	logger.Log.Info("Overall synchronization: COMPLETED SUCCESSFULLY.")
+	return 0
 }

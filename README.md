@@ -1,4 +1,7 @@
 ---
+
+```markdown
+---
 # DBSync 🔄
 
 [![Go Version](https://img.shields.io/badge/Go-1.20%2B-blue.svg)](https://golang.org/)
@@ -44,36 +47,43 @@ Supports synchronization between the following combinations:
 ### Schema Synchronization
 Handles table structure synchronization with configurable strategies:
 
-| Strategy     | Description                                                                    | Status         |
-|--------------|--------------------------------------------------------------------------------|----------------|
-| `drop_create`| **(Default)** Drops and recreates destination tables. **DESTRUCTIVE!**           | Stable         |
-| `alter`      | Attempts `ALTER TABLE` for additions/removals. **Complex type changes may fail.** | Experimental   |
-| `none`       | No schema changes are applied to the destination.                                | Stable         |
+| Strategy     | Description                                                                                                                               | Status         |
+|--------------|-----------------------------------------------------------------------------------------------------------------------------------------|----------------|
+| `drop_create`| **(Default)** Drops and recreates destination tables. **DESTRUCTIVE!**                                                                  | Stable         |
+| `alter`      | Attempts `ALTER TABLE` for additions/removals/modifications of columns, indexes, & constraints. **Complex type changes may fail.**       | Experimental   |
+| `none`       | No schema changes are applied to the destination.                                                                                        | Stable         |
 
-*   Also attempts to synchronize Indexes and Unique/Foreign Key Constraints.
+*   Also attempts to synchronize Indexes and Unique/Foreign Key Constraints. Detection and DDL generation might be limited for complex constraints/indexes (e.g., CHECK, functional indexes).
+*   **The `alter` strategy is severely limited for SQLite** due to SQLite's native `ALTER TABLE` limitations (see [Limitations](#️-limitations--considerations)).
 
 ### Data Synchronization
 - Efficient data transfer using configurable batch sizes.
-- Idempotent operations using `ON CONFLICT UPDATE` (Upsert).
+- Idempotent operations using `ON CONFLICT UPDATE` (Upsert) on supported dialects (PG, MySQL >= 5.7?, SQLite >= 3.24.0).
 - Handles large tables using primary key-based pagination (single or composite keys).
 - Processes tables concurrently using a configurable worker pool.
+- Option (experimental) to disable foreign key constraints (`DISABLE_FK_DURING_SYNC`) during data load for potential speed improvements (risk of invalid data if source is inconsistent).
 
 ### Custom Type Mapping
 - Allows defining custom data type mappings between source and target dialects via a JSON configuration file (`TYPE_MAPPING_FILE_PATH`).
-- Supports direct mappings (e.g., `mysql.int` -> `postgres.integer`) and special regex-based pattern mappings (e.g., `mysql.tinyint(1)` -> `postgres.boolean`).
+- **Mapping Process:**
+    1.  The source data type is normalized (e.g., `varchar(255)` -> `varchar`, `int(11) unsigned` -> `int`).
+    2.  **`special_mappings`:** The JSON file can contain regex patterns (`source_type_pattern`) matched against the *full* original source type name (lowercase, e.g., `tinyint(1)`). If a pattern matches, the specified `target_type` is used. These take priority.
+    3.  **`mappings`:** If no special pattern matches, the normalized source type key (from step 1) is looked up in the `mappings` map. If found, the corresponding `target_type` is used.
+    4.  **Internal/Fallback:** If no match is found in the JSON configuration, or if the file isn't provided, dbsync might have internal fallbacks or use the source type directly if source and target dialects are the same. If no mapping is found, a generic fallback type (e.g., `TEXT`) is used.
+    5.  **Modifiers:** After the base target type is determined (from step 2, 3, or 4), `dbsync` attempts to apply modifiers (length, precision, scale) from the original source type to the target base type, if relevant for that target data type.
 
 ### Robustness & Observability
-| Feature              | Description                                                    |
-|----------------------|----------------------------------------------------------------|
-| Retry Logic          | Retries failed DB connections and batch operations.            |
-| Graceful Shutdown    | Handles `SIGINT`/`SIGTERM` for clean exit.                      |
-| Error Handling       | Option to skip failed tables (`SKIP_FAILED_TABLES`).           |
-| Structured Logging   | Uses Zap logger, supports JSON output (`ENABLE_JSON_LOGGING`). |
-| Prometheus Metrics   | Exposes detailed metrics on `/metrics` (port `METRICS_PORT`).  |
-| Health Checks        | Provides `/healthz` (liveness) & `/readyz` (readiness) checks. |
-| Profiling            | Optional pprof endpoints via `ENABLE_PPROF`.                   |
-| Timeouts             | Configurable per-table timeout (`TABLE_TIMEOUT`).              |
-| Secret Management    | Optional integration with HashiCorp Vault.                     |
+| Feature              | Description                                                                  |
+|----------------------|----------------------------------------------------------------------------|
+| Retry Logic          | Retries failed DB connections and batch operations.                          |
+| Graceful Shutdown    | Handles `SIGINT`/`SIGTERM` for clean exit.                                  |
+| Error Handling       | Option to skip failed tables (`SKIP_FAILED_TABLES`).                         |
+| Structured Logging   | Uses Zap logger, supports JSON output (`ENABLE_JSON_LOGGING`).             |
+| Prometheus Metrics   | Exposes detailed metrics on `/metrics` (port `METRICS_PORT`).               |
+| Health Checks        | Provides `/healthz` (liveness) & `/readyz` (readiness) endpoints.          |
+| Profiling            | Optional pprof endpoints via `ENABLE_PPROF`.                               |
+| Timeouts             | Configurable per-table timeout (`TABLE_TIMEOUT`).                           |
+| Secret Management    | Optional integration with HashiCorp Vault.                                 |
 
 ---
 
@@ -112,31 +122,36 @@ At minimum, you need to define the sync direction and connection details for bot
 **Example `.env` Snippet (Direct Password):**
 ```dotenv
 # --- Core Settings ---
-SYNC_DIRECTION=mysql-to-postgres # Required
+SYNC_DIRECTION=mysql-to-postgres # Required: mysql-to-mysql, mysql-to-postgres, postgres-to-mysql, postgres-to-postgres, sqlite-to-mysql, sqlite-to-postgres
 SCHEMA_SYNC_STRATEGY=drop_create   # drop_create, alter, none
 
 # --- Source Database (Required) ---
-SRC_DIALECT=mysql
+SRC_DIALECT=mysql             # mysql, postgres, sqlite
 SRC_HOST=127.0.0.1
 SRC_PORT=3306
-SRC_USER=source_user              # Username is always required
+SRC_USER=source_user          # Username is always required
 SRC_PASSWORD=your_source_password # Provide password here if NOT using Vault
-SRC_DBNAME=source_db
-SRC_SSLMODE=disable
+SRC_DBNAME=source_db          # DB Name / File path for SQLite
+SRC_SSLMODE=disable           # disable, require, verify-ca, verify-full (adjust per DB)
 
 # --- Destination Database (Required) ---
-DST_DIALECT=postgres
+DST_DIALECT=postgres          # mysql, postgres
 DST_HOST=127.0.0.1
 DST_PORT=5432
-DST_USER=dest_user                # Username is always required
-DST_PASSWORD=your_dest_password   # Provide password here if NOT using Vault
+DST_USER=dest_user            # Username is always required
+DST_PASSWORD=your_dest_password # Provide password here if NOT using Vault
 DST_DBNAME=dest_db
-DST_SSLMODE=disable
+DST_SSLMODE=disable           # disable, require, verify-ca, verify-full (adjust per DB)
 
 # --- Other Optional Settings ---
 # BATCH_SIZE=1000
 # WORKERS=8
+# TABLE_TIMEOUT=5m
+# SKIP_FAILED_TABLES=false
+# DISABLE_FK_DURING_SYNC=false # Set to true to attempt FK disabling during data load (experimental)
 # DEBUG_MODE=false
+# ENABLE_JSON_LOGGING=false
+# ENABLE_PPROF=false
 # METRICS_PORT=9091
 # TYPE_MAPPING_FILE_PATH=./typemap.json
 # ... etc ...
@@ -202,13 +217,20 @@ You can provide a JSON file to define custom data type mappings between source a
       "source_dialect": "mysql",
       "target_dialect": "postgres",
       "mappings": {
-        "int": "INTEGER",
-        "varchar": "VARCHAR"
+        "int": "INTEGER",         // Mapping from normalized source type
+        "varchar": "VARCHAR",
+        "text": "TEXT"
+        // ... other standard mappings ...
       },
       "special_mappings": [
         {
+          // Match original source type (lowercase) with regex
           "source_type_pattern": "^tinyint\\(1\\)$",
-          "target_type": "BOOLEAN"
+          "target_type": "BOOLEAN" // Target type if match
+        },
+        {
+          "source_type_pattern": "^enum\\((.*)\\)$", // Capture enum values (currently unused)
+          "target_type": "VARCHAR(255)" // Map all enums to VARCHAR
         }
       ]
     }
@@ -216,59 +238,60 @@ You can provide a JSON file to define custom data type mappings between source a
   ]
 }
 ```
-*   `mappings`: Direct mapping from the source type name (after basic normalization, e.g., "int" not "int(11)") to the target type name.
+*   `mappings`: Direct mapping from the (basic normalized) source type name (e.g., "int" not "int(11)") to the target base type name.
 *   `special_mappings`:
-    *   `source_type_pattern`: A regex pattern that will be matched against the full lowercase source type name (e.g., "tinyint(1)").
-    *   `target_type`: The target type to use if the pattern matches.
+    *   `source_type_pattern`: A regex pattern matched against the full lowercase source type name (e.g., "tinyint(1)", "varchar(255)").
+    *   `target_type`: The target base type to use if the pattern matches.
+*   **Modifiers (Length/Precision/Scale):** After the target base type is determined from `mappings` or `special_mappings`, `dbsync` attempts to apply modifiers from the original source type to the target type if relevant.
 
-Set the `TYPE_MAPPING_FILE_PATH` environment variable to point to this file (e.g., `TYPE_MAPPING_FILE_PATH=./typemap.json`). If not configured or the file is not found, `dbsync` will use internal fallbacks or use types directly if possible.
+Set the `TYPE_MAPPING_FILE_PATH` environment variable to point to this file (e.g., `TYPE_MAPPING_FILE_PATH=./typemap.json`). If not configured or the file is not found, `dbsync` will use internal fallbacks or use types directly if dialects are the same or no mapping is found.
 
 ### Key Environment Variables
 
-| Variable               | Default       | Description                                                                   | Required |
-|------------------------|---------------|-------------------------------------------------------------------------------|----------|
-| `SYNC_DIRECTION`       | -             | Sync direction (e.g., `mysql-to-postgres`)                                    | Yes      |
-| `SRC_DIALECT`          | -             | Source DB dialect (`mysql`, `postgres`, `sqlite`)                             | Yes      |
-| `SRC_HOST`             | -             | Source DB host                                                                | Yes      |
-| `SRC_PORT`             | -             | Source DB port                                                                | Yes      |
-| `SRC_USER`             | -             | Source DB username (Always required)                                          | Yes      |
-| `SRC_PASSWORD`         | *(empty)*     | Source DB password (Use this OR Vault/Secret Manager)                         | Optional |
-| `SRC_DBNAME`           | -             | Source DB name / file path (SQLite)                                           | Yes      |
-| `SRC_SSLMODE`          | `disable`     | Source DB SSL mode (relevant for MySQL/Postgres)                              | No       |
-| `DST_DIALECT`          | -             | Destination DB dialect (`mysql`, `postgres`)                                  | Yes      |
-| `DST_HOST`             | -             | Destination DB host                                                           | Yes      |
-| `DST_PORT`             | -             | Destination DB port                                                           | Yes      |
-| `DST_USER`             | -             | Destination DB username (Always required)                                     | Yes      |
-| `DST_PASSWORD`         | *(empty)*     | Destination DB password (Use this OR Vault/Secret Manager)                    | Optional |
-| `DST_DBNAME`           | -             | Destination DB name                                                           | Yes      |
-| `DST_SSLMODE`          | `disable`     | Destination DB SSL mode                                                       | No       |
-| `SCHEMA_SYNC_STRATEGY` | `drop_create` | How to handle schema differences (`drop_create`, `alter`, `none`)             | No       |
-| `BATCH_SIZE`           | 1000          | Number of rows per data transfer batch                                        | No       |
-| `WORKERS`              | 8             | Number of tables to process concurrently                                      | No       |
-| `TABLE_TIMEOUT`        | 5m            | Max duration for processing a single table (schema + data + constraints)      | No       |
-| `SKIP_FAILED_TABLES`   | false         | Continue syncing other tables if one fails                                    | No       |
-| `DISABLE_FK_DURING_SYNC`| false        | (Experimental) Attempt to disable FKs during data load                       | No       |
-| `MAX_RETRIES`          | 3             | Max retries for operations like batch inserts                                 | No       |
-| `RETRY_INTERVAL`       | 5s            | Wait time between retries                                                     | No       |
-| `CONN_POOL_SIZE`       | 20            | Max open DB connections per pool                                              | No       |
-| `CONN_MAX_LIFETIME`    | 1h            | Max lifetime for DB connections                                               | No       |
-| `DEBUG_MODE`           | false         | Enable verbose debug logging and stack traces                                 | No       |
-| `ENABLE_JSON_LOGGING`  | false         | Output logs in JSON format                                                    | No       |
-| `ENABLE_PPROF`         | false         | Enable pprof HTTP endpoints for profiling                                     | No       |
-| `METRICS_PORT`         | 9091          | Port for `/metrics`, `/healthz`, `/readyz`, `/debug/pprof/` endpoints   | No       |
-| `TYPE_MAPPING_FILE_PATH`| `./typemap.json`| Path to custom type mapping JSON file (optional)                             | No       |
-| **Vault Specific**     |               |                                                                               |          |
-| `VAULT_ENABLED`        | `false`       | Set `true` to enable Vault integration                                        | No       |
-| `VAULT_ADDR`           | `https://...` | Vault server address                                                          | If Enabled |
-| `VAULT_TOKEN`          | -             | Vault token for authentication                                                | If Enabled (and using token auth) |
-| `VAULT_CACERT`         | -             | Path to Vault CA certificate (optional)                                       | No       |
-| `VAULT_SKIP_VERIFY`    | `false`       | Skip Vault TLS verification (INSECURE)                                        | No       |
-| `SRC_SECRET_PATH`      | -             | Path to source DB secret in Vault                                             | If Enabled |
-| `DST_SECRET_PATH`      | -             | Path to destination DB secret in Vault                                        | If Enabled |
-| `SRC_USERNAME_KEY`     | `username`    | Key name for username within the source Vault secret data                     | No       |
-| `SRC_PASSWORD_KEY`     | `password`    | Key name for password within the source Vault secret data                     | No       |
-| `DST_USERNAME_KEY`     | `username`    | Key name for username within the destination Vault secret data                | No       |
-| `DST_PASSWORD_KEY`     | `password`    | Key name for password within the destination Vault secret data                | No       |
+| Variable               | Default       | Description                                                                          | Required |
+|------------------------|---------------|------------------------------------------------------------------------------------|----------|
+| `SYNC_DIRECTION`       | -             | Sync direction (e.g., `mysql-to-postgres`)                                         | Yes      |
+| `SRC_DIALECT`          | -             | Source DB dialect (`mysql`, `postgres`, `sqlite`)                                | Yes      |
+| `SRC_HOST`             | -             | Source DB host                                                                   | Yes      |
+| `SRC_PORT`             | -             | Source DB port                                                                   | Yes      |
+| `SRC_USER`             | -             | Source DB username (Always required)                                             | Yes      |
+| `SRC_PASSWORD`         | *(empty)*     | Source DB password (Use this OR Vault)                                             | Optional |
+| `SRC_DBNAME`           | -             | Source DB name / file path (SQLite)                                                | Yes      |
+| `SRC_SSLMODE`          | `disable`     | Source DB SSL mode (relevant for MySQL/Postgres)                                   | No       |
+| `DST_DIALECT`          | -             | Destination DB dialect (`mysql`, `postgres`)                                       | Yes      |
+| `DST_HOST`             | -             | Destination DB host                                                                | Yes      |
+| `DST_PORT`             | -             | Destination DB port                                                                | Yes      |
+| `DST_USER`             | -             | Destination DB username (Always required)                                        | Yes      |
+| `DST_PASSWORD`         | *(empty)*     | Destination DB password (Use this OR Vault)                                        | Optional |
+| `DST_DBNAME`           | -             | Destination DB name                                                                | Yes      |
+| `DST_SSLMODE`          | `disable`     | Destination DB SSL mode                                                            | No       |
+| `SCHEMA_SYNC_STRATEGY` | `drop_create` | How to handle schema differences (`drop_create`, `alter`, `none`)                | No       |
+| `BATCH_SIZE`           | 1000          | Number of rows per data transfer batch                                             | No       |
+| `WORKERS`              | 8             | Number of tables to process concurrently                                         | No       |
+| `TABLE_TIMEOUT`        | 5m            | Max duration for processing a single table (schema + data + constraints)           | No       |
+| `SKIP_FAILED_TABLES`   | false         | Continue syncing other tables if one fails                                         | No       |
+| `DISABLE_FK_DURING_SYNC`| false        | (Experimental) Attempt to disable FKs during data load                          | No       |
+| `MAX_RETRIES`          | 3             | Max retries for operations like batch inserts                                      | No       |
+| `RETRY_INTERVAL`       | 5s            | Wait time between retries                                                          | No       |
+| `CONN_POOL_SIZE`       | 20            | Max open DB connections per pool                                                   | No       |
+| `CONN_MAX_LIFETIME`    | 1h            | Max lifetime for DB connections                                                    | No       |
+| `DEBUG_MODE`           | false         | Enable verbose debug logging and stack traces                                    | No       |
+| `ENABLE_JSON_LOGGING`  | false         | Output logs in JSON format                                                         | No       |
+| `ENABLE_PPROF`         | false         | Enable pprof HTTP endpoints for profiling                                         | No       |
+| `METRICS_PORT`         | 9091          | Port for `/metrics`, `/healthz`, `/readyz`, `/debug/pprof/` endpoints           | No       |
+| `TYPE_MAPPING_FILE_PATH`| *(empty)*     | Path to custom type mapping JSON file (optional, default `./typemap.json`)         | No       |
+| **Vault Specific**     |               |                                                                                    |          |
+| `VAULT_ENABLED`        | `false`       | Set `true` to enable Vault integration                                             | No       |
+| `VAULT_ADDR`           | `https://...` | Vault server address                                                               | If Enabled |
+| `VAULT_TOKEN`          | -             | Vault token for authentication                                                     | If Enabled (and using token auth) |
+| `VAULT_CACERT`         | -             | Path to Vault CA certificate (optional)                                            | No       |
+| `VAULT_SKIP_VERIFY`    | `false`       | Skip Vault TLS verification (INSECURE)                                             | No       |
+| `SRC_SECRET_PATH`      | -             | Path to source DB secret in Vault (KV v2)                                          | If Enabled |
+| `DST_SECRET_PATH`      | -             | Path to destination DB secret in Vault (KV v2)                                     | If Enabled |
+| `SRC_USERNAME_KEY`     | `username`    | Key name for username within the source Vault secret data                          | No       |
+| `SRC_PASSWORD_KEY`     | `password`    | Key name for password within the source Vault secret data                          | No       |
+| `DST_USERNAME_KEY`     | `username`    | Key name for username within the destination Vault secret data                     | No       |
+| `DST_PASSWORD_KEY`     | `password`    | Key name for password within the destination Vault secret data                     | No       |
 
 *(See `.env.example` for the full list and descriptions)*
 
@@ -284,7 +307,7 @@ Some configuration settings from environment variables can be overridden using c
 
 **Example:**
 ```bash
-./dbsync -sync-direction sqlite-to-mysql -batch-size 500
+./dbsync -sync-direction sqlite-to-mysql -batch-size 500 -type-map-file /etc/dbsync/my_typemap.json
 ```
 CLI flags will take precedence over their corresponding environment variables.
 
@@ -333,19 +356,25 @@ curl http://localhost:9091/readyz
 *   🔐 **Least Privilege Principle:** Grant the database users configured for `dbsync` only the minimum necessary permissions:
     *   **Source User:** Requires `SELECT` permissions on the tables to be synced and permissions to query `information_schema` (or equivalent schema metadata tables).
     *   **Target User:** Requires permissions for `SELECT`, `INSERT`, `UPDATE`, `DELETE`. Depending on the `SCHEMA_SYNC_STRATEGY`, it also needs `DROP TABLE`, `CREATE TABLE`, `ALTER TABLE`, `CREATE INDEX`, `DROP INDEX`, `ALTER TABLE ADD CONSTRAINT`, `ALTER TABLE DROP CONSTRAINT`.
-*   🔒 **Secure Connections:** **Strongly recommended** to use encrypted database connections in production by setting `SRC_SSLMODE` and `DST_SSLMODE` to `require`, `verify-ca`, or `verify-full` (depending on your setup) for PostgreSQL and configuring equivalent TLS settings for MySQL. Similarly, ensure the connection to Vault (`VAULT_ADDR`) uses HTTPS and configure `VAULT_CACERT` or disable `VAULT_SKIP_VERIFY=false`.
+*   🔒 **Secure Connections:** **Strongly recommended** to use encrypted database connections in production by setting `SRC_SSLMODE` and `DST_SSLMODE` to `require`, `verify-ca`, or `verify-full` (depending on your setup) for PostgreSQL and configuring equivalent TLS settings for MySQL. Similarly, ensure the connection to Vault (`VAULT_ADDR`) uses HTTPS and configure `VAULT_CACERT` or do not set `VAULT_SKIP_VERIFY=true`.
 
 ---
 
 ## ⚠️ Limitations & Considerations
 
-*   **One-Way, Full Sync:** This tool performs a one-way (source -> destination) full data synchronization on each run. It's not suitable for real-time replication or CDC.
-*   **Primary Key Requirement:** Efficient data synchronization relies heavily on sortable primary keys (single or composite) for pagination. Tables without primary keys might fail to sync or perform poorly, especially if large and `SCHEMA_SYNC_STRATEGY=none`.
-*   **`alter` Strategy:** The `alter` schema strategy is **experimental**. It may not handle all schema differences correctly, especially complex type changes between different database dialects. Use with caution and thorough testing.
-*   **Constraint/Index Sync:** While the tool attempts to sync indexes and constraints, the detection and DDL generation might be incomplete for all types or database versions (especially CHECK constraints and complex indexes). Foreign Keys are typically applied *after* data sync, which could fail if data violates the constraint.
-*   **Complex Types:** Mapping for custom types, complex arrays, spatial data, etc., might be limited. Unknown types often fall back to generic text types. The custom type mapping feature (`TYPE_MAPPING_FILE_PATH`) can help address this.
-*   **Generated Columns:** Data in generated/computed columns is not directly synced; the destination DB is expected to compute them. Type mapping is skipped for such columns.
-*   **Performance:** Sync speed depends heavily on network, disk I/O, database tuning, data volume, chosen `WORKERS`/`BATCH_SIZE`, etc.
+*   **One-Way, Full Sync:** This tool performs a one-way (source -> destination) full data synchronization on each run. It's not suitable for real-time replication or Change Data Capture (CDC).
+*   **Primary Key Requirement:** Efficient data synchronization relies heavily on sortable primary keys (single or composite) for pagination. Tables without primary keys might fail to sync data reliably or perform poorly, especially if large.
+*   **`alter` Strategy (Experimental):**
+    *   The `alter` schema strategy is tagged **experimental**. Its ability to handle all schema differences may be limited, particularly:
+        *   **Complex Type Changes:** Changing data types between different dialects (e.g., `TEXT` to `VARCHAR(10)` in MySQL, `VARCHAR` to `INT`) might fail, cause data loss/truncation, or require manual `USING` clauses (PostgreSQL) that `dbsync` may not generate perfectly. Use with extreme caution for type changes.
+        *   **Modifying `IDENTITY`/`AUTO_INCREMENT`:** Adding or removing these properties on existing columns is usually not handled automatically by the `alter` strategy.
+        *   **Generated Columns:** Changes to generated column expressions are not detected or handled.
+    *   The `drop_create` strategy is more reliable for significant schema changes.
+*   **SQLite `ALTER TABLE` Limitations:** SQLite has very limited `ALTER TABLE` support. The `alter` strategy **will not** attempt to change the type, nullability, default value, or collation of existing columns in SQLite. For such changes, you must recreate the table manually or use the `drop_create` strategy.
+*   **Constraint/Index Sync:** While the tool attempts to sync indexes and constraints, detection and DDL generation might be incomplete for all types (especially `CHECK` constraints) or database versions. Foreign Keys are typically applied *after* data sync, which could fail if data violates the constraint. `DISABLE_FK_DURING_SYNC` can help initial load but doesn't fix underlying data issues.
+*   **Complex Data Types:** Mapping for custom types, complex arrays, spatial data, etc., might be limited or require explicit definitions in `typemap.json`. Unknown types often fallback to generic text types.
+*   **Generated/Computed Columns:** Data in generated/computed columns is not directly synced; the destination DB is expected to compute them based on its definition. Type mapping is skipped for such columns.
+*   **Performance:** Sync speed depends heavily on network latency/bandwidth, disk I/O, database tuning, data volume, chosen `WORKERS`/`BATCH_SIZE`, complexity of transformations, etc.
 
 ---
 
@@ -353,21 +382,21 @@ curl http://localhost:9091/readyz
 
 **Common Issues & Solutions:**
 
-| Issue                          | Potential Solution                                                                 |
-|--------------------------------|------------------------------------------------------------------------------------|
-| Connection Failures            | Verify DB connection details (`.env`/flags), network, firewalls, DB user credentials.      |
-| Vault Connection/Auth Errors   | Verify `VAULT_ADDR`, `VAULT_TOKEN` (or other auth), network access, TLS config. |
-| Secret Not Found (Vault)       | Check `SRC/DST_SECRET_PATH` and ensure the secret exists with correct keys.      |
-| Permission Denied              | Check source/target DB user privileges match requirements.                         |
-| Schema DDL Errors              | Check logs for failed DDL. Investigate incompatibility. Consider `SCHEMA_SYNC_STRATEGY=none`. |
-| Data Sync Errors (Constraint)| Data violates UNIQUE/FK/CHECK. Ensure target schema matches *or* clean source data. |
-| Data Sync Errors (Type)      | Data type mismatch between source/target not handled by mapping. Investigate data or adjust `typemap.json`. |
-| Invalid Type Mapping File | Ensure `TYPE_MAPPING_FILE_PATH` points to a valid JSON file. Check JSON syntax. |
-| Slow Performance               | Tune `WORKERS`, `BATCH_SIZE`, `CONN_POOL_SIZE`. Monitor DB/network performance.    |
-| Pagination Issues (Rare)       | Ensure PKs are stable and sortable correctly by the source DB.                     |
+| Issue                          | Potential Solution                                                                          |
+|---------------------------------|-------------------------------------------------------------------------------------------|
+| Connection Failures            | Verify DB connection details (`.env`/flags), network connectivity, firewalls, DB user credentials & privileges. |
+| Vault Connection/Auth Errors   | Verify `VAULT_ADDR`, `VAULT_TOKEN` (or other auth method), network access, TLS config (`VAULT_CACERT`, `VAULT_SKIP_VERIFY`). |
+| Secret Not Found (Vault)       | Check `SRC/DST_SECRET_PATH` exists in Vault and the token has permission. Ensure keys (`username`/`password` or custom) exist within the secret's `data` field (KV v2). |
+| Permission Denied              | Check source/target DB user privileges match requirements (SELECT on source; SELECT, INSERT, UPDATE, DELETE, CREATE/ALTER/DROP on target depending on strategy). |
+| Schema DDL Errors (ALTER/CREATE)| Check logs for the specific failed DDL statement. Investigate incompatibility or syntax errors. Consider `SCHEMA_SYNC_STRATEGY=none` or `drop_create`. Note limitations of `alter` strategy, especially for type changes and SQLite. |
+| Data Sync Errors (Constraint)  | Data violates `UNIQUE`/`FK`/`CHECK` constraint on destination. Ensure target schema matches *or* clean source data. `DISABLE_FK_DURING_SYNC=true` might allow loading but doesn't fix the data. |
+| Data Sync Errors (Type)        | Data type mismatch between source/target not handled correctly by mapping (e.g., string too long for target `VARCHAR`, non-numeric in numeric column). Investigate source data or adjust `typemap.json`. |
+| Invalid Type Mapping File Error| Ensure `TYPE_MAPPING_FILE_PATH` points to a valid JSON file. Check JSON syntax & regex patterns. |
+| Slow Performance               | Tune `WORKERS`, `BATCH_SIZE`, `CONN_POOL_SIZE`. Monitor DB/network performance. Analyze query plans on source/destination. |
+| Pagination Issues (No PK / Rare)| Ensure PKs exist for large tables if using `alter` or `drop_create`. Check if PK values are stable and sortable correctly by the source DB. |
 
 **Debugging:**
-Set `DEBUG_MODE=true` in your `.env` file (or via flag if implemented) for more verbose logging, including SQL queries (passwords redacted) and stack traces on errors. Use `ENABLE_JSON_LOGGING=true` for easier log parsing.
+Set `DEBUG_MODE=true` in your `.env` file for more verbose logging, including SQL queries (passwords redacted) and stack traces on errors. Use `ENABLE_JSON_LOGGING=true` for easier log parsing.
 
 ---
 
@@ -386,4 +415,6 @@ Contributions are welcome! Please feel free to submit issues or pull requests.
 ## 📄 License
 
 Distributed under the MIT License. See [LICENSE](LICENSE) file for more information.
+
+
 ---

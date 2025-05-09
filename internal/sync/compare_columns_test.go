@@ -3,7 +3,6 @@ package sync
 
 import (
 	"database/sql"
-	// "strings" // Tidak digunakan secara langsung di file test ini
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -15,7 +14,7 @@ func newColInfo(name, typ string, nullable bool, isPrimary bool, isGenerated boo
 	return ColumnInfo{
 		Name:            name,
 		Type:            typ,
-		MappedType:      "", // Akan diisi secara manual oleh test atau helper
+		MappedType:      "", // Akan diisi secara manual oleh test
 		IsNullable:      nullable,
 		IsPrimary:       isPrimary,
 		IsGenerated:     isGenerated,
@@ -30,15 +29,8 @@ func newColInfo(name, typ string, nullable bool, isPrimary bool, isGenerated boo
 	}
 }
 
-// Helper untuk membuat sql.NullInt64
-func nullInt(val int64) sql.NullInt64 {
-	return sql.NullInt64{Int64: val, Valid: true}
-}
-
-// Helper untuk membuat sql.NullString
-func nullStr(val string) sql.NullString {
-	return sql.NullString{String: val, Valid: true}
-}
+func nullInt(val int64) sql.NullInt64 { return sql.NullInt64{Int64: val, Valid: true} }
+func nullStr(val string) sql.NullString { return sql.NullString{String: val, Valid: true} }
 
 var noInt = sql.NullInt64{}
 var noStr = sql.NullString{}
@@ -54,41 +46,47 @@ func TestAreDefaultsEquivalent(t *testing.T) {
 		srcDefRaw                string
 		dstDefRaw                string
 		typeForDefaultComparison string
-		expected                 bool
+		expected                 bool // Ekspektasi disesuaikan dengan logika "presisi DDL"
 		overrideSyncer           *SchemaSyncer
 	}{
 		{"Identical Strings", "'hello'", "'hello'", "varchar", true, nil},
 		{"Identical Strings Different Quotes", "'hello'", `"hello"`, "varchar", true, nil},
 		{"Different Strings", "'hello'", "'world'", "varchar", false, nil},
-		{"Identical Numbers", "123", "123", "int", true, nil},
-		{"Different Numbers", "123", "124", "int", false, nil},
-		{"Identical Floats", "1.23", "1.23", "float", true, nil},
-		{"Different Floats", "1.23", "1.24", "float", false, nil},
-		{"Float Equiv 0", "0", "0.0", "float", true, nil},
-		{"Float Equiv 5", "5", "5.00", "decimal(10,2)", true, nil},
-		{"Number vs String", "123", "'123'", "int", false, nil},
-		{"String vs Number", "'123'", "123", "varchar", false, nil},
+		{"Identical Numbers (Raw)", "123", "123", "int", true, nil},
+		{"Different Numbers (Raw)", "123", "124", "int", false, nil},
+		{"Identical Floats (Raw)", "1.23", "1.23", "float", true, nil},
+		{"Different Floats (Raw)", "1.23", "1.24", "float", false, nil},
+		{"Float Equiv 0 (Raw)", "0", "0.0", "float", true, nil}, // "0" dan "0.0" setelah normalisasi akan dibandingkan sebagai float
+		{"Float Equiv 5 (Raw)", "5", "5.00", "decimal(10,2)", true, nil}, // "5" dan "5.00" setelah normalisasi akan dibandingkan numerik
+
+		// Kasus di mana DDL asli berbeda (angka vs. string angka)
+		{"Number vs String (type int)", "123", "'123'", "int", false, nil},         // Diharapkan false karena DDL asli beda
+		{"String vs Number (type varchar)", "'123'", "123", "varchar", false, nil}, // Diharapkan false karena DDL asli beda
+
 		{"NULL vs Empty (Normalized)", "null", "", "varchar", true, nil},
 		{"Empty vs NULL (Normalized)", "", "NULL", "int", true, nil},
 		{"NULL vs Literal", "NULL", "'hello'", "varchar", false, nil},
-		{"Literal vs NULL", "'0'", "null", "int", false, nil},
+		{"Literal vs NULL", "'0'", "null", "int", false, nil}, // '0' adalah literal, NULL adalah null
 		{"Both Empty", "", "", "varchar", true, nil},
 		{"Both NULL (Normalized)", "null", "NULL", "varchar", true, nil},
 		{"Identical Functions (Normalized)", "CURRENT_TIMESTAMP", "now()", "timestamp", true, nil},
 		{"Different Functions", "CURRENT_DATE", "now()", "date", false, nil},
 		{"Function vs Literal", "now()", "'2025-01-01'", "timestamp", false, nil},
-		{"Boolean True Equiv (Normalized)", "1", "true", "bool", true, nil},
-		{"Boolean False Equiv (Normalized)", "0", "false", "bool", true, nil},
-		{"Boolean True vs False (Normalized)", "1", "false", "bool", false, nil},
-		{"MySQL Bool TinyInt Equiv (Normalized)", "'1'", "true", "tinyint(1)", true, &SchemaSyncer{srcDialect: "mysql", dstDialect: "mysql", logger: logger}},
-		{"MySQL Bool TinyInt Diff (Normalized)", "'1'", "false", "tinyint(1)", false, &SchemaSyncer{srcDialect: "mysql", dstDialect: "mysql", logger: logger}},
+		{"Boolean True Equiv (Normalized)", "1", "true", "bool", true, nil}, // true -> "1"
+		{"Boolean False Equiv (Normalized)", "0", "false", "bool", true, nil},// false -> "0"
+		{"Boolean True vs False (Normalized)", "1", "false", "bool", false, nil}, // "1" vs "0"
+		{"MySQL Bool TinyInt Equiv (Normalized)", "'1'", "true", "tinyint(1)", true, &SchemaSyncer{srcDialect: "mysql", dstDialect: "mysql", logger: logger}}, // true -> "1"
+		{"MySQL Bool TinyInt Diff (Normalized)", "'1'", "false", "tinyint(1)", false, &SchemaSyncer{srcDialect: "mysql", dstDialect: "mysql", logger: logger}}, // "1" vs "0"
 		{"Postgres Cast vs Literal (Normalized)", "'hello'::text", "'hello'", "text", true, &SchemaSyncer{srcDialect: "postgres", dstDialect: "postgres", logger: logger}},
 		{"Postgres Cast vs Diff Literal (Normalized)", "'hello'::text", "'world'", "text", false, &SchemaSyncer{srcDialect: "postgres", dstDialect: "postgres", logger: logger}},
 		{"Postgres Cast Func vs Func (Normalized)", "now()::timestamp", "current_timestamp", "timestamp", true, &SchemaSyncer{srcDialect: "postgres", dstDialect: "postgres", logger: logger}},
-		{"Decimal Comparison with APD (same)", "10.000", "10", "decimal(10,3)", true, nil},
-		{"Decimal Comparison with APD (different)", "10.001", "10", "decimal(10,3)", false, nil},
-		{"Quoted Numeric vs Numeric", "'123'", "123", "int", true, nil},
-		{"Quoted Numeric vs Quoted Numeric", "'123'", "'123.0'", "float", true, nil},
+		{"Decimal Comparison with APD (same, normalized)", "10.000", "10", "decimal(10,3)", true, nil}, // "10.000" vs "10" -> APD(10.000) vs APD(10) -> sama
+		{"Decimal Comparison with APD (different, normalized)", "10.001", "10", "decimal(10,3)", false, nil}, // "10.001" vs "10" -> APD(10.001) vs APD(10) -> beda
+
+		// Kasus yang menguji logika "quoted vs raw" vs "nilai setelah normalisasi"
+		{"Quoted Numeric vs Numeric (type int)", "'123'", "123", "int", false, nil}, // Diharapkan false karena DDL asli beda (ekspektasi dari diskusi)
+		{"Quoted Numeric vs Quoted Numeric (type float, same value)", "'123'", "'123.0'", "float", true, nil}, // Setelah normalisasi: "123" vs "123.0", lalu float(123) vs float(123.0) -> true
+		{"Quoted Numeric vs Quoted Numeric (type float, diff value)", "'123.1'", "'123.0'", "float", false, nil}, // Setelah normalisasi: "123.1" vs "123.0", lalu float(123.1) vs float(123.0) -> false
 	}
 
 	for _, tc := range testCases {
@@ -97,8 +95,17 @@ func TestAreDefaultsEquivalent(t *testing.T) {
 			if tc.overrideSyncer != nil {
 				currentSyncer = tc.overrideSyncer
 			}
-			subTestLogger := logger.Named(t.Name())
+			subTestLogger := logger.Named(tc.name)
 			actual := currentSyncer.areDefaultsEquivalent(tc.srcDefRaw, tc.dstDefRaw, tc.typeForDefaultComparison, subTestLogger)
+			if tc.expected != actual {
+				// Tambahkan log lebih detail jika gagal
+				t.Logf("Debug Info for: %s", tc.name)
+				t.Logf("  srcDefRaw: '%s', dstDefRaw: '%s', typeForDefaultComparison: '%s'", tc.srcDefRaw, tc.dstDefRaw, tc.typeForDefaultComparison)
+				// Anda bisa memanggil normalizeDefaultValue di sini untuk melihat hasilnya jika perlu
+				normSrc := normalizeDefaultValue(tc.srcDefRaw, currentSyncer.srcDialect)
+				normDst := normalizeDefaultValue(tc.dstDefRaw, currentSyncer.dstDialect)
+				t.Logf("  normSrcDef: '%s', normDstDef: '%s'", normSrc, normDst)
+			}
 			assert.Equal(t, tc.expected, actual, "Test Case: %s", tc.name)
 		})
 	}
@@ -201,7 +208,7 @@ func TestGetColumnModifications(t *testing.T) {
 			src:           newColInfo("col_def_func_lit", "TIMESTAMP", true, false, false, nullStr("CURRENT_TIMESTAMP"), false, noInt, noInt, noInt, noStr, noStr),
 			dst:           newColInfo("col_def_func_lit", "TIMESTAMP WITHOUT TIME ZONE", true, false, false, nullStr("'2024-01-01'::timestamp"), false, noInt, noInt, noInt, noStr, noStr),
 			srcMappedType: "TIMESTAMP WITHOUT TIME ZONE",
-			expected:      []string{"default (src: 'CURRENT_TIMESTAMP', dst: ''2024-01-01'::timestamp')"}, // Ini adalah ekspektasi yang benar
+			expected:      []string{"default (src: 'CURRENT_TIMESTAMP', dst: ''2024-01-01'::timestamp')"},
 		},
 		{
 			name:          "Default Ignored for AutoIncrement",
@@ -327,7 +334,14 @@ func TestGetColumnModifications(t *testing.T) {
 
 			subTestLogger := logger.Named(tc.name)
 			actual := currentSyncer.getColumnModifications(tc.src, tc.dst, subTestLogger)
-			assert.ElementsMatch(t, tc.expected, actual, "Test Case: %s\nSRC: %+v\nDST: %+v", tc.name, tc.src, tc.dst)
+			if !assert.ElementsMatch(t, tc.expected, actual) {
+				// Tambahkan log lebih detail jika assert gagal
+				t.Logf("Test Case: %s FAILED", tc.name)
+				t.Logf("  SRC ColumnInfo: %+v", tc.src)
+				t.Logf("  DST ColumnInfo: %+v", tc.dst)
+				t.Logf("  Expected Diffs: %v", tc.expected)
+				t.Logf("  Actual Diffs  : %v", actual)
+			}
 		})
 	}
 }

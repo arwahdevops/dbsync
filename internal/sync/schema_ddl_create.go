@@ -4,7 +4,7 @@ package sync
 import (
 	"fmt"
 	"sort"
-	"strconv" // Dipertahankan karena digunakan oleh formatDefaultValue
+	"strconv"
 	"strings"
 
 	"go.uber.org/zap"
@@ -34,16 +34,16 @@ func (s *SchemaSyncer) generateCreateTableDDL(table string, columns []ColumnInfo
 	for i, col := range columns {
 		// MappedType seharusnya sudah diisi oleh pemanggil (SyncTableSchema -> populateMappedTypesForSourceColumns)
 		if col.MappedType == "" && !col.IsGenerated {
-			errMsg := fmt.Sprintf("cannot generate CREATE TABLE DDL for table '%s': MappedType is missing for non-generated column '%s'", table, col.Name)
-			log.Error(errMsg)
-			return "", nil, fmt.Errorf(errMsg)
+			log.Error("Cannot generate CREATE TABLE DDL: MappedType is missing for non-generated column",
+				zap.String("table_name", table), zap.String("column_name", col.Name))
+			return "", nil, fmt.Errorf("cannot generate CREATE TABLE DDL for table '%s': MappedType is missing for non-generated column '%s'", table, col.Name) // PERBAIKAN
 		}
 
 		// Panggil mapColumnDefinition untuk mendapatkan definisi lengkap satu kolom
 		columnDef, err := s.mapColumnDefinition(col)
 		if err != nil {
 			// Error sudah termasuk konteks kolom dari mapColumnDefinition
-			return "", nil, fmt.Errorf("failed to generate column definition for CREATE TABLE '%s': %w", table, err)
+			return "", nil, fmt.Errorf("failed to generate column definition for CREATE TABLE '%s': %w", table, err) // Gunakan %w
 		}
 		columnDefs[i] = "  " + columnDef // Tambahkan indentasi
 
@@ -97,9 +97,8 @@ func (s *SchemaSyncer) mapColumnDefinition(col ColumnInfo) (string, error) {
 	} else {
 		// Untuk kolom non-generated
 		if targetType == "" {
-			errMsg := fmt.Sprintf("mapped type is missing for non-generated column '%s'", col.Name)
-			log.Error(errMsg)
-			return "", fmt.Errorf(errMsg)
+			log.Error("Mapped type is missing for non-generated column", zap.String("column_name", col.Name))
+			return "", fmt.Errorf("mapped type is missing for non-generated column '%s'", col.Name) // PERBAIKAN
 		}
 		definition.WriteString(targetType) // targetType sudah termasuk modifier
 
@@ -328,7 +327,7 @@ func (s *SchemaSyncer) formatDefaultValue(value, mappedDataType string) string {
 		if normValue == "0" { return "FALSE" }
 	}
 	if s.dstDialect == "mysql" && mappedDataType == "tinyint(1)" {
-		if normValue == "1" { return "'1'" }
+		if normValue == "1" { return "'1'" } // MySQL booleans as tinyint(1) often store '0' or '1' as strings
 		if normValue == "0" { return "'0'" }
 	}
 
@@ -343,7 +342,7 @@ func (s *SchemaSyncer) formatDefaultValue(value, mappedDataType string) string {
 	}
 
 	// Default: quote sebagai string literal
-	escapedValue := strings.ReplaceAll(value, "'", "''")
+	escapedValue := strings.ReplaceAll(value, "'", "''") // Basic escaping untuk single quote
 	return fmt.Sprintf("'%s'", escapedValue)
 }
 
@@ -352,8 +351,8 @@ func (s *SchemaSyncer) getCollationSyntax(collationName string) string {
 	if collationName == "" { return "" }
 	switch s.dstDialect {
 	case "mysql": return fmt.Sprintf("COLLATE %s", utils.QuoteIdentifier(collationName, s.dstDialect))
-	case "postgres": return fmt.Sprintf("COLLATE %s", utils.QuoteIdentifier(collationName, s.dstDialect))
-	case "sqlite": return fmt.Sprintf("COLLATE %s", collationName)
+	case "postgres": return fmt.Sprintf("COLLATE %s", utils.QuoteIdentifier(collationName, s.dstDialect)) // PG juga bisa meng-quote nama collation
+	case "sqlite": return fmt.Sprintf("COLLATE %s", collationName) // SQLite tidak meng-quote nama collation
 	default: return ""
 	}
 }
@@ -362,9 +361,10 @@ func (s *SchemaSyncer) getCollationSyntax(collationName string) string {
 func (s *SchemaSyncer) getCommentSyntax(comment string) string {
 	if comment == "" { return "" }
 	if s.dstDialect == "mysql" {
-		escapedComment := strings.ReplaceAll(comment, "'", "''")
-		escapedComment = strings.ReplaceAll(escapedComment, "\\", "\\\\")
+		// Escape single quotes and backslashes for MySQL COMMENT
+		escapedComment := strings.ReplaceAll(comment, "\\", "\\\\")
+		escapedComment = strings.ReplaceAll(escapedComment, "'", "''")
 		return fmt.Sprintf("COMMENT '%s'", escapedComment)
 	}
-	return ""
+	return "" // Dialek lain biasanya menggunakan statement `COMMENT ON COLUMN` terpisah
 }

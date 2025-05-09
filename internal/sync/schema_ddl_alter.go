@@ -11,7 +11,6 @@ import (
 
 // generateModifyColumnDDLs generates one or more ALTER statements for column modification.
 // Ini adalah dispatcher ke fungsi spesifik dialek.
-// (Implementasi ini sudah kita review sebelumnya dan tampak baik)
 func (s *SchemaSyncer) generateModifyColumnDDLs(table string, src, dst ColumnInfo, log *zap.Logger) []string {
 	// Dapatkan perbedaan dulu (menggunakan fungsi dari compare_columns.go)
 	diffs := s.getColumnModifications(src, dst, log) // `s` sudah menjadi receiver di sini
@@ -48,9 +47,8 @@ func (s *SchemaSyncer) generateAddColumnDDL(table string, col ColumnInfo) (strin
 
 	// MappedType seharusnya sudah diisi oleh pemanggil (populateMappedTypesForSourceColumns)
 	if col.MappedType == "" && !col.IsGenerated {
-		errMsg := fmt.Sprintf("cannot generate ADD COLUMN DDL for non-generated column '%s': MappedType is missing", col.Name)
-		log.Error(errMsg)
-		return "", fmt.Errorf(errMsg)
+		log.Error("Cannot generate ADD COLUMN DDL: MappedType is missing for non-generated column", zap.String("column_name", col.Name))
+		return "", fmt.Errorf("cannot generate ADD COLUMN DDL for non-generated column '%s': MappedType is missing", col.Name) // PERBAIKAN
 	}
 	if col.IsGenerated {
 		// Perlu penanganan spesifik dialek untuk sintaks GENERATED AS
@@ -63,9 +61,8 @@ func (s *SchemaSyncer) generateAddColumnDDL(table string, col ColumnInfo) (strin
 	// (mapColumnDefinition ada di schema_ddl_create.go atau file ini jika dipindah)
 	colDef, err := s.mapColumnDefinition(col)
 	if err != nil {
-		errMsg := fmt.Sprintf("failed to map column definition for ADD COLUMN '%s': %v", col.Name, err)
-		log.Error(errMsg)
-		return "", fmt.Errorf(errMsg)
+		log.Error("Failed to map column definition for ADD COLUMN", zap.String("column_name", col.Name), zap.Error(err))
+		return "", fmt.Errorf("failed to map column definition for ADD COLUMN '%s': %w", col.Name, err) // PERBAIKAN (gunakan %w)
 	}
 
 	quotedTable := utils.QuoteIdentifier(table, s.dstDialect)
@@ -79,9 +76,8 @@ func (s *SchemaSyncer) generateAddColumnDDL(table string, col ColumnInfo) (strin
 		log.Debug("Generated ADD COLUMN DDL.", zap.String("ddl", ddl))
 		return ddl, nil
 	default:
-		errMsg := fmt.Sprintf("unsupported destination dialect '%s' for ADD COLUMN", s.dstDialect)
-		log.Error(errMsg)
-		return "", fmt.Errorf(errMsg)
+		log.Error("Unsupported destination dialect for ADD COLUMN", zap.String("dialect", s.dstDialect))
+		return "", fmt.Errorf("unsupported destination dialect '%s' for ADD COLUMN", s.dstDialect) // PERBAIKAN
 	}
 }
 
@@ -105,9 +101,8 @@ func (s *SchemaSyncer) generateDropColumnDDL(table string, col ColumnInfo) (stri
 			zap.String("table", table), zap.String("column", col.Name))
 		ddl = fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s;", quotedTable, quotedColName)
 	default:
-		errMsg := fmt.Sprintf("unsupported destination dialect '%s' for DROP COLUMN", s.dstDialect)
-		log.Error(errMsg)
-		return "", fmt.Errorf(errMsg)
+		log.Error("Unsupported destination dialect for DROP COLUMN", zap.String("dialect", s.dstDialect))
+		return "", fmt.Errorf("unsupported destination dialect '%s' for DROP COLUMN", s.dstDialect) // PERBAIKAN
 	}
 	log.Debug("Generated DROP COLUMN DDL.", zap.String("ddl", ddl))
 	return ddl, nil
@@ -128,9 +123,8 @@ func (s *SchemaSyncer) generateDropIndexDDL(table string, idx IndexInfo) (string
 		// PostgreSQL dan SQLite (sejak 3.34.0 untuk DROP INDEX) mendukung IF EXISTS.
 		ddl = fmt.Sprintf("DROP INDEX IF EXISTS %s;", quotedIndexName)
 	default:
-		errMsg := fmt.Sprintf("unsupported destination dialect '%s' for DROP INDEX", s.dstDialect)
-		log.Error(errMsg)
-		return "", fmt.Errorf(errMsg)
+		log.Error("Unsupported destination dialect for DROP INDEX", zap.String("dialect", s.dstDialect))
+		return "", fmt.Errorf("unsupported destination dialect '%s' for DROP INDEX", s.dstDialect) // PERBAIKAN
 	}
 	log.Debug("Generated DROP INDEX DDL.", zap.String("ddl", ddl))
 	return ddl, nil
@@ -168,17 +162,17 @@ func (s *SchemaSyncer) generateDropConstraintDDL(table string, constraint Constr
 			// Hanya ada satu PK, tidak perlu nama.
 			ddl = fmt.Sprintf("ALTER TABLE %s DROP PRIMARY KEY;", quotedTable)
 		default:
-			errMsg := fmt.Sprintf("unsupported constraint type '%s' for DROP CONSTRAINT in MySQL for constraint '%s'", constraint.Type, constraint.Name)
-			log.Error(errMsg)
-			return "", fmt.Errorf(errMsg)
+			log.Error("Unsupported constraint type for DROP CONSTRAINT in MySQL",
+				zap.String("constraint_type", constraint.Type),
+				zap.String("constraint_name", constraint.Name))
+			return "", fmt.Errorf("unsupported constraint type '%s' for DROP CONSTRAINT in MySQL for constraint '%s'", constraint.Type, constraint.Name) // PERBAIKAN
 		}
 	case "postgres", "sqlite":
 		// PostgreSQL dan SQLite menggunakan sintaks umum dan mendukung IF EXISTS.
 		ddl = fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s;", quotedTable, quotedConstraintName)
 	default:
-		errMsg := fmt.Sprintf("unsupported destination dialect '%s' for DROP CONSTRAINT", s.dstDialect)
-		log.Error(errMsg)
-		return "", fmt.Errorf(errMsg)
+		log.Error("Unsupported destination dialect for DROP CONSTRAINT", zap.String("dialect", s.dstDialect))
+		return "", fmt.Errorf("unsupported destination dialect '%s' for DROP CONSTRAINT", s.dstDialect) // PERBAIKAN
 	}
 	log.Debug("Generated DROP CONSTRAINT DDL.", zap.String("ddl", ddl))
 	return ddl, nil

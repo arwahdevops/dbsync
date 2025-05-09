@@ -12,13 +12,18 @@ import (
 func normalizeTypeName(typeName string) string {
 	name := strings.ToLower(strings.TrimSpace(typeName))
 
-	// Hapus ukuran/modifier generik dalam tanda kurung, misal (11) atau (255) atau (10,2)
-	// Regex ini akan menghapus '(...)' dari akhir string tipe
-	name = regexp.MustCompile(`\s*\([^)]*\)$`).ReplaceAllString(name, "")
-
-	// Hapus modifier umum MySQL setelah tanda kurung (jika ada) atau langsung setelah tipe
+	// Hapus modifier umum MySQL terlebih dahulu
 	name = strings.ReplaceAll(name, " unsigned", "")
 	name = strings.ReplaceAll(name, " zerofill", "")
+	name = strings.TrimSpace(name) // Penting setelah replace
+
+	// Sekarang hapus ukuran/modifier generik dalam tanda kurung, misal (11) atau (255) atau (10,2)
+	// Regex ini akan menghapus '(...)' dari akhir string tipe, atau jika diikuti spasi.
+	// Kita buat agar bisa menangani spasi setelahnya juga atau jika itu satu-satunya modifier
+	name = regexp.MustCompile(`\s*\([^)]*\)\s*$`).ReplaceAllString(name, "") // Modifikasi regex di sini
+	name = regexp.MustCompile(`\s*\([^)]*\)$`).ReplaceAllString(name, "")   // Jalankan lagi untuk kasus tanpa spasi di akhir
+	name = strings.TrimSpace(name)                                       // Trim lagi
+
 
 	// Alias umum (perlu diperluas berdasarkan kebutuhan)
 	// Urutan penting jika ada alias yang merupakan substring dari yang lain.
@@ -46,27 +51,66 @@ func normalizeTypeName(typeName string) string {
 // normalizeDefaultValue menormalisasi nilai default untuk perbandingan.
 // Menerima `dialect` untuk normalisasi spesifik.
 func normalizeDefaultValue(def string, dialect string) string {
-	if def == "" { // Jika tidak ada default, kembalikan string kosong
+	if def == "" {
 		return ""
 	}
 
 	lower := strings.ToLower(strings.TrimSpace(def))
 
-	// Hapus quote terluar (single, double, backtick)
-	// Ini penting agar 'value' sama dengan "value"
-	if len(lower) >= 2 {
-		firstChar, lastChar := lower[0], lower[len(lower)-1]
-		if (firstChar == '\'' && lastChar == '\'') ||
-			(firstChar == '"' && lastChar == '"') ||
-			(firstChar == '`' && lastChar == '`') {
-			lower = lower[1 : len(lower)-1]
+	// Helper internal untuk menghapus quote terluar
+	stripOuterQuotes := func(s string) string {
+		if len(s) >= 2 {
+			firstChar, lastChar := s[0], s[len(s)-1]
+			if (firstChar == '\'' && lastChar == '\'') ||
+				(firstChar == '"' && lastChar == '"') ||
+				(firstChar == '`' && lastChar == '`') {
+				return s[1 : len(s)-1]
+			}
+		}
+		return s
+	}
+
+	switch strings.ToLower(dialect) {
+	case "mysql":
+		if strings.Contains(lower, "on update current_timestamp") {
+			parts := strings.Split(lower, "on update current_timestamp")
+			lower = strings.TrimSpace(parts[0])
+		}
+		// MySQL boolean literal b'0' atau b'1'
+		if strings.HasPrefix(lower, "b'") && strings.HasSuffix(lower, "'") && (lower == "b'0'" || lower == "b'1'") {
+			lower = lower[2:3] // "0" atau "1"
+		}
+	case "postgres":
+		// Cek nextval DULU, karena bisa mengandung cast di dalamnya
+		if strings.HasPrefix(lower, "nextval(") {
+			return "nextval" // Jika ini nextval, kita selesai
+		}
+
+		// Loop untuk menghapus cast secara berulang (setelah cek nextval)
+		for {
+			// Regex yang lebih sederhana: cocokkan apa saja sebelum '::' diikuti oleh tipe
+			// Kita tidak perlu menangkap tipe setelah '::' secara detail
+			reCast := regexp.MustCompile(`^(.*?)\s*::\s*[a-zA-Z_].*$`) // Cocokkan hingga akhir baris setelah ::type
+			matches := reCast.FindStringSubmatch(lower)
+			if len(matches) > 1 {
+				// Ambil bagian sebelum '::'
+				lower = strings.TrimSpace(matches[1])
+				// Periksa apakah hasil stripping adalah string yang di-quote, jika ya, hapus quotenya
+				lower = stripOuterQuotes(lower)
+			} else {
+				break // Tidak ada lagi cast yang cocok
+			}
+		}
+	case "sqlite":
+		if strings.EqualFold(lower, "null") { // "null" literal case-insensitive
+			return "null"
 		}
 	}
 
-	// Normalisasi fungsi umum waktu
+	// Normalisasi fungsi umum waktu (setelah potensi stripping cast)
 	switch lower {
-	case "now()", "current_timestamp", "current_timestamp()", "getdate()", "sysdatetime()": // sysdatetime SQL Server
-		return "current_timestamp" // Normalisasi ke satu bentuk umum
+	case "now()", "current_timestamp", "current_timestamp()", "getdate()", "sysdatetime()":
+		return "current_timestamp"
 	case "current_date", "current_date()":
 		return "current_date"
 	case "current_time", "current_time()":
@@ -75,12 +119,11 @@ func normalizeDefaultValue(def string, dialect string) string {
 
 	// Normalisasi fungsi UUID umum
 	switch lower {
-	case "uuid()", "gen_random_uuid()", "newid()", "uuid_generate_v4()": // newid() SQL Server, uuid_generate_v4() PG
+	case "uuid()", "gen_random_uuid()", "newid()", "uuid_generate_v4()":
 		return "uuid_function"
 	}
 
 	// Normalisasi nilai boolean umum ke "0" atau "1"
-	// (compare_columns.go mungkin akan melakukan perbandingan lebih lanjut jika tipenya bool)
 	switch lower {
 	case "true", "t", "yes", "y", "on", "1":
 		return "1"
@@ -88,66 +131,18 @@ func normalizeDefaultValue(def string, dialect string) string {
 		return "0"
 	}
 
-	// Normalisasi spesifik dialek
-	switch strings.ToLower(dialect) {
-	case "mysql":
-		// MySQL boolean literal b'0' atau b'1'
-		if strings.HasPrefix(lower, "b'") && strings.HasSuffix(lower, "'") && (lower == "b'0'" || lower == "b'1'") {
-			return lower[2:3] // "0" atau "1"
-		}
-		// MySQL CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP -> kita hanya peduli nilai default awal
-		if strings.Contains(lower, "on update current_timestamp") {
-			parts := strings.Split(lower, "on update current_timestamp")
-			trimmedPart := strings.TrimSpace(parts[0])
-			if trimmedPart == "current_timestamp" || trimmedPart == "current_timestamp()" {
-				return "current_timestamp"
-			}
-			// Jika ada nilai literal sebelum "ON UPDATE", gunakan itu
-			// Ini mungkin sudah ditangani oleh penghapusan quote di atas
-			return trimmedPart
-		}
-	case "postgres":
-		// Hapus casting eksplisit seperti 'some_value'::typename
-		// Contoh: 'hello'::character varying -> "hello"
-		// Ini adalah regex yang mencoba menangkap ini. Mungkin perlu disempurnakan.
-		reCast := regexp.MustCompile(`^(.+?)::[a-zA-Z_][a-zA-Z0-9_]*(?:\[\])?$`)
-		if matches := reCast.FindStringSubmatch(lower); len(matches) > 1 {
-			// `matches[1]` adalah bagian sebelum `::`
-			// Kita perlu memastikan ini adalah nilai literal yang di-quote,
-			// atau fungsi yang sudah kita normalisasi.
-			potentialValue := strings.TrimSpace(matches[1])
-			// Coba hapus quote lagi jika ada (misal, jika bentuknya "'hello'")
-			if len(potentialValue) >= 2 {
-				first, last := potentialValue[0], potentialValue[len(potentialValue)-1]
-				if (first == '\'' && last == '\'') || (first == '"' && last == '"') {
-					return potentialValue[1 : len(potentialValue)-1]
-				}
-			}
-			// Jika bukan literal yang di-quote, bisa jadi fungsi. Coba normalisasi lagi.
-			return normalizeDefaultValue(potentialValue, dialect) // Panggil rekursif untuk normalisasi lebih lanjut
-		}
-		// nextval('sequence_name'::regclass) -> "nextval"
-		if strings.HasPrefix(lower, "nextval(") && strings.HasSuffix(lower, ")") {
-			return "nextval" // Hanya penanda, detail sequence tidak dibandingkan di sini
-		}
-	case "sqlite":
-		// SQLite tidak memiliki banyak fungsi default yang kompleks,
-		// jadi normalisasi umum di atas mungkin sudah cukup.
-		// 'NULL' (case-insensitive) -> "null"
-		if strings.EqualFold(lower, "null") {
-			return "null"
-		}
-	}
+	// Hapus quote terluar LAGI setelah semua transformasi, karena proses di atas
+	// mungkin telah mengekspos string yang sebelumnya di-quote (misalnya dari dalam cast)
+	lower = stripOuterQuotes(lower)
 
-	// Jika string adalah "null" (setelah lowercase), kembalikan sebagai penanda khusus.
-	// Ini membantu membedakan default NULL eksplisit dari tidak adanya default (string kosong).
+	// Jika string adalah "null" (setelah lowercase dan unquote), kembalikan sebagai penanda khusus.
 	if lower == "null" {
 		return "null"
 	}
 
-	// Jika tidak ada normalisasi spesifik yang cocok, kembalikan string lowercase yang sudah di-trim dan di-unquote.
 	return lower
 }
+
 
 // normalizeFKAction menormalisasi aksi Foreign Key.
 func normalizeFKAction(action string) string {

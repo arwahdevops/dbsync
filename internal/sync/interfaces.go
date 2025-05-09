@@ -29,7 +29,7 @@ type SchemaSyncerInterface interface {
 	GetPrimaryKeys(ctx context.Context, table string) ([]string, error)
 }
 
-// FullSyncInterface defines the main synchronization runner.
-type FullSyncInterface interface {
+// OrchestratorInterface defines the main synchronization runner.
+type OrchestratorInterface interface {
 	Run(ctx context.Context) map[string]SyncResult // Returns results per table
 }

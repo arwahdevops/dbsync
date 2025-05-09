@@ -162,7 +162,7 @@ func main() {
 
 	// 12. Create and run the synchronization process
 	logger.Log.Info("Starting database synchronization process...")
-	syncer := projectSync.NewFullSync(srcConn, dstConn, cfg, logger.Log, metricsStore)
+	syncer := projectSync.NewOrchestrator(srcConn, dstConn, cfg, logger.Log, metricsStore)
 	results := syncer.Run(ctx) // results is map[string]projectSync.SyncResult
 
 	// 13. Process and log results

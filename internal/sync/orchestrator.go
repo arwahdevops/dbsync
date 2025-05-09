@@ -1,4 +1,4 @@
-// internal/sync/full_sync.go
+// internal/sync/orchestrator.go
 package sync
 
 import (
@@ -21,7 +21,7 @@ import (
 	"github.com/arwahdevops/dbsync/internal/utils"
 )
 
-type FullSync struct {
+type Orchestrator struct {
 	srcConn      *db.Connector
 	dstConn      *db.Connector
 	cfg          *config.Config
@@ -46,10 +46,10 @@ type SyncResult struct {
 }
 
 
-var _ FullSyncInterface = (*FullSync)(nil)
+var _ OrchestratorInterface = (*Orchestrator)(nil)
 
-func NewFullSync(srcConn, dstConn *db.Connector, cfg *config.Config, logger *zap.Logger, metricsStore *metrics.Store) *FullSync {
-	return &FullSync{
+func NewOrchestrator(srcConn, dstConn *db.Connector, cfg *config.Config, logger *zap.Logger, metricsStore *metrics.Store) *Orchestrator {
+	return &Orchestrator{
 		srcConn:      srcConn,
 		dstConn:      dstConn,
 		cfg:          cfg,
@@ -65,7 +65,7 @@ func NewFullSync(srcConn, dstConn *db.Connector, cfg *config.Config, logger *zap
 	}
 }
 
-func (f *FullSync) Run(ctx context.Context) map[string]SyncResult {
+func (f *Orchestrator) Run(ctx context.Context) map[string]SyncResult {
 	startTime := time.Now()
 	f.logger.Info("Starting full database synchronization run",
 		zap.String("direction", f.cfg.SyncDirection),
@@ -333,7 +333,7 @@ endloop:
 }
 
 // syncData performs the actual data transfer using pagination.
-func (f *FullSync) syncData(ctx context.Context, table string, pkColumns []string) (totalRowsSynced int64, batches int, err error) {
+func (f *Orchestrator) syncData(ctx context.Context, table string, pkColumns []string) (totalRowsSynced int64, batches int, err error) {
 	log := f.logger.With(zap.String("table", table), zap.Strings("pk_columns", pkColumns))
 
 	var totalRows int64 = -1
@@ -521,7 +521,7 @@ func (f *FullSync) syncData(ctx context.Context, table string, pkColumns []strin
 }
 
 // syncBatchWithRetry attempts to insert/upsert a batch with retry logic.
-func (f *FullSync) syncBatchWithRetry(ctx context.Context, table string, batch []map[string]interface{}) error {
+func (f *Orchestrator) syncBatchWithRetry(ctx context.Context, table string, batch []map[string]interface{}) error {
 	log := f.logger.With(zap.String("table", table), zap.Int("batch_size", len(batch)))
 	if len(batch) == 0 {
 		log.Debug("syncBatchWithRetry called with empty batch, skipping.")
@@ -596,7 +596,7 @@ func (f *FullSync) syncBatchWithRetry(ctx context.Context, table string, batch [
 
 
 // listTables retrieves a list of non-system tables from the source database.
-func (f *FullSync) listTables(ctx context.Context) ([]string, error) {
+func (f *Orchestrator) listTables(ctx context.Context) ([]string, error) {
 	var tables []string
 	var err error
 	dbCfg := f.cfg.SrcDB
@@ -643,7 +643,7 @@ func (f *FullSync) listTables(ctx context.Context) ([]string, error) {
 }
 
 // getSortedPKNames mengurutkan nama kolom PK secara alfabetis.
-func (f *FullSync) getSortedPKNames(pkColumns []string) ([]string, error) {
+func (f *Orchestrator) getSortedPKNames(pkColumns []string) ([]string, error) {
 	if len(pkColumns) == 0 {
 		return []string{}, nil
 	}
@@ -654,7 +654,7 @@ func (f *FullSync) getSortedPKNames(pkColumns []string) ([]string, error) {
 }
 
 // buildPaginationClauses membangun klausa ORDER BY dan placeholder WHERE.
-func (f *FullSync) buildPaginationClauses(pkColumns []string, dialect string) (orderBy string, quotedPKs []string, placeholders []string, err error) {
+func (f *Orchestrator) buildPaginationClauses(pkColumns []string, dialect string) (orderBy string, quotedPKs []string, placeholders []string, err error) {
 	if len(pkColumns) == 0 {
 		err = fmt.Errorf("cannot build pagination clauses without primary keys")
 		return
@@ -674,7 +674,7 @@ func (f *FullSync) buildPaginationClauses(pkColumns []string, dialect string) (o
 }
 
 // buildWhereClause membangun klausa WHERE untuk keyset pagination.
-func (f *FullSync) buildWhereClause(quotedSortedPKs []string, placeholders []string, lastPKValues []interface{}) (string, []interface{}) {
+func (f *Orchestrator) buildWhereClause(quotedSortedPKs []string, placeholders []string, lastPKValues []interface{}) (string, []interface{}) {
 	if len(quotedSortedPKs) == 1 {
 		return fmt.Sprintf("%s > ?", quotedSortedPKs[0]), lastPKValues
 	}
@@ -696,7 +696,7 @@ func (f *FullSync) buildWhereClause(quotedSortedPKs []string, placeholders []str
 }
 
 // revertFKsWithContext memanggil fungsi revert dengan context.
-func (f *FullSync) revertFKsWithContext(ctx context.Context, revertFunc func() error) error {
+func (f *Orchestrator) revertFKsWithContext(ctx context.Context, revertFunc func() error) error {
 	if revertFunc == nil {
 		return nil
 	}
@@ -716,7 +716,7 @@ func (f *FullSync) revertFKsWithContext(ctx context.Context, revertFunc func() e
 
 
 // toggleForeignKeys menonaktifkan atau mengaktifkan kembali foreign key checks/triggers.
-func (f *FullSync) toggleForeignKeys(ctx context.Context, conn *db.Connector, enable bool, log *zap.Logger) (revertFunc func() error, err error) {
+func (f *Orchestrator) toggleForeignKeys(ctx context.Context, conn *db.Connector, enable bool, log *zap.Logger) (revertFunc func() error, err error) {
 	if !f.cfg.DisableFKDuringSync && !enable {
 		return nil, nil
 	}

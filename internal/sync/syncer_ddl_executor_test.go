@@ -81,8 +81,7 @@ func TestParseAndCategorizeDDLs(t *testing.T) {
 			inputTable: "test_alter",
 			expectedParsed: &categorizedDDLs{
 				CreateTableDDL:     "",
-				// Urutan setelah sorting: DROP, lalu ADD
-				AlterColumnDDLs:    []string{"ALTER TABLE \"test_alter\" DROP COLUMN old_col", "ALTER TABLE \"test_alter\" ADD COLUMN new_col INT"},
+				AlterColumnDDLs:    []string{"ALTER TABLE \"test_alter\" DROP COLUMN old_col", "ALTER TABLE \"test_alter\" ADD COLUMN new_col INT"}, // Sorted
 				AddIndexDDLs:       []string{}, DropIndexDDLs: []string{}, AddConstraintDDLs: []string{}, DropConstraintDDLs: []string{},
 			},
 			expectedError: false,
@@ -101,20 +100,20 @@ func TestParseAndCategorizeDDLs(t *testing.T) {
 					"ALTER TABLE \"mixed_table\" ADD CONSTRAINT uq_mixed_name UNIQUE (name);",
 					"ALTER TABLE \"mixed_table\" DROP CONSTRAINT fk_mixed_obsolete;",
 					"ALTER TABLE \"mixed_table\" ADD CONSTRAINT fk_mixed_new FOREIGN KEY (user_id) REFERENCES users(id);",
-					"ALTER TABLE \"mixed_table\" DROP CONSTRAINT pk_to_drop;", // Asumsi ini adalah PK
+					"ALTER TABLE \"mixed_table\" DROP CONSTRAINT pk_to_drop;",
 				},
 			},
 			inputTable: "mixed_table",
 			expectedParsed: &categorizedDDLs{
 				CreateTableDDL:  "",
 				AlterColumnDDLs: []string{"ALTER TABLE \"mixed_table\" MODIFY COLUMN status VARCHAR(20)"},
-				AddIndexDDLs:    []string{"CREATE UNIQUE INDEX idx_mixed_unique ON \"mixed_table\" (email)"}, // Diurutkan leksikografis
-				DropIndexDDLs:   []string{"DROP INDEX idx_mixed_old", "DROP INDEX idx_mixed_old_b"},       // Diurutkan leksikografis
-				AddConstraintDDLs: []string{ // Diurutkan: UNIQUE, FK
+				AddIndexDDLs:    []string{"CREATE UNIQUE INDEX idx_mixed_unique ON \"mixed_table\" (email)"},
+				DropIndexDDLs:   []string{"DROP INDEX idx_mixed_old", "DROP INDEX idx_mixed_old_b"},
+				AddConstraintDDLs: []string{
 					"ALTER TABLE \"mixed_table\" ADD CONSTRAINT uq_mixed_name UNIQUE (name)",
 					"ALTER TABLE \"mixed_table\" ADD CONSTRAINT fk_mixed_new FOREIGN KEY (user_id) REFERENCES users(id)",
 				},
-				DropConstraintDDLs: []string{ // Diurutkan: FK, PK
+				DropConstraintDDLs: []string{
 					"ALTER TABLE \"mixed_table\" DROP CONSTRAINT fk_mixed_obsolete",
 					"ALTER TABLE \"mixed_table\" DROP CONSTRAINT pk_to_drop",
 				},
@@ -130,8 +129,7 @@ func TestParseAndCategorizeDDLs(t *testing.T) {
 			inputTable: "unrec_table",
 			expectedParsed: &categorizedDDLs{
 				CreateTableDDL:     "",
-				// Urutan setelah sorting: ALTER, lalu UNKNOWN
-				AlterColumnDDLs:    []string{"ALTER TABLE tbl ADD col1 INT", "UNKNOWN DDL STATEMENT"},
+				AlterColumnDDLs:    []string{"ALTER TABLE tbl ADD col1 INT", "UNKNOWN DDL STATEMENT"}, // Sorted
 				AddIndexDDLs:       []string{}, DropIndexDDLs: []string{}, AddConstraintDDLs: []string{}, DropConstraintDDLs: []string{},
 			},
 			expectedError: false,
@@ -140,12 +138,19 @@ func TestParseAndCategorizeDDLs(t *testing.T) {
 			name:   "Create Table Followed by Alter",
 			syncer: syncerPostgres,
 			inputDDLs: &SchemaExecutionResult{
+				// TableDDL sekarang hanya berisi CREATE TABLE karena parseAndCategorizeDDLs akan break setelahnya
+				// Jika ingin menguji ALTER setelah CREATE dari TableDDL, TableDDL harus berisi *hanya* ALTER tersebut,
+				// dan CREATE TABLE harusnya kosong atau dari SchemaExecutionResult yang berbeda.
+				// Untuk skenario ini, kita asumsikan TableDDL hanya CREATE, dan ALTER ada di tempat lain.
+				// Jika TableDDL *memang* berisi keduanya, ekspektasi AlterColumnDDLs harus diisi.
+				// Dengan logika parseAndCategorizeDDLs saat ini, jika TableDDL = "CREATE TABLE...; ALTER TABLE...",
+				// maka CreateTableDDL akan terisi, dan sisa ALTER akan masuk ke AlterColumnDDLs.
 				TableDDL: "CREATE TABLE create_then_alter (id INT); ALTER TABLE create_then_alter ADD COLUMN name VARCHAR(10);",
 			},
 			inputTable: "create_then_alter",
 			expectedParsed: &categorizedDDLs{
 				CreateTableDDL:     "CREATE TABLE create_then_alter (id INT)",
-				// EKSPEKTASI YANG BENAR: AlterColumnDDLs akan berisi statement ALTER
+				// EKSPEKTASI YANG BENAR berdasarkan implementasi terakhir parseAndCategorizeDDLs
 				AlterColumnDDLs:    []string{"ALTER TABLE create_then_alter ADD COLUMN name VARCHAR(10)"},
 				AddIndexDDLs:       []string{}, DropIndexDDLs: []string{}, AddConstraintDDLs: []string{}, DropConstraintDDLs: []string{},
 			},
@@ -283,8 +288,8 @@ func TestSortConstraintsForDrop(t *testing.T) {
 		"ALTER TABLE t1 DROP CONSTRAINT chk_1",
 		"ALTER TABLE t1 DROP CONSTRAINT pk_constraint_name",
 		"ALTER TABLE t1 DROP PRIMARY KEY",
-		"ALTER TABLE t1 DROP CONSTRAINT some_other_constraint", // Leksikografis
-		"DROP CONSTRAINT unknown_type_cons",                   // Leksikografis
+		"ALTER TABLE t1 DROP CONSTRAINT some_other_constraint",
+		"DROP CONSTRAINT unknown_type_cons",
 	}
 	actual := syncer.sortConstraintsForDrop(input)
 	assert.Equal(t, expected, actual)

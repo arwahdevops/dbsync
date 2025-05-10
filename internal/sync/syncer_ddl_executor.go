@@ -9,7 +9,8 @@ import (
 	"go.uber.org/multierr" // Untuk menggabungkan error
 	"go.uber.org/zap"
 	"gorm.io/gorm"
-	// "github.com/arwahdevops/dbsync/internal/utils" // SUDAH DIHAPUS KARENA TIDAK DIGUNAKAN DI FILE INI
+
+	//"github.com/arwahdevops/dbsync/internal/utils" // Diperlukan untuk QuoteIdentifier di ExecuteDDLs
 )
 
 // parseAndCategorizeDDLs mem-parse DDL dari SchemaExecutionResult menjadi kategori yang lebih spesifik.
@@ -18,6 +19,7 @@ func (s *SchemaSyncer) parseAndCategorizeDDLs(ddls *SchemaExecutionResult, table
 	parsed := &categorizedDDLs{}
 
 	if ddls.TableDDL != "" {
+		// TableDDL bisa jadi satu statement CREATE atau beberapa statement ALTER yang dipisah ';'
 		potentialStatements := strings.Split(ddls.TableDDL, ";")
 		firstProcessed := false
 		for _, stmt := range potentialStatements {
@@ -27,26 +29,29 @@ func (s *SchemaSyncer) parseAndCategorizeDDLs(ddls *SchemaExecutionResult, table
 			}
 			upperTrimmed := strings.ToUpper(trimmed)
 			if !firstProcessed && strings.HasPrefix(upperTrimmed, "CREATE TABLE") {
-				parsed.CreateTableDDL = trimmed
+				parsed.CreateTableDDL = trimmed // Hanya statement CREATE TABLE pertama yang dianggap
 				firstProcessed = true
+				// Jika ada statement lain setelah CREATE TABLE dalam TableDDL, itu mungkin aneh,
+				// tapi kita bisa log atau abaikan. Untuk sekarang, kita fokus pada CREATE.
 				if len(potentialStatements) > 1 {
 					log.Warn("TableDDL contains CREATE TABLE and subsequent statements. Only the CREATE TABLE statement will be categorized as such.", zap.String("full_table_ddl", ddls.TableDDL))
+					// Sisa statement akan coba dikategorikan sebagai ALTER jika ada.
                     for _, subsequentStmt := range potentialStatements[1:] {
                         trimmedSubsequent := strings.TrimSpace(subsequentStmt)
                         if trimmedSubsequent != "" && strings.HasPrefix(strings.ToUpper(trimmedSubsequent), "ALTER TABLE") {
                             parsed.AlterColumnDDLs = append(parsed.AlterColumnDDLs, trimmedSubsequent)
                         }
                     }
-                    break
+                    break // Keluar dari loop setelah memproses CREATE dan sisanya sebagai ALTER jika ada
 				}
 			} else if strings.HasPrefix(upperTrimmed, "ALTER TABLE") {
 				parsed.AlterColumnDDLs = append(parsed.AlterColumnDDLs, trimmed)
 				firstProcessed = true
-			} else if !firstProcessed && trimmed != "" {
+			} else if !firstProcessed && trimmed != "" { // Jika statement pertama bukan CREATE/ALTER tapi ada
 				log.Warn("TableDDL starts with an unrecognized statement, attempting to categorize as ALTER.", zap.String("statement", trimmed))
 				parsed.AlterColumnDDLs = append(parsed.AlterColumnDDLs, trimmed)
 				firstProcessed = true
-			} else if firstProcessed && trimmed != "" {
+			} else if firstProcessed && trimmed != "" { // Statement berikutnya setelah yang pertama
                  if strings.HasPrefix(upperTrimmed, "ALTER TABLE") {
                     parsed.AlterColumnDDLs = append(parsed.AlterColumnDDLs, trimmed)
                 } else {
@@ -55,6 +60,7 @@ func (s *SchemaSyncer) parseAndCategorizeDDLs(ddls *SchemaExecutionResult, table
             }
 		}
 	}
+
 
 	for _, ddl := range ddls.IndexDDLs {
 		trimmed := strings.TrimSpace(ddl)
@@ -103,6 +109,8 @@ func (s *SchemaSyncer) parseAndCategorizeDDLs(ddls *SchemaExecutionResult, table
 	return parsed, nil
 }
 
+// executeDDLPhase adalah helper untuk mengeksekusi sekelompok DDL dalam satu fase.
+// Mengembalikan error gabungan jika continueOnError true dan ada error yang tidak diabaikan.
 func (s *SchemaSyncer) executeDDLPhase(tx *gorm.DB, phaseName string, ddlList []string, continueOnError bool, log *zap.Logger) error {
 	if len(ddlList) == 0 {
 		log.Debug("No DDLs to execute for phase.", zap.String("phase_name", phaseName))
@@ -116,13 +124,16 @@ func (s *SchemaSyncer) executeDDLPhase(tx *gorm.DB, phaseName string, ddlList []
 		if ddl == "" {
 			continue
 		}
+		// Hapus titik koma di akhir jika ada, karena beberapa driver/DB mungkin tidak menyukainya
+		// atau GORM Exec sudah menanganinya. Lebih aman tanpa.
 		cleanDDL := strings.TrimRight(strings.TrimSpace(ddl), ";")
 		if cleanDDL == "" {
 			continue
 		}
 
 		log.Debug("Executing DDL.", zap.String("phase_name", phaseName), zap.String("ddl", cleanDDL))
-		if err := tx.Exec(cleanDDL).Error; err != nil {
+		if err := tx.Exec(cleanDDL).Error; err != nil { // Gunakan cleanDDL
+			// Sertakan DDL asli (dengan titik koma jika ada) dalam log untuk kejelasan
 			execErrLog := log.With(zap.String("phase_name", phaseName), zap.String("failed_ddl_original", ddl), zap.Error(err))
 			if s.shouldIgnoreDDLError(err) {
 				execErrLog.Warn("DDL execution resulted in an ignorable error, continuing.")
@@ -146,20 +157,43 @@ func (s *SchemaSyncer) executeDDLPhase(tx *gorm.DB, phaseName string, ddlList []
 	return accumulatedErrors
 }
 
+// shouldIgnoreDDLError memeriksa apakah error DDL tertentu dapat diabaikan.
 func (s *SchemaSyncer) shouldIgnoreDDLError(err error) bool {
-	if err == nil { return false }
+	if err == nil {
+		return false
+	}
 	errStr := strings.ToLower(err.Error())
 	sqlState := ""
 
+	// Coba ekstrak SQLSTATE jika ada (format PG: ERROR: ... (SQLSTATE XXXXX))
 	reSQLState := regexp.MustCompile(`\(sqlstate\s+([a-z0-9]{5})\)`)
 	matches := reSQLState.FindStringSubmatch(errStr)
 	if len(matches) > 1 {
-		sqlState = strings.ToUpper(matches[1])
+		sqlState = strings.ToUpper(matches[1]) // SQLSTATE biasanya uppercase
 	}
 
+	// Pola error berdasarkan SQLSTATE (lebih andal)
 	ignorableSQLStates := map[string][]string{
-		"postgres": {"42P07", "42710", "42704", "23505"},
-		"mysql":    {}, // MySQL lebih sering dicek dengan pesan error
+		"postgres": {
+			"42P07", // DUPLICATE_TABLE, juga bisa untuk indeks, sequence, view
+			"42710", // DUPLICATE_OBJECT (misalnya, constraint, tipe)
+			"42704", // UNDEFINED_OBJECT (berguna untuk DROP IF EXISTS yang gagal karena memang tidak ada)
+			"23505", // UNIQUE_VIOLATION (bisa terjadi jika ADD UNIQUE CONSTRAINT dan data melanggar, tapi ini lebih ke data error)
+			         // Mungkin tidak selalu ingin diabaikan.
+		},
+		"mysql": {
+			// MySQL error codes dipetakan ke SQLSTATE, tapi pesan sering lebih berguna.
+			// Error codes MySQL umum:
+			// 1007: Can't create database; database exists
+			// 1008: Can't drop database; database doesn't exist
+			// 1050: Table '...' already exists
+			// 1051: Unknown table '...'
+			// 1060: Duplicate column name '...'
+			// 1061: Duplicate key name '...'
+			// 1062: Duplicate entry '...' for key ... (UNIQUE_VIOLATION)
+			// 1091: Can't DROP '...'; check that it exists
+			// 1826: Duplicate foreign key constraint name (MySQL 8+)
+		},
 	}
 
 	if states, ok := ignorableSQLStates[s.dstDialect]; ok && sqlState != "" {
@@ -174,6 +208,7 @@ func (s *SchemaSyncer) shouldIgnoreDDLError(err error) bool {
 		}
 	}
 
+	// Pola error berdasarkan string pesan (kurang andal, tapi fallback)
 	ignorableMessagePatterns := map[string][]string{
 		"mysql": {
 			"duplicate key name",
@@ -182,27 +217,29 @@ func (s *SchemaSyncer) shouldIgnoreDDLError(err error) bool {
 			"check constraint .* already exists",
 			"constraint .* does not exist",
 			"table '.*' already exists",
-			"unknown table '.*'",
+			"unknown table '.*'", // Untuk DROP
 			"already exists",
 			"doesn't exist",
-            "duplicate entry .* for key",
-            "foreign key constraint.*? already exists",
+            "duplicate entry .* for key", // Untuk unique constraint add
+            "foreign key constraint.*? already exists", // Error 1826
 		},
 		"postgres": {
+			// Pola string jika SQLSTATE tidak cukup atau tidak ada
 			`relation ".*" already exists`,
 			`index ".*" already exists`,
 			`constraint ".*" for relation ".*" already exists`,
 			`constraint ".*" on table ".*" does not exist`,
 			`index ".*" does not exist`,
 			`table ".*" does not exist`,
+			// Tambahkan jika ada pesan spesifik lain
 		},
 		"sqlite": {
 			"index .* already exists",
 			"table .* already exists",
-			"no such index",
-			"no such table",
+			"no such index", // Untuk DROP
+			"no such table", // Untuk DROP
 			"already exists",
-			"unique constraint failed",
+			"unique constraint failed", // Saat ADD UNIQUE CONSTRAINT dan data melanggar
 		},
 	}
 
@@ -226,6 +263,8 @@ func (s *SchemaSyncer) shouldIgnoreDDLError(err error) bool {
 	return false
 }
 
+
+// splitPostgresFKsForDeferredExecution memisahkan DDL FK PostgreSQL.
 func (s *SchemaSyncer) splitPostgresFKsForDeferredExecution(allConstraints []string) (deferredFKs []string, nonDeferredFKs []string) {
 	for _, ddl := range allConstraints {
 		upperDDL := strings.ToUpper(ddl)
@@ -242,6 +281,7 @@ func (s *SchemaSyncer) splitPostgresFKsForDeferredExecution(allConstraints []str
 	return
 }
 
+// --- DDL Sorting Helpers ---
 func (s *SchemaSyncer) sortConstraintsForDrop(ddls []string) []string {
 	sorted := make([]string, len(ddls))
 	copy(sorted, ddls)

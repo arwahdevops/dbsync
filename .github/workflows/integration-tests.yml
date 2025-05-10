@@ -1,0 +1,64 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [ dev ] # Jalankan saat push ke main
+  pull_request:
+    branches: [ main ] # Jalankan saat ada PR ke main
+
+jobs:
+  test:
+    name: Run Integration Tests
+    runs-on: ubuntu-latest # Menggunakan runner Linux terbaru
+    timeout-minutes: 20 # Sesuaikan timeout jika test Anda lama
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: '1.24.2' # Sesuaikan dengan versi Go proyek Anda
+
+      # Opsional: Cache Go modules
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      # Opsional: Cache Docker layers (bisa sedikit rumit untuk setup awal)
+      # - name: Cache Docker layers
+      #   uses: actions/cache@v3
+      #   with:
+      #     path: /tmp/.docker-cache
+      #     key: ${{ runner.os }}-docker-${{ hashFiles('**/Dockerfile') }}-${{ github.sha }} # Kunci yang lebih dinamis
+      #     restore-keys: |
+      #       ${{ runner.os }}-docker-${{ hashFiles('**/Dockerfile') }}-
+
+      - name: Install Go dependencies
+        run: go mod tidy && go mod download
+
+      - name: Build (opsional, tapi baik untuk cek kompilasi)
+        run: go build -v -o dbsync .
+
+      - name: Run Integration Tests
+        # Menjalankan test dengan tag 'integration'
+        # Timeout untuk test itu sendiri bisa diatur di sini juga jika perlu
+        run: go test -v -tags=integration -timeout 20m ./tests/integration/...
+        env:
+          # Tidak perlu set variabel TEST_DB_HOST/PORT/USER/PASS di sini
+          # karena TestContainers akan membuat DB sementara secara dinamis.
+          # Namun, jika ada env var lain yang dibutuhkan oleh aplikasi Anda, set di sini.
+          SKIP_INTEGRATION_TESTS: "" # Pastikan tidak di-skip di CI
+
+      # Opsional: Upload test results (jika Anda menggunakan format tertentu seperti JUnit)
+      # - name: Upload test results
+      #   if: always() # Selalu jalankan, bahkan jika test gagal
+      #   uses: actions/upload-artifact@v3
+      #   with:
+      #     name: go-test-results
+      #     path: test-results.xml # Ganti dengan path hasil test Anda

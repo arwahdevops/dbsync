@@ -1,9 +1,10 @@
+// internal/sync/schema_compare.go
 package sync
 
 import (
-	"reflect"
+	"reflect" // Tetap dibutuhkan untuk DeepEqual
 	"regexp"
-	"sort"
+	// "sort" // Tidak dibutuhkan lagi untuk sorting kolom di dalam needsIndex/ConstraintModification
 	"strings"
 
 	"go.uber.org/zap"
@@ -159,23 +160,14 @@ func normalizeCheckDefinition(def string) string {
 	norm = regexp.MustCompile(`\s+`).ReplaceAllString(norm, " ")
 	norm = strings.TrimSpace(norm)
 
-	// Iteratif menghapus tanda kurung terluar jika mereka hanya membungkus
-	// keseluruhan ekspresi yang sudah seimbang di dalamnya.
 	for {
 		if len(norm) < 2 || norm[0] != '(' || norm[len(norm)-1] != ')' {
-			break // Tidak ada kurung terluar lagi atau string terlalu pendek
+			break
 		}
-
-		// Ambil substring tanpa kurung terluar
 		innerContent := norm[1 : len(norm)-1]
-
-		// Periksa apakah innerContent sendiri adalah ekspresi yang seimbang.
-		// Jika innerContent tidak seimbang, maka kurung terluar tidak bisa dibuang.
 		if !isBalanced(innerContent) {
 			break
 		}
-
-		// Jika innerContent seimbang, berarti kurung terluar aman untuk dihilangkan.
 		norm = strings.TrimSpace(innerContent)
 	}
 	return norm
@@ -193,7 +185,6 @@ func isDefaultNullOrFunction(normalizedDefaultValue string) bool {
 	return false
 }
 
-// --- Fungsi asli dari schema_compare.go ---
 
 func (s *SchemaSyncer) needsColumnModification(src, dst ColumnInfo, log *zap.Logger) bool {
 	return len(s.getColumnModifications(src, dst, log)) > 0
@@ -205,16 +196,33 @@ func (s *SchemaSyncer) needsIndexModification(src, dst IndexInfo, log *zap.Logge
 		log.Debug("Index unique flag mismatch", zap.Bool("src_is_unique", src.IsUnique), zap.Bool("dst_is_unique", dst.IsUnique))
 		return true
 	}
+
+	// *** PERBAIKAN: Bandingkan kolom dengan urutan yang dipertahankan ***
 	if !reflect.DeepEqual(src.Columns, dst.Columns) {
-		srcColsSorted := make([]string, len(src.Columns)); copy(srcColsSorted, src.Columns); sort.Strings(srcColsSorted)
-		dstColsSorted := make([]string, len(dst.Columns)); copy(dstColsSorted, dst.Columns); sort.Strings(dstColsSorted)
-		if !reflect.DeepEqual(srcColsSorted, dstColsSorted) {
-			log.Debug("Index columns mismatch (both original and sorted order)", zap.Strings("src_cols", src.Columns), zap.Strings("dst_cols", dst.Columns))
-			return true
-		}
-		log.Debug("Index columns match after sorting, but original order might differ or be inconsistent from source.", zap.Strings("src_cols_original", src.Columns), zap.Strings("dst_cols_original", dst.Columns))
+		// Log perbedaan jika ada, meskipun kita tidak lagi mengurutkan di sini untuk perbandingan utama.
+		// Ini berguna untuk debugging jika urutan yang diterima dari DB berbeda.
+		log.Debug("Index columns mismatch (order matters)",
+			zap.Strings("src_cols_ordered", src.Columns),
+			zap.Strings("dst_cols_ordered", dst.Columns))
+
+		// Sebagai fallback atau pemeriksaan tambahan, kita bisa log perbandingan yang diurutkan
+		// untuk melihat apakah hanya urutannya yang berbeda atau kolomnya sendiri berbeda.
+		// Namun, untuk `needsModification`, perbedaan urutan sudah cukup.
+		// srcColsSorted := make([]string, len(src.Columns)); copy(srcColsSorted, src.Columns); sort.Strings(srcColsSorted)
+		// dstColsSorted := make([]string, len(dst.Columns)); copy(dstColsSorted, dst.Columns); sort.Strings(dstColsSorted)
+		// if !reflect.DeepEqual(srcColsSorted, dstColsSorted) {
+		//  log.Debug("Index columns also mismatch when sorted alphabetically, indicating different column sets.",
+		//      zap.Strings("src_cols_sorted", srcColsSorted),
+		//      zap.Strings("dst_cols_sorted", dstColsSorted))
+		// }
+		return true
 	}
-	log.Debug("Index definitions appear equivalent based on unique flag and column list.")
+
+	// TODO: Pertimbangkan perbandingan IndexType/RawDef jika diperlukan di masa depan,
+	// terutama untuk indeks fungsional atau tipe indeks non-standar (GIN, GIST).
+	// Saat ini, jika nama, keunikan, dan kolom (dalam urutan) sama, dianggap tidak perlu modifikasi.
+
+	log.Debug("Index definitions appear equivalent based on unique flag and ordered column list.")
 	return false
 }
 
@@ -224,29 +232,27 @@ func (s *SchemaSyncer) needsConstraintModification(src, dst ConstraintInfo, log 
 		log.Debug("Constraint type mismatch", zap.String("src_type", src.Type), zap.String("dst_type", dst.Type))
 		return true
 	}
+
+	// *** PERBAIKAN: Bandingkan kolom dengan urutan yang dipertahankan ***
 	if !reflect.DeepEqual(src.Columns, dst.Columns) {
-		srcColsSorted := make([]string, len(src.Columns)); copy(srcColsSorted, src.Columns); sort.Strings(srcColsSorted)
-		dstColsSorted := make([]string, len(dst.Columns)); copy(dstColsSorted, dst.Columns); sort.Strings(dstColsSorted)
-		if !reflect.DeepEqual(srcColsSorted, dstColsSorted) {
-			log.Debug("Constraint columns mismatch (both original and sorted order)", zap.Strings("src_cols", src.Columns), zap.Strings("dst_cols", dst.Columns))
-			return true
-		}
-		log.Debug("Constraint columns match after sorting, but original order might differ.", zap.Strings("src_cols_original", src.Columns), zap.Strings("dst_cols_original", dst.Columns))
+		log.Debug("Constraint columns mismatch (order matters)",
+			zap.Strings("src_cols_ordered", src.Columns),
+			zap.Strings("dst_cols_ordered", dst.Columns))
+		return true
 	}
+
 	switch src.Type {
 	case "FOREIGN KEY":
 		if src.ForeignTable != dst.ForeignTable {
 			log.Debug("FK foreign table mismatch", zap.String("src_foreign_table", src.ForeignTable), zap.String("dst_foreign_table", dst.ForeignTable))
 			return true
 		}
+		// *** PERBAIKAN: Bandingkan kolom foreign dengan urutan yang dipertahankan ***
 		if !reflect.DeepEqual(src.ForeignColumns, dst.ForeignColumns) {
-			srcForeignColsSorted := make([]string, len(src.ForeignColumns)); copy(srcForeignColsSorted, src.ForeignColumns); sort.Strings(srcForeignColsSorted)
-			dstForeignColsSorted := make([]string, len(dst.ForeignColumns)); copy(dstForeignColsSorted, dst.ForeignColumns); sort.Strings(dstForeignColsSorted)
-			if !reflect.DeepEqual(srcForeignColsSorted, dstForeignColsSorted) {
-				log.Debug("FK foreign columns mismatch (both original and sorted order)", zap.Strings("src_foreign_cols", src.ForeignColumns), zap.Strings("dst_foreign_cols", dst.ForeignColumns))
-				return true
-			}
-			log.Debug("FK foreign columns match after sorting, but original order might differ.", zap.Strings("src_foreign_cols_original", src.ForeignColumns), zap.Strings("dst_foreign_cols_original", dst.ForeignColumns))
+			log.Debug("FK foreign columns mismatch (order matters)",
+				zap.Strings("src_foreign_cols_ordered", src.ForeignColumns),
+				zap.Strings("dst_foreign_cols_ordered", dst.ForeignColumns))
+			return true
 		}
 		srcDelNorm := normalizeFKAction(src.OnDelete)
 		dstDelNorm := normalizeFKAction(dst.OnDelete)
@@ -270,6 +276,7 @@ func (s *SchemaSyncer) needsConstraintModification(src, dst ConstraintInfo, log 
 			return true
 		}
 	case "UNIQUE", "PRIMARY KEY":
+		// Untuk UNIQUE dan PK, perbandingan tipe dan kolom (dengan urutan dipertahankan) sudah cukup.
 		break
 	}
 	log.Debug("Constraint definitions appear equivalent.")

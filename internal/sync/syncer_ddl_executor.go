@@ -44,29 +44,43 @@ func (s *SchemaSyncer) parseAndCategorizeDDLs(ddls *SchemaExecutionResult, table
 				parsed.CreateTableDDL = cleanedStmt
 				isCreateTableProcessed = true
 				log.Debug("Categorized CREATE TABLE DDL.", zap.String("ddl", parsed.CreateTableDDL))
+
+				// Jika ada statement setelah CREATE TABLE, coba kategorikan sebagai ALTER
+				// Ini adalah skenario yang tidak umum jika DDL dihasilkan oleh syncer ini,
+				// tapi bisa terjadi jika TableDDL berasal dari sumber eksternal.
 				if i < len(potentialStatements)-1 {
-					hasNextNonEmpty := false
+					remainingStatementsInTableDDL := false
 					for j := i + 1; j < len(potentialStatements); j++ {
-						if cleanSingleDDL(potentialStatements[j]) != "" {
-							hasNextNonEmpty = true
-							break
+						subsequentCleanedStmt := cleanSingleDDL(potentialStatements[j])
+						if subsequentCleanedStmt == "" {
+							continue
+						}
+						remainingStatementsInTableDDL = true // Tandai bahwa ada statement lain
+						if strings.HasPrefix(strings.ToUpper(subsequentCleanedStmt), "ALTER TABLE") {
+							parsed.AlterColumnDDLs = append(parsed.AlterColumnDDLs, subsequentCleanedStmt)
+							log.Debug("Categorized subsequent ALTER TABLE DDL from TableDDL.", zap.String("ddl", subsequentCleanedStmt))
+						} else {
+							log.Warn("Ignoring unrecognized subsequent statement in TableDDL after CREATE TABLE.", zap.String("statement", subsequentCleanedStmt))
 						}
 					}
-					if hasNextNonEmpty {
-						log.Warn("TableDDL contains CREATE TABLE followed by other non-empty statements. This is unusual. Only the CREATE TABLE statement is processed as such from this block.",
+					if remainingStatementsInTableDDL {
+						log.Warn("TableDDL contained CREATE TABLE and was followed by other statements; these were processed or logged.",
 							zap.String("create_table_part", parsed.CreateTableDDL),
-							zap.String("full_table_ddl", ddls.TableDDL))
+							zap.String("full_table_ddl_input", ddls.TableDDL))
 					}
 				}
-				break // Setelah CREATE TABLE, kita anggap TableDDL selesai untuk bagian ini
+				// Setelah CREATE TABLE (dan potensi ALTER berikutnya) diproses, kita anggap TableDDL selesai untuk blok ini.
+				// DDL lain untuk indeks/constraint seharusnya ada di slice masing-masing.
+				break
 			} else if strings.HasPrefix(upperCleanedStmt, "ALTER TABLE") {
 				parsed.AlterColumnDDLs = append(parsed.AlterColumnDDLs, cleanedStmt)
 				log.Debug("Categorized ALTER TABLE DDL from TableDDL.", zap.String("ddl", cleanedStmt))
 			} else {
+				// Jika statement pertama bukan CREATE dan bukan ALTER
 				if i == 0 && !isCreateTableProcessed {
 					log.Warn("TableDDL starts with an unrecognized statement. This statement will be categorized as a general column alteration, but review is advised.", zap.String("statement", cleanedStmt))
 					parsed.AlterColumnDDLs = append(parsed.AlterColumnDDLs, cleanedStmt)
-				} else if cleanedStmt != "" {
+				} else if cleanedStmt != "" { // Statement berikutnya yang tidak dikenal (setelah yang pertama bukan CREATE/ALTER)
 					log.Warn("Ignoring unrecognized statement in TableDDL.", zap.String("statement", cleanedStmt))
 				}
 			}
@@ -122,7 +136,6 @@ func (s *SchemaSyncer) parseAndCategorizeDDLs(ddls *SchemaExecutionResult, table
 	return parsed, nil
 }
 
-// executeDDLPhase meneruskan DDL yang sebenarnya ke `shouldIgnoreDDLError`.
 func (s *SchemaSyncer) executeDDLPhase(tx *gorm.DB, phaseName string, ddlList []string, continueOnError bool, log *zap.Logger) error {
 	if len(ddlList) == 0 {
 		log.Debug("No DDLs to execute for phase.", zap.String("phase_name", phaseName))
@@ -138,7 +151,6 @@ func (s *SchemaSyncer) executeDDLPhase(tx *gorm.DB, phaseName string, ddlList []
 		log.Debug("Executing DDL.", zap.String("phase_name", phaseName), zap.String("ddl", ddl))
 		if err := tx.Exec(ddl).Error; err != nil {
 			execErrLog := log.With(zap.String("phase_name", phaseName), zap.String("failed_ddl", ddl), zap.Error(err))
-			// Teruskan DDL yang gagal ke shouldIgnoreDDLError
 			if s.shouldIgnoreDDLError(err, ddl) {
 				execErrLog.Warn("DDL execution resulted in an ignorable error, continuing.")
 			} else {
@@ -161,7 +173,6 @@ func (s *SchemaSyncer) executeDDLPhase(tx *gorm.DB, phaseName string, ddlList []
 	return accumulatedErrors
 }
 
-// shouldIgnoreDDLError sekarang menerima DDL string sebagai argumen kedua.
 func (s *SchemaSyncer) shouldIgnoreDDLError(err error, ddl string) bool {
 	if err == nil { return false }
 
@@ -170,14 +181,11 @@ func (s *SchemaSyncer) shouldIgnoreDDLError(err error, ddl string) bool {
 	sqlStateOrCode := ""
 
 	reSQLStateOrCode := regexp.MustCompile(`\((?:sqlstate|error code|error)\s+([a-z0-9_]{2,})\)`)
-	matches := reSQLStateOrCode.FindStringSubmatch(errStrLower)
-	if len(matches) > 1 {
-		sqlStateOrCode = strings.ToUpper(matches[1])
+	matchesCode := reSQLStateOrCode.FindStringSubmatch(errStrLower)
+	if len(matchesCode) > 1 {
+		sqlStateOrCode = strings.ToUpper(matchesCode[1])
 	}
 
-	// Kondisi spesifik: JANGAN abaikan "table does not exist" (42P01 untuk PG)
-	// jika DDL adalah ADD CONSTRAINT FOREIGN KEY.
-	// Ini untuk memunculkan masalah dependensi urutan.
 	upperDDL := strings.ToUpper(ddl)
 	isAddForeignKey := strings.HasPrefix(upperDDL, "ALTER TABLE") &&
 		strings.Contains(upperDDL, "ADD CONSTRAINT") &&
@@ -206,57 +214,66 @@ func (s *SchemaSyncer) shouldIgnoreDDLError(err error, ddl string) bool {
 		}
 	}
 
-	objectNameFlexiblePattern := `(?:` + "`[^`]*`" + `|'[^']*'|"[^"]*"|[\w.-]+)`
-	tableNameWithSchemaFlexiblePattern := `(?:` + objectNameFlexiblePattern + `\.` + objectNameFlexiblePattern + `|` + objectNameFlexiblePattern + `)`
+	// Pola nama objek: diapit backtick, single quote, atau non-spasi/quote/semicolon/kurung/koma/titik/titikdua
+	// `[\w.-]+` menangkap nama tanpa quote yang terdiri dari karakter word, titik, atau hubung.
+	objectNameForMsgPattern := `(?:` + "`[^`]*`" + `|'[^']*'|[\w.-]+)`
+	tableNameForMsgPattern := `(?:` + objectNameForMsgPattern + `\.` + objectNameForMsgPattern + `|` + objectNameForMsgPattern + `)`
+
 
 	ignorableMessagePatterns := map[string][]string{
 		"mysql": {
-			`duplicate key name\s+` + objectNameFlexiblePattern,
-			`can't drop (?:index|constraint)\s+` + objectNameFlexiblePattern + `(?:\s*on\s+` + tableNameWithSchemaFlexiblePattern + `)?\s*;?\s*check that it exists`,
-			`check constraint\s+` + objectNameFlexiblePattern + `\s+already exists`,
-			`(?:foreign key\s+)?constraint(?:\s+` + objectNameFlexiblePattern + `)?\s+(?:for key\s+` + objectNameFlexiblePattern + `\s*)?already exists`,
-			`constraint\s+` + objectNameFlexiblePattern + `\s+does not exist`,
-			`table\s+` + tableNameWithSchemaFlexiblePattern + `\s+already exists`,
-			`unknown table\s+` + tableNameWithSchemaFlexiblePattern,
-			`duplicate column name\s+` + objectNameFlexiblePattern,
-			`index\s+` + objectNameFlexiblePattern + `\s+already exists on table\s+` + tableNameWithSchemaFlexiblePattern,
+			`duplicate key name\s+` + objectNameForMsgPattern,
+			// Pola yang disempurnakan untuk Error 1091 (Can't DROP):
+			// `can't drop `: Literal
+			// `(?:(?:index|constraint)\s+)?`: "index " atau "constraint " opsional
+			// `objectNameForMsgPattern`: Nama objek
+			// `(?:\s+on\s+` + `tableNameForMsgPattern` + `)?`: Klausa "ON table" opsional (untuk DROP INDEX name ON table)
+			// `\s*(?:;|#\S+)?\s*`: Spasi, lalu titik koma opsional ATAU error code MySQL (misal #42S02) opsional, lalu spasi lagi
+			// `check that it exists`: Literal
+			`can't drop (?:(?:index|constraint)\s+)?` + objectNameForMsgPattern + `(?:\s+on\s+` + tableNameForMsgPattern + `)?\s*(?:;|#\S+)?\s*check that it exists`,
+			`check constraint\s+` + objectNameForMsgPattern + `\s+already exists`,
+			`(?:foreign key\s+)?constraint(?:\s+` + objectNameForMsgPattern + `)?\s+(?:for key\s+` + objectNameForMsgPattern + `\s*)?already exists`,
+			`constraint\s+` + objectNameForMsgPattern + `\s+does not exist`,
+			`table\s+` + tableNameForMsgPattern + `\s+already exists`,
+			`unknown table\s+` + tableNameForMsgPattern,
+			`duplicate column name\s+` + objectNameForMsgPattern,
+			`index\s+` + objectNameForMsgPattern + `\s+already exists on table\s+` + tableNameForMsgPattern,
 		},
-		"postgres": {
+		"postgres": { // PG lebih konsisten dengan double quotes untuk nama objek dalam pesan error
 			`relation\s+"[^"]+"\s+already exists`,
 			`index\s+"[^"]+"\s+already exists`,
 			`constraint\s+"[^"]+"\s+(?:for|on) relation\s+"[^"]+"\s+already exists`,
 			`constraint\s+"[^"]+"\s+on table\s+"[^"]+"\s+does not exist`,
 			`index\s+"[^"]+"\s+does not exist`,
-			// Untuk "table "schema_name"."table_name" does not exist", hanya abaikan jika DDL adalah DROP TABLE.
-			// `table\s+"[^"]+"\s+does not exist`,
 			`type\s+"[^"]+"\s+already exists`,
 			`schema\s+"[^"]+"\s+already exists`,
 		},
 		"sqlite": {
-			`index\s+` + objectNameFlexiblePattern + `\s+already exists`,
-			`table\s+` + objectNameFlexiblePattern + `\s+already exists`,
-			`no such index:\s*` + objectNameFlexiblePattern,
-			`no such table:\s*` + objectNameFlexiblePattern,
-			`(?:unique\s+)?constraint\s+` + objectNameFlexiblePattern + `\s+already exists`,
-			`constraint\s+` + objectNameFlexiblePattern + `\s+failed`,
-			`column\s+` + objectNameFlexiblePattern + `\s+already exists`,
+			`index\s+` + objectNameForMsgPattern + `\s+already exists`,
+			`table\s+` + objectNameForMsgPattern + `\s+already exists`,
+			`no such index:\s*` + objectNameForMsgPattern,
+			`no such table:\s*` + objectNameForMsgPattern,
+			`(?:unique\s+)?constraint\s+` + objectNameForMsgPattern + `\s+already exists`,
+			`constraint\s+` + objectNameForMsgPattern + `\s+failed`,
+			`column\s+` + objectNameForMsgPattern + `\s+already exists`,
 		},
 	}
 
-	// Penanganan khusus untuk "table ... does not exist" di PostgreSQL
-	if s.dstDialect == "postgres" && sqlStateOrCode == "42P01" { // undefined_table
-		// Hanya abaikan jika DDL adalah DROP TABLE atau DROP TYPE atau DROP SCHEMA (jika relevan)
+	// Penanganan khusus untuk "table ... does not exist" di PostgreSQL dan MySQL agar hanya ignore jika DDL adalah DROP
+	if (s.dstDialect == "postgres" && sqlStateOrCode == "42P01") ||
+		(s.dstDialect == "mysql" && (strings.Contains(errStrLower, "unknown table ") || sqlStateOrCode == "42S02" || sqlStateOrCode == "1051")) {
 		if strings.HasPrefix(upperDDL, "DROP TABLE") || strings.HasPrefix(upperDDL, "DROP TYPE") || strings.HasPrefix(upperDDL, "DROP SCHEMA") {
-			s.logger.Debug("DDL error 42P01 for DROP statement matched. Ignoring.", zap.String("ddl", ddl), zap.String("error_original", errStrOriginal))
+			s.logger.Debug("DDL error (table/type/schema does not exist) for DROP statement matched. Ignoring.", zap.String("ddl", ddl), zap.String("error_original", errStrOriginal))
 			return true
 		}
-		// Jika bukan DROP, jangan abaikan 42P01 berdasarkan SQLSTATE saja, biarkan pola pesan mencoba.
+		s.logger.Debug("DDL error (table/type/schema does not exist) for non-DROP statement. Will rely on specific message patterns if any, otherwise NOT ignoring.", zap.String("ddl", ddl), zap.String("error_original", errStrOriginal))
+		// Jangan return false di sini, biarkan pola pesan lain mencoba jika ini bukan DROP
 	}
 
 
 	if patterns, ok := ignorableMessagePatterns[s.dstDialect]; ok {
 		for _, pattern := range patterns {
-			fullPattern := `(?i)` + pattern
+			fullPattern := `(?i)` + pattern // Case-insensitive match untuk keseluruhan pola
 			matched, _ := regexp.MatchString(fullPattern, errStrLower)
 			if matched {
 				s.logger.Debug("DDL error matched ignorable message pattern.", zap.String("dialect", s.dstDialect), zap.String("pattern_used", fullPattern), zap.String("error_original", errStrOriginal))
@@ -268,6 +285,7 @@ func (s *SchemaSyncer) shouldIgnoreDDLError(err error, ddl string) bool {
 	s.logger.Debug("DDL error did not match any ignorable SQLSTATEs or message patterns and will NOT be ignored.", zap.String("dialect", s.dstDialect), zap.String("sqlstate_or_code_extracted", sqlStateOrCode), zap.String("error_original", errStrOriginal))
 	return false
 }
+
 
 func (s *SchemaSyncer) splitPostgresFKsForDeferredExecution(allConstraints []string) (deferredFKs []string, nonDeferredFKs []string) {
 	for _, ddl := range allConstraints {
@@ -288,15 +306,20 @@ func (s *SchemaSyncer) splitPostgresFKsForDeferredExecution(allConstraints []str
 func (s *SchemaSyncer) sortConstraintsForDrop(ddls []string) []string {
 	extractConstraintNameAndType := func(ddl string) (string, string) {
 		upperDDL := strings.ToUpper(ddl)
+		// Pola yang lebih baik untuk menangkap nama dan tipe constraint
 		re := regexp.MustCompile(`(?i)DROP (?:CONSTRAINT\s+(` + "`?" + `[^` + "`" + `\s;]+` + "`?" + `)|(FOREIGN KEY)\s+(` + "`?" + `[^` + "`" + `\s;]+` + "`?" + `)|(CHECK)\s+(` + "`?" + `[^` + "`" + `\s;]+` + "`?" + `)|(PRIMARY KEY))`)
 		matches := re.FindStringSubmatch(upperDDL)
 
 		if len(matches) > 0 {
-			if matches[6] != "" { return "PRIMARY_KEY_IMPLICIT", "PRIMARY KEY" }
-			if matches[2] != "" && matches[3] != "" { return strings.Trim(matches[3], "`'\""), "FOREIGN KEY" }
-			if matches[4] != "" && matches[5] != "" { return strings.Trim(matches[5], "`'\""), "CHECK" }
-			if matches[1] != "" {
+			if matches[6] != "" { // (PRIMARY KEY)
+				return "PRIMARY_KEY_IMPLICIT", "PRIMARY KEY"
+			} else if matches[2] != "" && matches[3] != "" { // (FOREIGN KEY) name
+				return strings.Trim(matches[3], "`'\""), "FOREIGN KEY"
+			} else if matches[4] != "" && matches[5] != "" { // (CHECK) name
+				return strings.Trim(matches[5], "`'\""), "CHECK"
+			} else if matches[1] != "" { // CONSTRAINT name
 				name := strings.Trim(matches[1], "`'\"")
+				// Tebak tipe dari nama jika ini adalah DROP CONSTRAINT <name>
 				if strings.HasPrefix(name, "FK_") || strings.Contains(name, "_FK_") || strings.HasSuffix(name, "_FK") || strings.HasPrefix(name, "fk_") { return name, "FOREIGN KEY" }
 				if strings.HasPrefix(name, "UQ_") || strings.Contains(name, "_UQ_") || strings.HasSuffix(name, "_UQ") || strings.HasPrefix(name, "uq_") { return name, "UNIQUE" }
 				if strings.HasPrefix(name, "PK_") || strings.Contains(name, "_PK_") || strings.HasSuffix(name, "_PK") || strings.HasPrefix(name, "pk_") { return name, "PRIMARY KEY" }
@@ -357,7 +380,7 @@ func (s *SchemaSyncer) sortAlterColumns(ddls []string) []string {
 		if strings.Contains(upperDDL, "DROP COLUMN") { return 1 }
 		if strings.Contains(upperDDL, "MODIFY COLUMN") || strings.Contains(upperDDL, "ALTER COLUMN") { return 2 }
 		if strings.Contains(upperDDL, "ADD COLUMN") { return 3 }
-		if !strings.EqualFold(upperDDL, "UNKNOWN DDL STATEMENT") {
+		if !strings.EqualFold(upperDDL, "UNKNOWN DDL STATEMENT") { // Hanya log jika bukan kasus uji spesifik
 			s.logger.Debug("ALTER DDL with unknown priority category during sorting.", zap.String("ddl", ddl))
 		}
 		return 4

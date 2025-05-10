@@ -13,13 +13,11 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
-	// "github.com/arwahdevops/dbsync/internal/config" // Tidak dibutuhkan langsung di file ini
-	"github.com/arwahdevops/dbsync/internal/db"
+	"github.com/arwahdevops/dbsync/internal/db" // Diperlukan
 	"github.com/arwahdevops/dbsync/internal/utils"
 )
 
-// getDestinationColumnTypes mengambil tipe data kolom dari tabel tujuan.
-// Ini adalah method privat dari Orchestrator, bisa juga dipindah ke schema_fetcher khusus destinasi.
+// getDestinationColumnTypes (tetap sama seperti sebelumnya)
 func (f *Orchestrator) getDestinationColumnTypes(ctx context.Context, tableName string) (map[string]string, error) {
 	log := f.logger.With(zap.String("table", tableName), zap.String("dialect", f.dstConn.Dialect), zap.String("action", "getDestinationColumnTypes"))
 	colTypes := make(map[string]string)
@@ -30,7 +28,6 @@ func (f *Orchestrator) getDestinationColumnTypes(ctx context.Context, tableName 
 		UdtName    string `gorm:"column:udt_name"` // Untuk PostgreSQL
 	}
 
-	// Query spesifik per dialek untuk mendapatkan tipe data
 	switch f.dstConn.Dialect {
 	case "postgres":
 		query := `
@@ -42,10 +39,10 @@ func (f *Orchestrator) getDestinationColumnTypes(ctx context.Context, tableName 
 			return nil, fmt.Errorf("fetch postgres column types for %s: %w", tableName, err)
 		}
 		for _, c := range columnsData {
-			normType := normalizeTypeName(c.DataType) // normalizeTypeName dari syncer_type_mapper.go
+			normType := normalizeTypeName(c.DataType)
 			if normType == "boolean" || strings.ToLower(c.UdtName) == "bool" {
-				colTypes[c.ColumnName] = "boolean" // Penanda internal
-			} else if normType == "array" && c.UdtName != "" { // Handle array types
+				colTypes[c.ColumnName] = "boolean"
+			} else if normType == "array" && c.UdtName != "" {
 				baseUdt := strings.TrimPrefix(c.UdtName, "_")
 				colTypes[c.ColumnName] = normalizeTypeName(baseUdt) + "[]"
 			} else if normType == "user-defined" && c.UdtName != "" {
@@ -55,15 +52,6 @@ func (f *Orchestrator) getDestinationColumnTypes(ctx context.Context, tableName 
 			}
 		}
 	case "mysql":
-		// Untuk MySQL, kita perlu mengetahui MappedType dari sumber ke tujuan.
-		// Ini lebih kompleks karena tipe asli MySQL bisa beragam (TINYINT(1), BOOLEAN alias).
-		// Transformasi boolean untuk MySQL->MySQL biasanya tidak diperlukan karena 0/1 sudah valid.
-		// Jika MySQL adalah tujuan dari PG, maka PG 'boolean' akan dipetakan ke 'tinyint(1)' oleh typemap.
-		// Data dari PG (true/false) perlu dikonversi ke 1/0 untuk MySQL tinyint(1).
-		// Logika ini akan ditambahkan jika diperlukan. Untuk sekarang, fokus pada PG sebagai tujuan.
-		log.Debug("MySQL destination column type fetching for data transformation (e.g. bool) not fully implemented here yet. Relies on direct GORM handling.")
-
-		// Namun, kita tetap bisa mengambil tipe data dasar MySQL jika diperlukan untuk transformasi lain.
 		query := `SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS
 				  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?;`
 		if err := f.dstConn.DB.WithContext(ctx).Raw(query, tableName).Scan(&columnsData).Error; err != nil {
@@ -73,7 +61,6 @@ func (f *Orchestrator) getDestinationColumnTypes(ctx context.Context, tableName 
 		for _, c := range columnsData {
 			colTypes[c.ColumnName] = normalizeTypeName(c.DataType)
 		}
-
 	default:
 		log.Debug("Destination column type fetching not implemented for dialect", zap.String("dialect", f.dstConn.Dialect))
 	}
@@ -101,49 +88,44 @@ func (f *Orchestrator) syncData(ctx context.Context, table string, srcPKColumns 
 		log.Warn("Could not count total source rows for progress tracking. Progress percentage will not be available.", logFields...)
 	} else if totalRows == 0 {
 		log.Info("Source table is empty. No data to synchronize.")
-		return 0, 0, nil // Tidak ada data, tidak ada error
+		return 0, 0, nil
 	} else {
 		log.Info("Approximate total source rows to synchronize", zap.Int64("count", totalRows))
 	}
 
-	// Dapatkan Primary Key dan Tipe Kolom dari tabel TUJUAN
 	var dstPKColumns []string
 	var dstColumnTypes map[string]string
 	var errSchemaInfo error
 
-	schemaInfoCtx, schemaInfoCancel := context.WithTimeout(ctx, 25*time.Second) // Timeout gabungan
+	schemaInfoCtx, schemaInfoCancel := context.WithTimeout(ctx, 25*time.Second)
 	defer schemaInfoCancel()
 
 	dstPKColumns, errSchemaInfo = f.getDestinationTablePKs(schemaInfoCtx, table)
 	if errSchemaInfo != nil {
 		log.Error("Failed to get destination primary keys for upsert. Upsert might default to UpdateAll or fail.", zap.Error(errSchemaInfo))
-		// Tidak menggagalkan, biarkan syncBatchWithRetry mencoba fallback
 	} else if len(dstPKColumns) == 0 {
 		log.Warn("No primary key found for destination table. ON CONFLICT upsert will use GORM's UpdateAll or default behavior, which might be inefficient or fail if table has no other updatable columns.", zap.String("table", table))
 	}
 
-	// Ambil tipe kolom tujuan untuk transformasi data (misalnya, boolean)
-	// Hanya relevan jika tujuan adalah PostgreSQL untuk konversi boolean dari MySQL 0/1.
-	// Atau jika MySQL adalah tujuan dan sumbernya PG boolean (true/false -> 1/0).
-	if f.dstConn.Dialect == "postgres" || f.dstConn.Dialect == "mysql" { // Perlu untuk kedua arah jika ada boolean
+	if f.dstConn.Dialect == "postgres" || f.dstConn.Dialect == "mysql" {
 		dstColumnTypes, errSchemaInfo = f.getDestinationColumnTypes(schemaInfoCtx, table)
 		if errSchemaInfo != nil {
 			log.Error("Failed to get destination column types. Data transformation (e.g., boolean) might not occur as expected.", zap.Error(errSchemaInfo))
 		}
 	}
 
-
 	var orderByClause string
-	var quotedSrcPKColumns, srcPKPlaceholders []string
+	var quotedSrcPKColumns []string // Tidak perlu placeholders di sini lagi
 	canPaginate := len(srcPKColumns) > 0
 
 	if canPaginate {
 		var sortErr error
-		orderByClause, quotedSrcPKColumns, srcPKPlaceholders, sortErr = f.buildPaginationClauses(srcPKColumns, f.srcConn.Dialect)
+		// buildPaginationClauses sekarang hanya mengembalikan orderBy dan quotedPKs
+		orderByClause, quotedSrcPKColumns, sortErr = f.buildPaginationOrderBy(srcPKColumns, f.srcConn.Dialect)
 		if sortErr != nil {
-			return 0, 0, fmt.Errorf("failed to build source pagination clauses for table '%s': %w", table, sortErr)
+			return 0, 0, fmt.Errorf("failed to build source pagination order by clause for table '%s': %w", table, sortErr)
 		}
-		log.Debug("Using pagination for data sync.", zap.String("order_by_clause", orderByClause))
+		log.Debug("Using pagination for data sync.", zap.String("order_by_clause", orderByClause), zap.Strings("quoted_src_pk_cols", quotedSrcPKColumns))
 	} else {
 		log.Warn("No source primary key provided/found for pagination. Attempting full table load in batches without explicit ordering for pagination.")
 		orderByClause = ""
@@ -170,7 +152,7 @@ func (f *Orchestrator) syncData(ctx context.Context, table string, srcPKColumns 
 		}
 	}
 
-	var lastSrcPKValues []interface{}
+	var lastSrcPKValues []interface{} // Ini akan menjadi nilai-nilai PK dari baris terakhir batch sebelumnya
 	totalRowsSynced = 0
 	batches = 0
 	progressLogThreshold := 100
@@ -186,10 +168,14 @@ func (f *Orchestrator) syncData(ctx context.Context, table string, srcPKColumns 
 		query := f.srcConn.DB.WithContext(ctx).Table(table)
 
 		if canPaginate && lastSrcPKValues != nil {
-			if len(quotedSrcPKColumns) == 0 || len(srcPKPlaceholders) == 0 {
-				return totalRowsSynced, batches, fmt.Errorf("internal error: source pagination columns/placeholders not initialized for table '%s'", table)
+			if len(quotedSrcPKColumns) == 0 { // quotedSrcPKColumns didapat dari buildPaginationOrderBy
+				return totalRowsSynced, batches, fmt.Errorf("internal error: source pagination columns not initialized for table '%s'", table)
 			}
-			whereClause, args := f.buildWhereClause(quotedSrcPKColumns, srcPKPlaceholders, lastSrcPKValues)
+			// buildWhereClause sekarang juga menerima dialek sumber
+			whereClause, args, whereErr := f.buildWhereClause(quotedSrcPKColumns, lastSrcPKValues, f.srcConn.Dialect)
+			if whereErr != nil {
+				return totalRowsSynced, batches, fmt.Errorf("failed to build WHERE clause for pagination on table '%s': %w", table, whereErr)
+			}
 			query = query.Where(whereClause, args...)
 		}
 
@@ -213,16 +199,17 @@ func (f *Orchestrator) syncData(ctx context.Context, table string, srcPKColumns 
 			if totalRowsSynced == 0 && lastSrcPKValues == nil { log.Info("Source table is empty or first fetch returned no data.") } else { log.Info("No more data found in source for this page, or sync complete.") }
 			if canPaginate && lastSrcPKValues != nil {
 				noDataStreak++
-				if noDataStreak >= 3 {
-					log.Error("Potential pagination issue: Multiple consecutive empty batches.", zap.Any("last_src_pk_values", lastSrcPKValues))
-					return totalRowsSynced, batches, fmt.Errorf("pagination issue: empty batches for table '%s'", table)
+				if noDataStreak >= 3 { // Meningkatkan toleransi sedikit, bisa jadi ada gap kecil di data
+					log.Error("Potential pagination issue: Multiple consecutive empty batches despite having previous PK values. This might indicate inconsistent data sorting or a bug.", zap.Any("last_src_pk_values", lastSrcPKValues))
+					// Tidak return error fatal di sini, biarkan loop berakhir secara alami.
+					// Namun, ini adalah warning keras.
 				}
 			}
 			break
 		}
 		noDataStreak = 0
 
-		// Transformasi data sebelum dikirim ke tujuan
+		// Transformasi data (tetap sama)
 		if dstColumnTypes != nil {
 			for i, row := range batchData {
 				transformedRow := make(map[string]interface{}, len(row))
@@ -230,7 +217,6 @@ func (f *Orchestrator) syncData(ctx context.Context, table string, srcPKColumns 
 					targetType, typeKnown := dstColumnTypes[key]
 					if typeKnown {
 						if f.dstConn.Dialect == "postgres" && targetType == "boolean" {
-							// Konversi MySQL 0/1 (int/float) ke PG boolean (true/false)
 							switch v := val.(type) {
 							case int: transformedRow[key] = (v == 1)
 							case int8: transformedRow[key] = (v == 1)
@@ -239,24 +225,23 @@ func (f *Orchestrator) syncData(ctx context.Context, table string, srcPKColumns 
 							case int64: transformedRow[key] = (v == 1)
 							case float32: transformedRow[key] = (v == 1.0)
 							case float64: transformedRow[key] = (v == 1.0)
-							// Jika sudah bool, tidak perlu konversi
 							case bool: transformedRow[key] = v
-							default: transformedRow[key] = val // Tipe lain, biarkan
+							default: transformedRow[key] = val
 							}
 							continue
-						} else if f.dstConn.Dialect == "mysql" && targetType == "tinyint" { // Asumsi tinyint(1) untuk boolean
-							// Konversi PG boolean (true/false) ke MySQL tinyint(1) (1/0)
+						} else if f.dstConn.Dialect == "mysql" && targetType == "tinyint" {
 							if boolVal, isBool := val.(bool); isBool {
 								if boolVal { transformedRow[key] = 1 } else { transformedRow[key] = 0 }
 								continue
 							}
 						}
 					}
-					transformedRow[key] = val // Salin jika tidak ada transformasi
+					transformedRow[key] = val
 				}
 				batchData[i] = transformedRow
 			}
 		}
+
 
 		log.Debug("Attempting to sync batch to destination database.", zap.Int("rows_to_sync", rowsInCurrentBatch))
 		syncBatchStartTime := time.Now()
@@ -274,15 +259,26 @@ func (f *Orchestrator) syncData(ctx context.Context, table string, srcPKColumns 
 
 		if canPaginate {
 			lastRowInBatch := batchData[rowsInCurrentBatch-1]
-			sortedSrcPKNames, pkSortErr := f.getSortedPKNames(srcPKColumns)
-			if pkSortErr != nil { return totalRowsSynced, batches, fmt.Errorf("get sorted source PK names for table '%s': %w", table, pkSortErr) }
+			// srcPKColumns adalah nama-nama PK sumber yang tidak di-quote, sesuai urutan dari schema fetch
+			// yang mana idealnya sudah sesuai urutan ordinal PK jika dari DB, atau di-sort by name sebagai fallback.
+			// Untuk paginasi, urutan yang digunakan di ORDER BY (dari buildPaginationOrderBy) adalah yang relevan.
+			// QuotedSrcPKColumns sudah di-sort by name di buildPaginationOrderBy.
+			// Kita perlu mengambil nilai PK dari lastRowInBatch sesuai urutan quotedSrcPKColumns.
 
-			newLastSrcPKValues := make([]interface{}, len(sortedSrcPKNames))
+			// Dapatkan nama PK yang tidak di-quote dari quotedSrcPKColumns (yang sudah di-sort by name)
+			// agar bisa lookup di lastRowInBatch.
+			unquotedSortedSrcPKNames := make([]string, len(quotedSrcPKColumns))
+			for i, qpk := range quotedSrcPKColumns {
+				unquotedSortedSrcPKNames[i] = utils.UnquoteIdentifier(qpk, f.srcConn.Dialect) // Perlu helper Unquote
+			}
+
+
+			newLastSrcPKValues := make([]interface{}, len(unquotedSortedSrcPKNames))
 			allPKsFound := true
-			for i, pkName := range sortedSrcPKNames {
+			for i, pkName := range unquotedSortedSrcPKNames {
 				val, ok := lastRowInBatch[pkName]
 				if !ok {
-					log.Error("Source PK column missing in fetched data, pagination cannot continue.", zap.String("missing_pk", pkName))
+					log.Error("Source PK column missing in fetched data, pagination cannot continue.", zap.String("missing_pk_unquoted", pkName), zap.String("corresponding_quoted_pk", quotedSrcPKColumns[i]))
 					allPKsFound = false; break
 				}
 				newLastSrcPKValues[i] = val
@@ -290,7 +286,7 @@ func (f *Orchestrator) syncData(ctx context.Context, table string, srcPKColumns 
 			if !allPKsFound { return totalRowsSynced, batches, fmt.Errorf("source PK column missing in fetched data for table '%s'", table) }
 			lastSrcPKValues = newLastSrcPKValues
 		} else {
-			if rowsInCurrentBatch < f.cfg.BatchSize { break } // Jika tidak paginasi dan batch tidak penuh, anggap selesai
+			if rowsInCurrentBatch < f.cfg.BatchSize { break }
 		}
 
 		if batches%progressLogThreshold == 0 || (totalRows > 0 && totalRowsSynced >= totalRows && totalRowsSynced > 0) {
@@ -304,7 +300,8 @@ func (f *Orchestrator) syncData(ctx context.Context, table string, srcPKColumns 
 	return totalRowsSynced, batches, nil
 }
 
-// syncBatchWithRetry melakukan upsert batch data ke tabel tujuan dengan retry.
+
+// syncBatchWithRetry (tetap sama seperti sebelumnya)
 func (f *Orchestrator) syncBatchWithRetry(ctx context.Context, table string, batch []map[string]interface{}, dstPKColumns []string) error {
 	log := f.logger.With(zap.String("table", table), zap.Int("batch_size", len(batch)))
 	if len(batch) == 0 {
@@ -322,11 +319,10 @@ func (f *Orchestrator) syncBatchWithRetry(ctx context.Context, table string, bat
 	}()
 
 	var conflictClause clause.Expression
-	if len(dstPKColumns) > 0 { // Jika PK tujuan diketahui
+	if len(dstPKColumns) > 0 {
 		conflictTargetCols := make([]clause.Column, len(dstPKColumns))
 		for i, pk := range dstPKColumns { conflictTargetCols[i] = clause.Column{Name: pk} }
 
-		// Tentukan kolom yang akan diupdate: semua kolom di batch kecuali PK tujuan
 		var colsToUpdateOnConflict []string
 		if len(batch) > 0 {
 			firstRow := batch[0]
@@ -344,10 +340,10 @@ func (f *Orchestrator) syncBatchWithRetry(ctx context.Context, table string, bat
 			log.Info("No non-PK columns found in batch to update on conflict. Using ON CONFLICT DO NOTHING.", zap.Strings("conflict_target_cols", dstPKColumns))
 			conflictClause = clause.OnConflict{ Columns: conflictTargetCols, DoNothing: true }
 		}
-	} else { // Jika PK tujuan tidak diketahui atau untuk dialek seperti SQLite yang mungkin tidak memerlukan kolom konflik eksplisit
+	} else {
 		log.Warn("Destination PKs not specified for ON CONFLICT clause; falling back to GORM's UpdateAll or dialect default behavior. This might be inefficient or cause 'model value required' if no updatable columns found by GORM.",
 			zap.String("dialect", f.dstConn.Dialect))
-		conflictClause = clause.OnConflict{UpdateAll: true} // Perilaku GORM default
+		conflictClause = clause.OnConflict{UpdateAll: true}
 	}
 
 
@@ -387,71 +383,85 @@ func (f *Orchestrator) syncBatchWithRetry(ctx context.Context, table string, bat
 	return fmt.Errorf("upsert batch to table '%s' failed after %d retries: %w", table, f.cfg.MaxRetries, lastErr)
 }
 
-// getSortedPKNames mengurutkan nama kolom PK (dari sumber) untuk konsistensi paginasi.
-func (f *Orchestrator) getSortedPKNames(pkColumns []string) ([]string, error) {
-	if len(pkColumns) == 0 {
-		return []string{}, nil
-	}
-	sortedPKs := make([]string, len(pkColumns))
-	copy(sortedPKs, pkColumns)
-	sort.Strings(sortedPKs)
-	return sortedPKs, nil
-}
 
-// buildPaginationClauses membangun klausa ORDER BY dan informasi placeholder untuk paginasi sumber.
-func (f *Orchestrator) buildPaginationClauses(srcPKColumns []string, dialect string) (orderBy string, quotedPKs []string, placeholders []string, err error) {
+// buildPaginationOrderBy membangun klausa ORDER BY dan mengembalikan nama PK yang di-quote dan diurutkan.
+// Kolom PK diurutkan berdasarkan nama untuk konsistensi.
+func (f *Orchestrator) buildPaginationOrderBy(srcPKColumns []string, dialect string) (orderBy string, quotedSortedPKs []string, err error) {
 	if len(srcPKColumns) == 0 {
 		err = fmt.Errorf("no source primary keys provided for pagination")
 		return
 	}
-	// Menggunakan urutan PK dari srcPKColumns apa adanya jika sudah diurutkan berdasarkan ordinal position.
-	// Jika tidak, sorting berdasarkan nama adalah fallback untuk determinisme.
-	// Saat ini, SchemaSyncer.GetPrimaryKeys (yang mengisi srcPKColumns) sudah sort by name.
 
-	// Untuk konsistensi dengan WHERE (...tuple...) > (...tuple...), kita sort by name.
-	// Jika urutan asli PK komposit dari DB penting dan berbeda, ini perlu disesuaikan.
-	pksToUse, _ := f.getSortedPKNames(srcPKColumns) // Ini akan sort by name
+	// Urutkan nama PK berdasarkan abjad untuk memastikan urutan yang konsisten dalam ORDER BY dan WHERE
+	// Ini penting jika urutan asli dari skema tidak dijamin konsisten.
+	pksToUse := make([]string, len(srcPKColumns))
+	copy(pksToUse, srcPKColumns)
+	sort.Strings(pksToUse) // Urutkan berdasarkan nama
 
-	quotedPKs = make([]string, len(pksToUse))
-	placeholders = make([]string, len(pksToUse))
+	quotedSortedPKs = make([]string, len(pksToUse))
 	orderByParts := make([]string, len(pksToUse))
 
 	for i, pk := range pksToUse {
-		quotedPKs[i] = utils.QuoteIdentifier(pk, dialect)
-		placeholders[i] = "?"
-		orderByParts[i] = quotedPKs[i] + " ASC"
+		quotedSortedPKs[i] = utils.QuoteIdentifier(pk, dialect)
+		orderByParts[i] = quotedSortedPKs[i] + " ASC" // Selalu ASC untuk paginasi standar
 	}
 	orderBy = strings.Join(orderByParts, ", ")
 	return
 }
 
 // buildWhereClause membangun klausa WHERE untuk paginasi sumber.
-func (f *Orchestrator) buildWhereClause(quotedSortedSrcPKs []string, placeholders []string, lastSrcPKValues []interface{}) (string, []interface{}) {
-	if len(quotedSortedSrcPKs) == 0 {
-		return "1=1", []interface{}{}
+// `quotedSortedSrcPKs` harus merupakan nama kolom PK yang sudah di-quote dan diurutkan (sama dengan urutan di ORDER BY).
+// `lastSrcPKValues` harus berisi nilai-nilai yang sesuai dengan urutan `quotedSortedSrcPKs`.
+func (f *Orchestrator) buildWhereClause(quotedSortedSrcPKs []string, lastSrcPKValues []interface{}, srcDialect string) (string, []interface{}, error) {
+	numPKs := len(quotedSortedSrcPKs)
+	if numPKs == 0 {
+		return "1=1", []interface{}{}, nil // Tidak ada PK, tidak ada paginasi
 	}
-	if len(quotedSortedSrcPKs) == 1 {
-		return fmt.Sprintf("%s > ?", quotedSortedSrcPKs[0]), lastSrcPKValues
+	if numPKs != len(lastSrcPKValues) {
+		return "", nil, fmt.Errorf("mismatch between number of PK columns (%d) and PK values (%d)", numPKs, len(lastSrcPKValues))
 	}
-	if len(quotedSortedSrcPKs) != len(placeholders) || len(quotedSortedSrcPKs) != len(lastSrcPKValues) {
-		f.logger.Error("Mismatch in counts for building composite PK WHERE clause.",
-			zap.Int("quoted_pks", len(quotedSortedSrcPKs)),
-			zap.Int("placeholders", len(placeholders)),
-			zap.Int("values", len(lastSrcPKValues)))
-		if len(lastSrcPKValues) > 0 && len(quotedSortedSrcPKs) > 0 { // Fallback aman
-			f.logger.Warn("Falling back to single PK condition for WHERE clause.")
-			return fmt.Sprintf("%s > ?", quotedSortedSrcPKs[0]), []interface{}{lastSrcPKValues[0]}
+
+	if srcDialect == "sqlite" && numPKs > 1 {
+		// Logika "Seek Method" untuk SQLite Composite PK
+		// WHERE (pk1 > val1) OR
+		//       (pk1 = val1 AND pk2 > val2) OR
+		//       (pk1 = val1 AND pk2 = val2 AND pk3 > val3) ...
+		var conditions []string
+		var args []interface{}
+
+		for i := 0; i < numPKs; i++ {
+			var currentLevelConditions []string
+			// Tambahkan kondisi pk_prev = val_prev untuk semua PK sebelumnya
+			for j := 0; j < i; j++ {
+				currentLevelConditions = append(currentLevelConditions, fmt.Sprintf("%s = ?", quotedSortedSrcPKs[j]))
+				args = append(args, lastSrcPKValues[j])
+			}
+			// Tambahkan kondisi pk_current > val_current
+			currentLevelConditions = append(currentLevelConditions, fmt.Sprintf("%s > ?", quotedSortedSrcPKs[i]))
+			args = append(args, lastSrcPKValues[i])
+
+			conditions = append(conditions, "("+strings.Join(currentLevelConditions, " AND ")+")")
 		}
-		return "1=0", []interface{}{} // Tidak akan cocok
+		return strings.Join(conditions, " OR "), args, nil
 	}
+
+	// Untuk dialek lain (MySQL, PostgreSQL) yang mendukung row-value constructor
+	if numPKs == 1 {
+		return fmt.Sprintf("%s > ?", quotedSortedSrcPKs[0]), lastSrcPKValues, nil
+	}
+
+	// Row-value constructor untuk >1 PK
 	whereTuple := fmt.Sprintf("(%s)", strings.Join(quotedSortedSrcPKs, ", "))
+	placeholders := make([]string, numPKs)
+	for i := range placeholders {
+		placeholders[i] = "?"
+	}
 	placeholderTuple := fmt.Sprintf("(%s)", strings.Join(placeholders, ", "))
-	return fmt.Sprintf("%s > %s", whereTuple, placeholderTuple), lastSrcPKValues
+	return fmt.Sprintf("%s > %s", whereTuple, placeholderTuple), lastSrcPKValues, nil
 }
 
 
-// toggleForeignKeys dan revertFKsWithContext sekarang adalah method Orchestrator
-// (Definisi mereka dari jawaban sebelumnya bisa disalin ke sini atau ke file helper Orchestrator)
+// toggleForeignKeys dan revertFKsWithContext (tetap sama seperti sebelumnya)
 func (f *Orchestrator) toggleForeignKeys(ctx context.Context, conn *db.Connector, enable bool, log *zap.Logger) (revertFunc func() error, err error) {
 	if conn.Dialect != "mysql" && conn.Dialect != "postgres" {
 		log.Debug("Foreign key toggling skipped: not supported for dialect or not needed.", zap.String("dialect", conn.Dialect))
@@ -468,20 +478,19 @@ func (f *Orchestrator) toggleForeignKeys(ctx context.Context, conn *db.Connector
 	switch dialect {
 	case "mysql":
 		initialStateCmd = "SELECT @@SESSION.foreign_key_checks;"
-		cmdToExecute = "SET SESSION foreign_key_checks = 0;"    // Disable
-		cmdToRevert = "SET SESSION foreign_key_checks = %v;" // Placeholder untuk state awal
-		defaultInitialState = 1                                // MySQL default FKs on
+		cmdToExecute = "SET SESSION foreign_key_checks = 0;"
+		cmdToRevert = "SET SESSION foreign_key_checks = %v;"
+		defaultInitialState = 1
 	case "postgres":
 		initialStateCmd = "SHOW session_replication_role;"
-		cmdToExecute = "SET session_replication_role = replica;" // Disable (efektifnya)
-		cmdToRevert = "SET session_replication_role = '%s';"  // Placeholder untuk state awal
-		defaultInitialState = "origin"                         // PG default
+		cmdToExecute = "SET session_replication_role = replica;"
+		cmdToRevert = "SET session_replication_role = '%s';"
+		defaultInitialState = "origin"
 		scopedLog.Warn("Using SET session_replication_role for PostgreSQL FK toggling. User needs superuser or REPLICATION attribute.")
 	default:
 		return nil, nil
 	}
 
-	// Baca state awal
 	var stateStr string
 	readCtx, readCancel := context.WithTimeout(ctx, 5*time.Second)
 	errRead := conn.DB.WithContext(readCtx).Raw(initialStateCmd).Scan(&stateStr).Error
@@ -499,20 +508,19 @@ func (f *Orchestrator) toggleForeignKeys(ctx context.Context, conn *db.Connector
 				scopedLog.Warn("Could not convert MySQL FK state to int. Assuming default.", zap.Error(convErr))
 				initialState = defaultInitialState
 			}
-		} else { // postgres
+		} else {
 			initialState = strings.TrimSpace(stateStr)
 		}
 	}
 
-	// Format perintah revert dengan state awal
 	if dialect == "mysql" {
 		cmdToRevert = fmt.Sprintf(cmdToRevert, initialState.(int))
-	} else { // postgres
+	} else {
 		cmdToRevert = fmt.Sprintf(cmdToRevert, initialState.(string))
 	}
 
-	finalCmdToExecute := cmdToExecute // Perintah untuk menonaktifkan
-	if enable {                     // Jika 'enable' true, berarti kita ingin MENGAKTIFKAN (revert)
+	finalCmdToExecute := cmdToExecute
+	if enable {
 		finalCmdToExecute = cmdToRevert
 	}
 
@@ -531,7 +539,6 @@ func (f *Orchestrator) toggleForeignKeys(ctx context.Context, conn *db.Connector
 		return nil, fmt.Errorf("FK toggle command '%s' failed: %w", finalCmdToExecute, executionError)
 	}
 
-	// Fungsi revert yang akan dipanggil oleh defer
 	revertFunc = func() error {
 		rCtx, rCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer rCancel()
@@ -556,3 +563,27 @@ func (f *Orchestrator) revertFKsWithContext(ctx context.Context, revertFunc func
 		return fmt.Errorf("reverting FKs cancelled by context: %w", ctx.Err())
 	}
 }
+
+// Helper UnquoteIdentifier (perlu ditambahkan ke utils/quoting.go jika belum ada)
+// Jika sudah ada, ini hanya contoh.
+/*
+func UnquoteIdentifier(name, dialect string) string {
+    name = strings.TrimSpace(name)
+    if len(name) < 2 {
+        return name
+    }
+    first, last := name[0], name[len(name)-1]
+
+    switch strings.ToLower(dialect) {
+    case "mysql":
+        if first == '`' && last == '`' {
+            return strings.ReplaceAll(name[1:len(name)-1], "``", "`")
+        }
+    case "postgres", "sqlite": // SQLite juga sering menggunakan double quotes
+        if first == '"' && last == '"' {
+            return strings.ReplaceAll(name[1:len(name)-1], "\"\"", "\"")
+        }
+    }
+    return name // Jika tidak di-quote dengan karakter yang dikenal untuk dialek itu
+}
+*/

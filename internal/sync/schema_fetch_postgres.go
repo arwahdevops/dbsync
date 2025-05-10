@@ -5,7 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"sort"
+	"sort" // Tetap dibutuhkan untuk sorting *slice of indexes* di akhir, bukan kolom di dalam indeks
 	"strings"
 
 	"go.uber.org/zap"
@@ -123,7 +123,6 @@ func (s *SchemaSyncer) getPostgresColumns(ctx context.Context, db *gorm.DB, tabl
 		srcType := c.DataType
 		if c.DataType == "ARRAY" && strings.HasPrefix(c.UdtName, "_") {
 			baseType := strings.TrimPrefix(c.UdtName, "_")
-			// PERBAIKAN: Panggil normalizeTypeName dengan benar
 			mappedBase := normalizeTypeName(baseType)
 			srcType = mappedBase + "[]"
 		} else if c.DataType == "USER-DEFINED" && c.UdtName != "" {
@@ -163,8 +162,6 @@ func (s *SchemaSyncer) getPostgresColumns(ctx context.Context, db *gorm.DB, tabl
 func (s *SchemaSyncer) getPostgresIndexes(ctx context.Context, db *gorm.DB, table string) ([]IndexInfo, error) {
 	log := s.logger.With(zap.String("table", table), zap.String("dialect", "postgres"), zap.String("action", "getPostgresIndexes"))
 	indexes := make([]IndexInfo, 0)
-	// PERBAIKAN: Hapus deklarasi idxMap yang tidak digunakan
-	// idxMap := make(map[string]*IndexInfo)
 
 	query := `
 	SELECT
@@ -172,6 +169,7 @@ func (s *SchemaSyncer) getPostgresIndexes(ctx context.Context, db *gorm.DB, tabl
 		idx.indisunique AS is_unique,
 		idx.indisprimary AS is_primary,
 		a.attname AS column_name,
+		-- array_position gives 1-based index, or NULL if attnum is not in indkey (e.g. expression index)
 		array_position(idx.indkey::int[], a.attnum::int) AS column_seq,
 		pg_get_indexdef(idx.indexrelid) AS raw_def,
 		am.amname AS index_method
@@ -179,72 +177,87 @@ func (s *SchemaSyncer) getPostgresIndexes(ctx context.Context, db *gorm.DB, tabl
 	JOIN pg_catalog.pg_index idx ON t.oid = idx.indrelid
 	JOIN pg_catalog.pg_class i ON i.oid = idx.indexrelid
 	JOIN pg_catalog.pg_am am ON i.relam = am.oid
+	-- For actual columns:
 	LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(idx.indkey)
-	WHERE t.relkind IN ('r', 'm', 'p')
+	WHERE t.relkind IN ('r', 'm', 'p') -- r = ordinary table, m = materialized view, p = partitioned table
 	  AND t.relname = $1
 	  AND t.relnamespace = (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = current_schema())
-	ORDER BY index_name, column_seq;
+	ORDER BY index_name, column_seq; -- column_seq will ensure columns are fetched in their index order
 	`
 	var results []struct {
 		IndexName   string
 		IsUnique    bool
 		IsPrimary   bool
-		ColumnName  sql.NullString
-		ColumnSeq   sql.NullInt64
+		ColumnName  sql.NullString // Can be NULL for expression indexes
+		ColumnSeq   sql.NullInt64  // 1-based sequence of the column in the index key
 		RawDef      string
 		IndexMethod string
 	}
 	err := db.WithContext(ctx).Raw(query, table).Scan(&results).Error
 	if err != nil {
-        if err == gorm.ErrRecordNotFound || strings.Contains(strings.ToLower(err.Error()), "does not exist"){
-             log.Warn("Table not found or no indexes found.", zap.Error(err))
-             return indexes, nil
-        }
+		if err == gorm.ErrRecordNotFound || strings.Contains(strings.ToLower(err.Error()), "does not exist") {
+			log.Warn("Table not found or no indexes found.", zap.Error(err))
+			return indexes, nil
+		}
 		return nil, fmt.Errorf("postgres index query failed for table '%s': %w", table, err)
 	}
 
-	tempColMap := make(map[string][]struct {
-		Name string
-		Seq  int64
-	})
-	idxDetails := make(map[string]*IndexInfo) // Gunakan ini sebagai gantinya
+	// Map untuk mengumpulkan kolom per indeks, mempertahankan urutan
+	idxMap := make(map[string]*IndexInfo)
+	// Map untuk menyimpan kolom-kolom sementara dengan urutan aslinya
+	tempColMap := make(map[string][]struct{ Name string; Seq int64 })
 
 	for _, r := range results {
-		idx, ok := idxDetails[r.IndexName]
+		idx, ok := idxMap[r.IndexName]
 		if !ok {
 			idx = &IndexInfo{
 				Name:      r.IndexName,
 				IsUnique:  r.IsUnique,
 				IsPrimary: r.IsPrimary,
 				RawDef:    r.RawDef,
-				// IndexType: r.IndexMethod,
+				Columns:   make([]string, 0), // Akan diisi nanti
 			}
-			idxDetails[r.IndexName] = idx
-			tempColMap[r.IndexName] = make([]struct { Name string; Seq int64 }, 0)
+			idxMap[r.IndexName] = idx
+			tempColMap[r.IndexName] = make([]struct{ Name string; Seq int64 }, 0)
 		}
-		if r.ColumnName.Valid && r.ColumnName.String != "" {
-			seq := int64(1)
-			if r.ColumnSeq.Valid {
-				seq = r.ColumnSeq.Int64
-			}
-			tempColMap[r.IndexName] = append(tempColMap[r.IndexName], struct { Name string; Seq int64 }{r.ColumnName.String, seq})
-		} else if !r.ColumnName.Valid && len(tempColMap[r.IndexName]) == 0 {
-			log.Debug("Index might be functional or expression-based (no direct column name).", zap.String("index", r.IndexName), zap.String("raw_def", r.RawDef))
+
+		if r.ColumnName.Valid && r.ColumnName.String != "" && r.ColumnSeq.Valid {
+			tempColMap[r.IndexName] = append(tempColMap[r.IndexName], struct{ Name string; Seq int64 }{
+				Name: r.ColumnName.String,
+				Seq:  r.ColumnSeq.Int64, // Ini sudah 1-based dan menjaga urutan
+			})
+		} else if !r.ColumnName.Valid {
+			// Ini adalah indeks ekspresi, kita akan menggunakan RawDef untuk representasi
+			// dan mungkin mencoba mem-parsing kolom dari RawDef jika diperlukan (kompleks).
+			// Untuk saat ini, tandai saja bahwa kolomnya tidak sederhana.
+			log.Debug("Index appears to be functional/expression-based (no direct column name).",
+				zap.String("index", r.IndexName), zap.String("raw_def", r.RawDef))
+			// Kita bisa menambahkan placeholder atau parsing RawDef di sini jika diperlukan.
+			// Misalnya, jika RawDef adalah "CREATE INDEX my_idx ON my_table (lower(email))", kita ingin (lower(email))
+			// Untuk sekarang, biarkan Columns kosong jika itu indeks ekspresi dan kita tidak mem-parsingnya.
 		}
 	}
 
-	// Finalisasi: Urutkan kolom per indeks dan tambahkan ke hasil
-	for name, idx := range idxDetails { // Iterasi map yang benar
-		cols := tempColMap[name]
-		sort.Slice(cols, func(i, j int) bool { return cols[i].Seq < cols[j].Seq })
-		idx.Columns = make([]string, len(cols))
-		for i, c := range cols {
-			idx.Columns[i] = c.Name
+	for name, idx := range idxMap {
+		colData := tempColMap[name]
+		// Urutkan kolom berdasarkan Seq yang diambil dari database (penting untuk konsistensi)
+		// Sebenarnya, query `ORDER BY column_seq` sudah melakukannya, jadi sort ini mungkin redundan
+		// tapi tidak berbahaya.
+		sort.Slice(colData, func(i, j int) bool {
+			return colData[i].Seq < colData[j].Seq
+		})
+
+		idx.Columns = make([]string, len(colData))
+		for i, cd := range colData {
+			idx.Columns[i] = cd.Name
 		}
-		sort.Strings(idx.Columns)
+		// *** PENTING: HAPUS sort.Strings(idx.Columns) ***
+		// Urutan kolom harus dipertahankan seperti dari database.
+
 		indexes = append(indexes, *idx)
 	}
 
+	// Urutkan slice `indexes` berdasarkan nama untuk output yang konsisten
 	sort.Slice(indexes, func(i, j int) bool { return indexes[i].Name < indexes[j].Name })
 	log.Debug("Fetched index info successfully.", zap.Int("index_count", len(indexes)))
 	return indexes, nil
@@ -264,9 +277,11 @@ func (s *SchemaSyncer) getPostgresConstraints(ctx context.Context, db *gorm.DB, 
 			ELSE con.contype::text
 		END AS constraint_type,
 		att.attname AS column_name,
+		-- array_position is 1-based, gives the order of column in the constraint key
 		array_position(con.conkey, att.attnum) AS ordinal_position,
 		confrelid.relname AS foreign_table_name,
 		attf.attname AS foreign_column_name,
+		-- array_position for foreign columns to maintain order
 		array_position(con.confkey, attf.attnum) as fk_ordinal_position,
 		CASE con.confupdtype
 			WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT' WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL'  WHEN 'd' THEN 'SET DEFAULT' ELSE ''
@@ -278,20 +293,22 @@ func (s *SchemaSyncer) getPostgresConstraints(ctx context.Context, db *gorm.DB, 
 	FROM pg_catalog.pg_constraint con
 	JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid
 	JOIN pg_catalog.pg_namespace nsp ON nsp.oid = rel.relnamespace
+	-- For local columns
 	LEFT JOIN pg_catalog.pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = ANY(con.conkey)
+	-- For foreign key's referenced table and columns
 	LEFT JOIN pg_catalog.pg_class confrelid ON confrelid.oid = con.confrelid
 	LEFT JOIN pg_catalog.pg_attribute attf ON attf.attrelid = con.confrelid AND attf.attnum = ANY(con.confkey)
 	WHERE nsp.nspname = current_schema() AND rel.relname = $1
-	ORDER BY constraint_name, ordinal_position, fk_ordinal_position;
+	ORDER BY constraint_name, ordinal_position, fk_ordinal_position; -- Ensure consistent order
 	`
 	var results []struct {
 		ConstraintName    string
 		ConstraintType    string
 		ColumnName        sql.NullString
-		OrdinalPosition   sql.NullInt64
+		OrdinalPosition   sql.NullInt64 // 1-based
 		ForeignTableName  sql.NullString
 		ForeignColumnName sql.NullString
-		FkOrdinalPosition sql.NullInt64 // PERBAIKAN: Deklarasi fkSeq tidak perlu lagi
+		FkOrdinalPosition sql.NullInt64 // 1-based
 		UpdateRule        string
 		DeleteRule        string
 		Definition        string
@@ -305,8 +322,10 @@ func (s *SchemaSyncer) getPostgresConstraints(ctx context.Context, db *gorm.DB, 
 		return nil, fmt.Errorf("postgres constraints query failed for table '%s': %w", table, err)
 	}
 
-	tempFKCols := make(map[string][]struct{ Seq int64; Local, Foreign string })
-	tempCols := make(map[string][]struct{ Seq int64; Name string })
+	// Temporary maps to gather columns in their correct order
+	tempLocalCols := make(map[string][]struct{ Seq int64; Name string })
+	tempForeignCols := make(map[string][]struct{ Seq int64; Name string })
+
 
 	for _, r := range results {
 		constraintName := r.ConstraintName
@@ -317,9 +336,9 @@ func (s *SchemaSyncer) getPostgresConstraints(ctx context.Context, db *gorm.DB, 
 			cons = &ConstraintInfo{
 				Name:           constraintName,
 				Type:           constraintType,
-				Columns:        make([]string, 0),
+				Columns:        make([]string, 0), // Will be populated later
 				ForeignTable:   r.ForeignTableName.String,
-				ForeignColumns: make([]string, 0),
+				ForeignColumns: make([]string, 0), // Will be populated later
 				OnDelete:       r.DeleteRule,
 				OnUpdate:       r.UpdateRule,
 				Definition: func() string {
@@ -334,53 +353,77 @@ func (s *SchemaSyncer) getPostgresConstraints(ctx context.Context, db *gorm.DB, 
 				}(),
 			}
 			consMap[constraintName] = cons
+			// Initialize slices for this constraint if not already done
+			if _, exists := tempLocalCols[constraintName]; !exists {
+				tempLocalCols[constraintName] = make([]struct{ Seq int64; Name string }, 0)
+			}
 			if constraintType == "FOREIGN KEY" {
-				tempFKCols[constraintName] = make([]struct{ Seq int64; Local, Foreign string }, 0)
-			} else if constraintType == "PRIMARY KEY" || constraintType == "UNIQUE" {
-				tempCols[constraintName] = make([]struct{ Seq int64; Name string }, 0)
+				if _, exists := tempForeignCols[constraintName]; !exists {
+					tempForeignCols[constraintName] = make([]struct{ Seq int64; Name string }, 0)
+				}
 			}
 		}
 
-		if r.ColumnName.Valid && r.ColumnName.String != "" {
-			seq := int64(1); if r.OrdinalPosition.Valid { seq = r.OrdinalPosition.Int64 }
-			// PERBAIKAN: Hapus deklarasi fkSeq yang tidak digunakan
-			// fkSeq := int64(1); if r.FkOrdinalPosition.Valid { fkSeq = r.FkOrdinalPosition.Int64 }
-
-			if constraintType == "FOREIGN KEY" && r.ForeignColumnName.Valid {
-				tempFKCols[constraintName] = append(tempFKCols[constraintName], struct{ Seq int64; Local, Foreign string }{
-					Seq:     seq,
-					Local:   r.ColumnName.String,
-					Foreign: r.ForeignColumnName.String,
-				})
-			} else if constraintType == "PRIMARY KEY" || constraintType == "UNIQUE" {
-				tempCols[constraintName] = append(tempCols[constraintName], struct{ Seq int64; Name string }{
-					Seq:  seq,
+		// Populate local columns
+		if r.ColumnName.Valid && r.ColumnName.String != "" && r.OrdinalPosition.Valid {
+			// Check for duplicates before appending (important if query returns multiple rows for same col in same constraint)
+			alreadyExists := false
+			for _, lc := range tempLocalCols[constraintName] {
+				if lc.Seq == r.OrdinalPosition.Int64 && lc.Name == r.ColumnName.String {
+					alreadyExists = true
+					break
+				}
+			}
+			if !alreadyExists {
+				tempLocalCols[constraintName] = append(tempLocalCols[constraintName], struct{ Seq int64; Name string }{
+					Seq:  r.OrdinalPosition.Int64,
 					Name: r.ColumnName.String,
 				})
 			}
 		}
-	}
 
-	for constraintName, cons := range consMap {
-		if cons.Type == "FOREIGN KEY" {
-			fkColPairs := tempFKCols[constraintName]
-			sort.Slice(fkColPairs, func(i, j int) bool { return fkColPairs[i].Seq < fkColPairs[j].Seq })
-			cons.Columns = make([]string, len(fkColPairs))
-			cons.ForeignColumns = make([]string, len(fkColPairs))
-			for i, pair := range fkColPairs {
-				cons.Columns[i] = pair.Local
-				cons.ForeignColumns[i] = pair.Foreign
+		// Populate foreign columns for FKs
+		if constraintType == "FOREIGN KEY" && r.ForeignColumnName.Valid && r.ForeignColumnName.String != "" && r.FkOrdinalPosition.Valid {
+			alreadyExists := false
+			for _, fc := range tempForeignCols[constraintName] {
+				if fc.Seq == r.FkOrdinalPosition.Int64 && fc.Name == r.ForeignColumnName.String {
+					alreadyExists = true
+					break
+				}
 			}
-		} else if cons.Type == "PRIMARY KEY" || cons.Type == "UNIQUE" {
-			cols := tempCols[constraintName]
-			sort.Slice(cols, func(i, j int) bool { return cols[i].Seq < cols[j].Seq })
-			cons.Columns = make([]string, len(cols))
-			for i, c := range cols { cons.Columns[i] = c.Name }
-			sort.Strings(cons.Columns)
+			if !alreadyExists {
+				tempForeignCols[constraintName] = append(tempForeignCols[constraintName], struct{ Seq int64; Name string }{
+					Seq:  r.FkOrdinalPosition.Int64,
+					Name: r.ForeignColumnName.String,
+				})
+			}
 		}
 	}
 
-	for _, cons := range consMap { constraints = append(constraints, *cons) }
+	// Finalize column lists for each constraint, ensuring correct order
+	for constraintName, cons := range consMap {
+		// Local columns
+		localColData := tempLocalCols[constraintName]
+		sort.Slice(localColData, func(i, j int) bool { return localColData[i].Seq < localColData[j].Seq })
+		cons.Columns = make([]string, len(localColData))
+		for i, cd := range localColData {
+			cons.Columns[i] = cd.Name
+		}
+		// *** PENTING: JANGAN sort.Strings(cons.Columns) ***
+
+		// Foreign columns (if FK)
+		if cons.Type == "FOREIGN KEY" {
+			foreignColData := tempForeignCols[constraintName]
+			sort.Slice(foreignColData, func(i, j int) bool { return foreignColData[i].Seq < foreignColData[j].Seq })
+			cons.ForeignColumns = make([]string, len(foreignColData))
+			for i, cd := range foreignColData {
+				cons.ForeignColumns[i] = cd.Name
+			}
+			// *** PENTING: JANGAN sort.Strings(cons.ForeignColumns) ***
+		}
+		constraints = append(constraints, *cons)
+	}
+
 	sort.Slice(constraints, func(i, j int) bool { return constraints[i].Name < constraints[j].Name })
 	log.Debug("Fetched constraint info successfully.", zap.Int("constraint_count", len(constraints)))
 	return constraints, nil

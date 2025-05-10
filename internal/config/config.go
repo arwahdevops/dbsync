@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"errors" // Diperlukan untuk os.IsNotExist
 	"fmt"
 	"os"
 	"sort"
@@ -9,7 +10,7 @@ import (
 	"time"
 
 	"github.com/caarlos0/env/v8"
-	"go.uber.org/zap" // Diperlukan untuk logging di LoadTypeMappings
+	"go.uber.org/zap"
 )
 
 type SchemaSyncStrategy string
@@ -62,7 +63,9 @@ type Config struct {
 	DstPasswordKey   string `env:"DST_PASSWORD_KEY" envDefault:"password"`
 
 	// --- Type Mapping Configuration ---
-	TypeMappingFilePath string `env:"TYPE_MAPPING_FILE_PATH" envDefault:"./typemap.json"`
+	TypeMappingFilePath string `env:"TYPE_MAPPING_FILE_PATH" envDefault:""` // Default kosong
+	// Tambahkan field untuk Opsi 3 jika dipilih:
+	// FailOnInvalidTypeMap bool `env:"FAIL_ON_INVALID_TYPEMAP" envDefault:"true"`
 }
 
 type DatabaseConfig struct {
@@ -75,8 +78,7 @@ type DatabaseConfig struct {
 	SSLMode  string `env:"SSLMODE" envDefault:"disable"`
 }
 
-// --- Type Mapping Structures (pindahkan ke sini atau file terpisah jika besar) ---
-type TypeMappingConfigEntry struct { // Ubah nama agar tidak konflik dengan struct Config
+type TypeMappingConfigEntry struct {
 	SourceDialect   string            `json:"source_dialect"`
 	TargetDialect   string            `json:"target_dialect"`
 	Mappings        map[string]string `json:"mappings"`
@@ -84,18 +86,16 @@ type TypeMappingConfigEntry struct { // Ubah nama agar tidak konflik dengan stru
 }
 
 type SpecialMapping struct {
-	SourceTypePattern string `json:"source_type_pattern"` // Regex
+	SourceTypePattern string `json:"source_type_pattern"`
 	TargetType        string `json:"target_type"`
-	// Bisa ditambahkan field lain seperti 'priority' jika ada overlap pola
 }
 
 type AllTypeMappings struct {
 	Mappings []TypeMappingConfigEntry `json:"type_mappings"`
 }
 
-var loadedTypeMappingsCache *AllTypeMappings // Cache mapping yang sudah dimuat
+var loadedTypeMappingsCache *AllTypeMappings
 
-// Load loads the main application configuration.
 func Load() (*Config, error) {
 	cfg := &Config{}
 	opts := env.Options{RequiredIfNoDef: true}
@@ -122,45 +122,75 @@ func Load() (*Config, error) {
 }
 
 // LoadTypeMappings memuat mapping tipe data dari file JSON.
-// `logger` harus sudah diinisialisasi sebelum memanggil fungsi ini.
+// Perubahan: Jika filePath (dari cfg.TypeMappingFilePath) diset dan ada error saat load/parse,
+// fungsi ini akan mengembalikan error tersebut.
 func LoadTypeMappings(filePath string, logger *zap.Logger) error {
-	if loadedTypeMappingsCache != nil && filePath == "" { // Jika sudah dimuat dan path kosong, jangan proses lagi
-		logger.Debug("External type mappings already processed or path is empty, skipping reload.")
+	// Jika cache sudah ada dan filePath yang baru sama dengan yang lama (atau keduanya kosong),
+	// tidak perlu reload. Ini mencegah reload jika fungsi dipanggil berkali-kali dengan path yang sama.
+	// Namun, jika filePath berbeda dari yang di-cache, kita harus reload.
+	// Untuk kesederhanaan, kita akan selalu reload jika filePath tidak kosong,
+	// dan hanya menggunakan cache jika filePath kosong setelah load pertama.
+	// Atau, kita bisa membuat logika cache lebih canggih, tapi untuk sekarang,
+	// asumsikan LoadTypeMappings dipanggil sekali dengan path final.
+
+	// Jika sudah pernah dipanggil dan filePath sekarang kosong, gunakan cache atau state termuat sebelumnya.
+	if loadedTypeMappingsCache != nil && filePath == "" {
+		logger.Debug("External type mappings already processed or path is empty now, skipping reload from file.")
 		return nil
 	}
+	// Reset cache jika filePath baru diberikan (atau load pertama)
+	loadedTypeMappingsCache = nil
+
+
 	if filePath == "" {
-		logger.Info("Type mapping file path is not configured. No external type mappings will be loaded. The application will rely on internal fallbacks or direct type usage.")
+		logger.Info("Type mapping file path (TYPE_MAPPING_FILE_PATH) is not configured. " +
+			"No external type mappings will be loaded. The application will rely on internal fallbacks or direct type usage if dialects are the same.")
 		loadedTypeMappingsCache = &AllTypeMappings{Mappings: []TypeMappingConfigEntry{}} // Inisialisasi kosong
 		return nil
 	}
 
+	logger.Info("Attempting to load custom type mappings from file.", zap.String("path", filePath))
+
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		logger.Error("Failed to read type mapping file. Proceeding without external type mappings.", zap.String("path", filePath), zap.Error(err))
-		loadedTypeMappingsCache = &AllTypeMappings{Mappings: []TypeMappingConfigEntry{}} // Inisialisasi kosong sebagai fallback
-		// Tidak mengembalikan error di sini agar aplikasi tetap bisa berjalan dengan fallback
-		return nil // Atau return fmt.Errorf(...) jika ingin fatal
+		if errors.Is(err, os.ErrNotExist) {
+			// File tidak ada, ini adalah error konfigurasi jika path eksplisit diberikan.
+			logger.Error("Custom type mapping file specified but not found.",
+				zap.String("path", filePath),
+				zap.Error(err))
+			// Kembalikan error agar aplikasi gagal jika file yang dikonfigurasi tidak ada.
+			return fmt.Errorf("custom type mapping file specified at '%s' but not found: %w", filePath, err)
+		}
+		// Error lain saat membaca file
+		logger.Error("Failed to read custom type mapping file.",
+			zap.String("path", filePath),
+			zap.Error(err))
+		return fmt.Errorf("failed to read custom type mapping file '%s': %w", filePath, err)
 	}
 
 	var mappings AllTypeMappings
 	if err := json.Unmarshal(data, &mappings); err != nil {
-		logger.Error("Failed to unmarshal type mapping file. Proceeding without external type mappings.", zap.String("path", filePath), zap.Error(err))
-		loadedTypeMappingsCache = &AllTypeMappings{Mappings: []TypeMappingConfigEntry{}} // Inisialisasi kosong sebagai fallback
-		return nil // Atau return fmt.Errorf(...) jika ingin fatal
+		logger.Error("Failed to unmarshal custom type mapping file. Check JSON syntax and structure.",
+			zap.String("path", filePath),
+			zap.Error(err))
+		return fmt.Errorf("failed to unmarshal custom type mapping file '%s': %w", filePath, err)
 	}
 
 	loadedTypeMappingsCache = &mappings
-	logger.Info("Successfully loaded type mappings from file.",
+	logger.Info("Successfully loaded custom type mappings from file.",
 		zap.String("path", filePath),
 		zap.Int("configurations_loaded", len(loadedTypeMappingsCache.Mappings)))
 	return nil
 }
 
-// GetTypeMappingForDialects mengambil konfigurasi mapping spesifik untuk pasangan dialek.
+
 func GetTypeMappingForDialects(srcDialect, dstDialect string) *TypeMappingConfigEntry {
 	if loadedTypeMappingsCache == nil {
-		// Ini seharusnya tidak terjadi jika LoadTypeMappings dipanggil, bahkan jika file tidak ada.
-		// Namun, sebagai pengaman:
+		// Ini seharusnya tidak terjadi jika LoadTypeMappings dipanggil saat startup,
+		// bahkan jika file tidak ada (akan diinisialisasi cache kosong).
+		// Log sebagai warning jika ini terjadi, menandakan potensi masalah urutan inisialisasi.
+		// fmt.Printf("Warning: GetTypeMappingForDialects called before LoadTypeMappings or cache is unexpectedly nil. Src: %s, Dst: %s\n", srcDialect, dstDialect)
+		// Untuk keamanan, return nil. Pemanggil harus menangani ini.
 		return nil
 	}
 	for _, cfgEntry := range loadedTypeMappingsCache.Mappings {
@@ -168,51 +198,34 @@ func GetTypeMappingForDialects(srcDialect, dstDialect string) *TypeMappingConfig
 			return &cfgEntry
 		}
 	}
-	return nil // Tidak ada mapping yang ditemukan untuk pasangan dialek ini
+	return nil
 }
 
 func validateConfig(cfg *Config) error {
-	// Validasi SyncDirection
 	allowedDirections := map[string]bool{"mysql-to-mysql": true, "mysql-to-postgres": true, "postgres-to-mysql": true, "postgres-to-postgres": true, "sqlite-to-mysql": true, "sqlite-to-postgres": true}
 	dir := strings.ToLower(cfg.SyncDirection)
 	if !allowedDirections[dir] {
 		return fmt.Errorf("invalid sync direction: %s. Valid: %v", cfg.SyncDirection, getMapKeys(allowedDirections))
 	}
-	// Validasi SchemaSyncStrategy
 	strategy := strings.ToLower(string(cfg.SchemaSyncStrategy))
 	if strategy != string(SchemaSyncDropCreate) && strategy != string(SchemaSyncAlter) && strategy != string(SchemaSyncNone) {
 		return fmt.Errorf("invalid schema sync strategy: %s. Valid: %s, %s, %s", cfg.SchemaSyncStrategy, SchemaSyncDropCreate, SchemaSyncAlter, SchemaSyncNone)
 	}
-	// Validasi port
 	validatePort := func(port int, name string) error {
 		if port < 1 || port > 65535 {
 			return fmt.Errorf("invalid %s port: %d", name, port)
 		}
 		return nil
 	}
-	if err := validatePort(cfg.SrcDB.Port, "source"); err != nil {
-		return err
-	}
-	if err := validatePort(cfg.DstDB.Port, "destination"); err != nil {
-		return err
-	}
-	if err := validatePort(cfg.MetricsPort, "metrics"); err != nil {
-		return err
-	}
-	// Validasi nilai numerik
-	if cfg.BatchSize <= 0 {
-		return fmt.Errorf("batch size must be positive")
-	}
-	if cfg.Workers <= 0 {
-		return fmt.Errorf("workers must be positive")
-	}
-	if cfg.MaxRetries < 0 {
-		return fmt.Errorf("max retries cannot be negative")
-	}
-	if cfg.ConnPoolSize <= 0 {
-		return fmt.Errorf("connection pool size must be positive")
-	}
-	// Validasi SSLMode
+	if err := validatePort(cfg.SrcDB.Port, "source"); err != nil { return err }
+	if err := validatePort(cfg.DstDB.Port, "destination"); err != nil { return err }
+	if err := validatePort(cfg.MetricsPort, "metrics"); err != nil { return err }
+
+	if cfg.BatchSize <= 0 { return fmt.Errorf("batch size must be positive") }
+	if cfg.Workers <= 0 { return fmt.Errorf("workers must be positive") }
+	if cfg.MaxRetries < 0 { return fmt.Errorf("max retries cannot be negative") }
+	if cfg.ConnPoolSize <= 0 { return fmt.Errorf("connection pool size must be positive") }
+
 	validSSL := map[string]bool{"disable": true, "allow": true, "prefer": true, "require": true, "verify-ca": true, "verify-full": true}
 	if isSSLModeRelevant(cfg.SrcDB.Dialect) && !validSSL[strings.ToLower(cfg.SrcDB.SSLMode)] {
 		return fmt.Errorf("invalid SSL mode for source DB: %s", cfg.SrcDB.SSLMode)
@@ -220,9 +233,8 @@ func validateConfig(cfg *Config) error {
 	if isSSLModeRelevant(cfg.DstDB.Dialect) && !validSSL[strings.ToLower(cfg.DstDB.SSLMode)] {
 		return fmt.Errorf("invalid SSL mode for destination DB: %s", cfg.DstDB.SSLMode)
 	}
-	// Validasi kesesuaian SyncDirection dengan dialect
 	parts := strings.Split(dir, "-to-")
-	if len(parts) != 2 { // Pastikan formatnya benar
+	if len(parts) != 2 {
 		return fmt.Errorf("invalid SYNC_DIRECTION format: %s. Expected format 'source-to-destination'", dir)
 	}
 	srcDialect := strings.ToLower(cfg.SrcDB.Dialect)
@@ -245,6 +257,7 @@ func getMapKeys(m map[string]bool) []string {
 	sort.Strings(keys)
 	return keys
 }
+
 func isSSLModeRelevant(dialect string) bool {
 	switch strings.ToLower(dialect) {
 	case "postgres", "mysql":

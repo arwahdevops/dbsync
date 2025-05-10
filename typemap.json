@@ -4,6 +4,7 @@
       "source_dialect": "mysql",
       "target_dialect": "postgres",
       "mappings": {
+        "bit": "VARBIT",
         "tinyint": "SMALLINT",
         "smallint": "SMALLINT",
         "mediumint": "INTEGER",
@@ -33,7 +34,11 @@
         "time": "TIME WITHOUT TIME ZONE",
         "datetime": "TIMESTAMP WITHOUT TIME ZONE",
         "timestamp": "TIMESTAMP WITH TIME ZONE",
-        "year": "SMALLINT"
+        "year": "SMALLINT",
+        "geometry": "geometry",
+        "point": "point",
+        "linestring": "geometry",
+        "polygon": "geometry"
       },
       "special_mappings": [
         {
@@ -68,16 +73,37 @@
         "date": "DATE",
         "time without time zone": "TIME",
         "time with time zone": "TIME",
-        "timestamp without time zone": "DATETIME(6)",
-        "timestamp with time zone": "TIMESTAMP(6)",
+        "timestamp without time zone": "DATETIME",
+        "timestamp with time zone": "TIMESTAMP",
         "boolean": "TINYINT(1)",
+        "interval": "VARCHAR(100)",
+        "money": "DECIMAL(19,2)",
+        "bit": "BINARY",
+        "bit varying": "VARBINARY",
+        "varbit": "VARBINARY",
         "inet": "VARCHAR(43)",
         "cidr": "VARCHAR(43)",
         "macaddr": "VARCHAR(17)",
+        "macaddr8": "VARCHAR(23)",
         "text[]": "JSON",
+        "varchar[]": "JSON",
         "integer[]": "JSON",
-        "int4": "INT",  // Alias PostgreSQL
-        "int8": "BIGINT" // Alias PostgreSQL
+        "bigint[]": "JSON",
+        "boolean[]": "JSON",
+        "numeric[]": "JSON",
+        "date[]": "JSON",
+        "timestamp[]": "JSON",
+        "timestamptz[]": "JSON",
+        "int2": "SMALLINT",
+        "int4": "INT",
+        "int8": "BIGINT",
+        "float4": "FLOAT",
+        "float8": "DOUBLE",
+        "bool": "TINYINT(1)",
+        "geometry": "GEOMETRY",
+        "point": "POINT",
+        "linestring": "LINESTRING",
+        "polygon": "POLYGON"
       },
       "special_mappings": []
     },
@@ -90,10 +116,14 @@
         "text": "TEXT",
         "blob": "BYTEA",
         "numeric": "NUMERIC",
+        "int": "BIGINT",
+        "varchar": "TEXT",
+        "char": "TEXT",
         "datetime": "TIMESTAMP WITHOUT TIME ZONE",
         "date": "DATE",
         "timestamp": "TIMESTAMP WITHOUT TIME ZONE",
-        "boolean": "BOOLEAN"
+        "boolean": "BOOLEAN",
+        "decimal": "NUMERIC"
       },
       "special_mappings": []
     },
@@ -106,10 +136,14 @@
         "text": "LONGTEXT",
         "blob": "LONGBLOB",
         "numeric": "DECIMAL(38,18)",
+        "int": "BIGINT",
+        "varchar": "LONGTEXT",
+        "char": "LONGTEXT",
         "datetime": "DATETIME(6)",
         "date": "DATE",
         "timestamp": "DATETIME(6)",
-        "boolean": "TINYINT(1)"
+        "boolean": "TINYINT(1)",
+        "decimal": "DECIMAL(38,18)"
       },
       "special_mappings": []
     }

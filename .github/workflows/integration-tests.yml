@@ -42,8 +42,8 @@ jobs:
       - name: Install Go dependencies
         run: go mod tidy && go mod download
 
-      - name: Build (opsional, tapi baik untuk cek kompilasi)
-        run: go build -v -o dbsync .
+      #- name: Build (opsional, tapi baik untuk cek kompilasi)
+      #  run: go build -v -o dbsync .
 
       - name: Run Integration Tests
         # Menjalankan test dengan tag 'integration'

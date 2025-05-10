@@ -12,7 +12,16 @@ import (
 	"gorm.io/gorm"
 )
 
-// categorizedDDLs (definisi ada di syncer_types.go)
+// categorizedDDLs (definisi ada di syncer_types.go atau file terpisah jika ada)
+// type categorizedDDLs struct {
+// 	CreateTableDDL     string
+// 	AlterColumnDDLs    []string
+// 	AddIndexDDLs       []string
+// 	DropIndexDDLs      []string
+// 	AddConstraintDDLs  []string
+// 	DropConstraintDDLs []string
+// }
+
 
 // cleanSingleDDL membersihkan satu string DDL dari spasi berlebih dan titik koma akhir.
 func cleanSingleDDL(ddl string) string {
@@ -44,10 +53,6 @@ func (s *SchemaSyncer) parseAndCategorizeDDLs(ddls *SchemaExecutionResult, table
 				parsed.CreateTableDDL = cleanedStmt
 				isCreateTableProcessed = true
 				log.Debug("Categorized CREATE TABLE DDL.", zap.String("ddl", parsed.CreateTableDDL))
-
-				// Jika ada statement setelah CREATE TABLE, coba kategorikan sebagai ALTER
-				// Ini adalah skenario yang tidak umum jika DDL dihasilkan oleh syncer ini,
-				// tapi bisa terjadi jika TableDDL berasal dari sumber eksternal.
 				if i < len(potentialStatements)-1 {
 					remainingStatementsInTableDDL := false
 					for j := i + 1; j < len(potentialStatements); j++ {
@@ -55,7 +60,7 @@ func (s *SchemaSyncer) parseAndCategorizeDDLs(ddls *SchemaExecutionResult, table
 						if subsequentCleanedStmt == "" {
 							continue
 						}
-						remainingStatementsInTableDDL = true // Tandai bahwa ada statement lain
+						remainingStatementsInTableDDL = true
 						if strings.HasPrefix(strings.ToUpper(subsequentCleanedStmt), "ALTER TABLE") {
 							parsed.AlterColumnDDLs = append(parsed.AlterColumnDDLs, subsequentCleanedStmt)
 							log.Debug("Categorized subsequent ALTER TABLE DDL from TableDDL.", zap.String("ddl", subsequentCleanedStmt))
@@ -69,9 +74,7 @@ func (s *SchemaSyncer) parseAndCategorizeDDLs(ddls *SchemaExecutionResult, table
 							zap.String("full_table_ddl_input", ddls.TableDDL))
 					}
 				}
-				// Setelah CREATE TABLE (dan potensi ALTER berikutnya) diproses, kita anggap TableDDL selesai untuk blok ini.
-				// DDL lain untuk indeks/constraint seharusnya ada di slice masing-masing.
-				break
+				break // Setelah CREATE TABLE, sisa dari TableDDL (jika ada) sudah diproses atau diabaikan.
 			} else if strings.HasPrefix(upperCleanedStmt, "ALTER TABLE") {
 				parsed.AlterColumnDDLs = append(parsed.AlterColumnDDLs, cleanedStmt)
 				log.Debug("Categorized ALTER TABLE DDL from TableDDL.", zap.String("ddl", cleanedStmt))
@@ -104,14 +107,15 @@ func (s *SchemaSyncer) parseAndCategorizeDDLs(ddls *SchemaExecutionResult, table
 		cleanedDDL := cleanSingleDDL(ddl)
 		if cleanedDDL == "" { continue }
 		upperCleanedDDL := strings.ToUpper(cleanedDDL)
+		// Perluas deteksi DROP untuk berbagai sintaks constraint
 		if strings.Contains(upperCleanedDDL, "DROP CONSTRAINT") ||
-			strings.Contains(upperCleanedDDL, "DROP FOREIGN KEY") ||
-			strings.Contains(upperCleanedDDL, "DROP CHECK") ||
-			strings.Contains(upperCleanedDDL, "DROP PRIMARY KEY") {
+			strings.Contains(upperCleanedDDL, "DROP FOREIGN KEY") || // MySQL specific
+			strings.Contains(upperCleanedDDL, "DROP CHECK") ||       // MySQL specific
+			strings.Contains(upperCleanedDDL, "DROP PRIMARY KEY") { // MySQL specific / general
 			parsed.DropConstraintDDLs = append(parsed.DropConstraintDDLs, cleanedDDL)
 		} else if strings.HasPrefix(upperCleanedDDL, "ALTER TABLE") && strings.Contains(upperCleanedDDL, "ADD CONSTRAINT") {
 			parsed.AddConstraintDDLs = append(parsed.AddConstraintDDLs, cleanedDDL)
-		} else if strings.HasPrefix(upperCleanedDDL, "ADD CONSTRAINT") {
+		} else if strings.HasPrefix(upperCleanedDDL, "ADD CONSTRAINT") { // Kasus tanpa ALTER TABLE prefix (kurang umum)
 			log.Debug("Found 'ADD CONSTRAINT' DDL without 'ALTER TABLE' prefix. Categorizing as ADD.", zap.String("ddl", cleanedDDL))
 			parsed.AddConstraintDDLs = append(parsed.AddConstraintDDLs, cleanedDDL)
 		} else {
@@ -119,6 +123,7 @@ func (s *SchemaSyncer) parseAndCategorizeDDLs(ddls *SchemaExecutionResult, table
 		}
 	}
 
+	// Urutkan DDLs untuk eksekusi yang lebih deterministik dan aman
 	parsed.AlterColumnDDLs = s.sortAlterColumns(parsed.AlterColumnDDLs)
 	parsed.DropIndexDDLs = s.sortDropIndexes(parsed.DropIndexDDLs)
 	parsed.AddIndexDDLs = s.sortAddIndexes(parsed.AddIndexDDLs)
@@ -146,7 +151,9 @@ func (s *SchemaSyncer) executeDDLPhase(tx *gorm.DB, phaseName string, ddlList []
 	var accumulatedErrors error
 
 	for _, ddl := range ddlList {
-		if ddl == "" { continue }
+		if ddl == "" { // Bisa terjadi jika hasil cleanSingleDDL adalah string kosong
+			continue
+		}
 
 		log.Debug("Executing DDL.", zap.String("phase_name", phaseName), zap.String("ddl", ddl))
 		if err := tx.Exec(ddl).Error; err != nil {
@@ -160,7 +167,7 @@ func (s *SchemaSyncer) executeDDLPhase(tx *gorm.DB, phaseName string, ddlList []
 					accumulatedErrors = multierr.Append(accumulatedErrors, currentErr)
 				} else {
 					execErrLog.Error("Failed to execute DDL, aborting phase and transaction.")
-					return currentErr
+					return currentErr // Kembalikan error pertama yang tidak bisa diabaikan
 				}
 			}
 		}
@@ -169,123 +176,149 @@ func (s *SchemaSyncer) executeDDLPhase(tx *gorm.DB, phaseName string, ddlList []
 		log.Warn("DDL phase completed with accumulated (ignorable or non-fatal) errors.",
 			zap.String("phase_name", phaseName),
 			zap.NamedError("accumulated_ddl_errors", accumulatedErrors))
+		// Jika continueOnError true, kita kembalikan accumulatedErrors.
+		// Jika false, seharusnya kita sudah return error pertama.
+		// Namun, untuk konsistensi, jika ada accumulatedErrors, kembalikan itu.
+		return accumulatedErrors
 	}
-	return accumulatedErrors
+	return nil // Tidak ada error fatal, atau semua error diabaikan/diakumulasi
 }
 
 func (s *SchemaSyncer) shouldIgnoreDDLError(err error, ddl string) bool {
-	if err == nil { return false }
-
-	errStrOriginal := err.Error()
-	errStrLower := strings.ToLower(errStrOriginal)
-	sqlStateOrCode := ""
-
-	reSQLStateOrCode := regexp.MustCompile(`\((?:sqlstate|error code|error)\s+([a-z0-9_]{2,})\)`)
-	matchesCode := reSQLStateOrCode.FindStringSubmatch(errStrLower)
-	if len(matchesCode) > 1 {
-		sqlStateOrCode = strings.ToUpper(matchesCode[1])
-	}
-
-	upperDDL := strings.ToUpper(ddl)
-	isAddForeignKey := strings.HasPrefix(upperDDL, "ALTER TABLE") &&
-		strings.Contains(upperDDL, "ADD CONSTRAINT") &&
-		strings.Contains(upperDDL, "FOREIGN KEY")
-
-	if s.dstDialect == "postgres" && sqlStateOrCode == "42P01" && isAddForeignKey {
-		s.logger.Debug("DDL error 42P01 (undefined_table) for ADD FOREIGN KEY will NOT be ignored to reveal dependency issues.",
-			zap.String("dialect", s.dstDialect), zap.String("sqlstate", sqlStateOrCode),
-			zap.String("ddl", ddl), zap.String("error_original", errStrOriginal))
+	if err == nil {
 		return false
 	}
 
-	ignorableSQLStates := map[string][]string{
-		"postgres": {"42P07", "42710", "42704", "42P01"},
-		"mysql":    {}, "sqlite": {},
+	errStrOriginal := err.Error()
+	errStrLower := strings.ToLower(errStrOriginal)
+	upperDDL := strings.ToUpper(ddl)
+
+	sqlState := ""
+	numericErrorCode := ""
+
+	reSQLState := regexp.MustCompile(`\(sqlstate\s+([a-z0-9]{5})\)`)
+	matchesSQLState := reSQLState.FindStringSubmatch(errStrLower)
+	if len(matchesSQLState) > 1 {
+		sqlState = strings.ToUpper(matchesSQLState[1])
 	}
 
-	if states, ok := ignorableSQLStates[s.dstDialect]; ok && sqlStateOrCode != "" {
-		if len(sqlStateOrCode) == 5 && regexp.MustCompile(`^[A-Z0-9]{5}$`).MatchString(sqlStateOrCode) {
-			for _, state := range states {
-				if sqlStateOrCode == state {
-					s.logger.Debug("DDL error matched ignorable SQLSTATE.", zap.String("dialect", s.dstDialect), zap.String("sqlstate", sqlStateOrCode), zap.String("error_original", errStrOriginal))
+	// Regex yang lebih baik untuk menangkap "Error NNNN" dari MySQL
+	reMySQLErrorCode := regexp.MustCompile(`error\s+(\d+)`)
+	matchesMySQLErrorCode := reMySQLErrorCode.FindStringSubmatch(errStrLower)
+	if len(matchesMySQLErrorCode) > 1 {
+		numericErrorCode = matchesMySQLErrorCode[1]
+	} else {
+		// Coba tangkap "Error Code: NNNN" (digunakan oleh beberapa driver/versi)
+		reMySQLErrorCodeInParen := regexp.MustCompile(`error\s+code:\s*(\d+)`)
+		matchesMySQLErrorCodeInParen := reMySQLErrorCodeInParen.FindStringSubmatch(errStrLower)
+		if len(matchesMySQLErrorCodeInParen) > 1 {
+			numericErrorCode = matchesMySQLErrorCodeInParen[1]
+		}
+	}
+
+
+	isDropTable := strings.HasPrefix(upperDDL, "DROP TABLE")
+	isDropIndex := strings.HasPrefix(upperDDL, "DROP INDEX")
+	isDropConstraint := strings.Contains(upperDDL, "DROP CONSTRAINT") ||
+		strings.Contains(upperDDL, "DROP FOREIGN KEY") ||
+		strings.Contains(upperDDL, "DROP CHECK") ||
+		strings.Contains(upperDDL, "DROP PRIMARY KEY")
+	isDropType := strings.HasPrefix(upperDDL, "DROP TYPE")
+	isDropSchema := strings.HasPrefix(upperDDL, "DROP SCHEMA")
+
+	isCreateTable := strings.HasPrefix(upperDDL, "CREATE TABLE")
+	isCreateIndex := strings.HasPrefix(upperDDL, "CREATE INDEX") || strings.HasPrefix(upperDDL, "CREATE UNIQUE INDEX")
+	isAddConstraint := strings.Contains(upperDDL, "ADD CONSTRAINT")
+	isAddColumn := strings.Contains(upperDDL, "ADD COLUMN")
+
+	currentDialectLog := s.logger.With(zap.String("dialect", s.dstDialect),
+		zap.String("sqlstate_extracted", sqlState),
+		zap.String("numeric_error_code_extracted", numericErrorCode),
+		zap.String("ddl_preview", ddl[:min(len(ddl), 70)]+"..."), // Menggunakan helper min
+		zap.String("error_original", errStrOriginal),
+	)
+
+	switch s.dstDialect {
+	case "postgres":
+		if (sqlState == "42P07" || sqlState == "42710") &&
+			(isCreateTable || isCreateIndex || isAddConstraint || strings.HasPrefix(upperDDL, "CREATE TYPE") || strings.HasPrefix(upperDDL, "CREATE SCHEMA")) {
+			currentDialectLog.Debug("Ignoring PostgreSQL duplicate object error (CREATE attempt).")
+			return true
+		}
+		if (sqlState == "42704" || sqlState == "42P01") &&
+			(isDropTable || isDropIndex || isDropConstraint || isDropType || isDropSchema) {
+			if sqlState == "42P01" && isAddConstraint && strings.Contains(upperDDL, "FOREIGN KEY") {
+				currentDialectLog.Debug("PostgreSQL error 42P01 (undefined_table) for ADD FOREIGN KEY will NOT be ignored.")
+				return false
+			}
+			currentDialectLog.Debug("Ignoring PostgreSQL object does not exist error (DROP attempt).")
+			return true
+		}
+
+	case "mysql":
+		if numericErrorCode == "1050" && isCreateTable { currentDialectLog.Debug("MySQL: Ignoring Error 1050 (Table already exists)."); return true }
+		if numericErrorCode == "1061" && isCreateIndex { currentDialectLog.Debug("MySQL: Ignoring Error 1061 (Duplicate key name for index)."); return true }
+		if numericErrorCode == "1060" && isAddColumn { currentDialectLog.Debug("MySQL: Ignoring Error 1060 (Duplicate column name)."); return true }
+		if numericErrorCode == "1826" && isAddConstraint && strings.Contains(upperDDL, "FOREIGN KEY") { currentDialectLog.Debug("MySQL: Ignoring Error 1826 (FK already exists)."); return true }
+		if numericErrorCode == "3822" && isAddConstraint && strings.Contains(upperDDL, "CHECK") { currentDialectLog.Debug("MySQL: Ignoring Error 3822 (Check constraint already exists)."); return true }
+
+		// Untuk UNIQUE/PK already exists, MySQL bisa menggunakan kode 1061 (jika didukung indeks) atau 1062 (jika data duplikat),
+		// atau pesan string umum. Error 1062 (Duplicate entry) TIDAK BOLEH diabaikan karena itu masalah data, bukan DDL.
+		// Kita akan fokus pada pesan string untuk constraint already exists jika kode tidak spesifik.
+		if (strings.Contains(errStrLower, "unique constraint") || strings.Contains(errStrLower, "primary key constraint")) &&
+		    strings.Contains(errStrLower, "already exists") && isAddConstraint {
+			currentDialectLog.Debug("MySQL: Ignoring 'constraint already exists' message for ADD CONSTRAINT.")
+			return true
+		}
+
+
+		if numericErrorCode == "1051" && isDropTable { currentDialectLog.Debug("MySQL: Ignoring Error 1051 (Unknown table) for DROP TABLE."); return true }
+		if numericErrorCode == "1091" && (isDropIndex || isDropConstraint) {
+			currentDialectLog.Debug("MySQL: Ignoring Error 1091 (Can't DROP; check that it exists) for DROP INDEX/CONSTRAINT.")
+			return true
+		}
+
+		// Fallback ke pola pesan jika kode numerik tidak cocok atau tidak ada
+		objectNamePattern := `(?:` + "`[^`]*`" + `|'[^']*'|[\w$.-]+)`
+		tableNamePattern  := `(?:` + "`[^`]*`" + `|'[^']*'|[\w$.]+)`
+		ignorableMySQLPatterns := []struct{Pattern string; ForCreate bool; ForDrop bool}{
+			// Create/Add
+			{Pattern: `duplicate key name\s+'?` + objectNamePattern + `'?`, ForCreate: true}, // Untuk indeks
+			{Pattern: `table\s+'?` + tableNamePattern + `'?\s+already exists`, ForCreate: true},
+			{Pattern: `duplicate column name\s+'?` + objectNamePattern + `'?`, ForCreate: true},
+			{Pattern: `(?:foreign key\s+)?constraint(?:\s+'?`+objectNamePattern+`'?)?\s+already exists`, ForCreate: true},
+			{Pattern: `check constraint\s+'?`+objectNamePattern+`'?\s+already exists`, ForCreate: true},
+			{Pattern: `index\s+'?`+objectNamePattern+`'?\s+already exists on table\s+'?` + tableNamePattern + `'?`, ForCreate: true},
+			// Drop
+			{Pattern: `unknown table\s+'?` + tableNamePattern + `'?`, ForDrop: true},
+			{Pattern: `can't drop (?:index|foreign key|constraint|check|primary key)?\s*'?"?` + objectNamePattern + `"?'.*check that it exists`, ForDrop: true}, // Lebih fleksibel dengan quote
+			{Pattern: `constraint\s+'?`+objectNamePattern+`'?\s+does not exist`, ForDrop: true},
+		}
+		for _, p := range ignorableMySQLPatterns {
+			if matched, _ := regexp.MatchString(`(?i)`+p.Pattern, errStrLower); matched {
+				if (p.ForCreate && (isCreateTable || isCreateIndex || isAddConstraint || isAddColumn)) ||
+				   (p.ForDrop && (isDropTable || isDropIndex || isDropConstraint)) {
+					currentDialectLog.Debug("MySQL error matched ignorable message pattern with DDL context.", zap.String("matched_pattern", p.Pattern))
 					return true
 				}
 			}
 		}
-	}
-
-	// Pola nama objek: diapit backtick, single quote, atau non-spasi/quote/semicolon/kurung/koma/titik/titikdua
-	// `[\w.-]+` menangkap nama tanpa quote yang terdiri dari karakter word, titik, atau hubung.
-	objectNameForMsgPattern := `(?:` + "`[^`]*`" + `|'[^']*'|[\w.-]+)`
-	tableNameForMsgPattern := `(?:` + objectNameForMsgPattern + `\.` + objectNameForMsgPattern + `|` + objectNameForMsgPattern + `)`
 
 
-	ignorableMessagePatterns := map[string][]string{
-		"mysql": {
-			`duplicate key name\s+` + objectNameForMsgPattern,
-			// Pola yang disempurnakan untuk Error 1091 (Can't DROP):
-			// `can't drop `: Literal
-			// `(?:(?:index|constraint)\s+)?`: "index " atau "constraint " opsional
-			// `objectNameForMsgPattern`: Nama objek
-			// `(?:\s+on\s+` + `tableNameForMsgPattern` + `)?`: Klausa "ON table" opsional (untuk DROP INDEX name ON table)
-			// `\s*(?:;|#\S+)?\s*`: Spasi, lalu titik koma opsional ATAU error code MySQL (misal #42S02) opsional, lalu spasi lagi
-			// `check that it exists`: Literal
-			`can't drop (?:(?:index|constraint)\s+)?` + objectNameForMsgPattern + `(?:\s+on\s+` + tableNameForMsgPattern + `)?\s*(?:;|#\S+)?\s*check that it exists`,
-			`check constraint\s+` + objectNameForMsgPattern + `\s+already exists`,
-			`(?:foreign key\s+)?constraint(?:\s+` + objectNameForMsgPattern + `)?\s+(?:for key\s+` + objectNameForMsgPattern + `\s*)?already exists`,
-			`constraint\s+` + objectNameForMsgPattern + `\s+does not exist`,
-			`table\s+` + tableNameForMsgPattern + `\s+already exists`,
-			`unknown table\s+` + tableNameForMsgPattern,
-			`duplicate column name\s+` + objectNameForMsgPattern,
-			`index\s+` + objectNameForMsgPattern + `\s+already exists on table\s+` + tableNameForMsgPattern,
-		},
-		"postgres": { // PG lebih konsisten dengan double quotes untuk nama objek dalam pesan error
-			`relation\s+"[^"]+"\s+already exists`,
-			`index\s+"[^"]+"\s+already exists`,
-			`constraint\s+"[^"]+"\s+(?:for|on) relation\s+"[^"]+"\s+already exists`,
-			`constraint\s+"[^"]+"\s+on table\s+"[^"]+"\s+does not exist`,
-			`index\s+"[^"]+"\s+does not exist`,
-			`type\s+"[^"]+"\s+already exists`,
-			`schema\s+"[^"]+"\s+already exists`,
-		},
-		"sqlite": {
-			`index\s+` + objectNameForMsgPattern + `\s+already exists`,
-			`table\s+` + objectNameForMsgPattern + `\s+already exists`,
-			`no such index:\s*` + objectNameForMsgPattern,
-			`no such table:\s*` + objectNameForMsgPattern,
-			`(?:unique\s+)?constraint\s+` + objectNameForMsgPattern + `\s+already exists`,
-			`constraint\s+` + objectNameForMsgPattern + `\s+failed`,
-			`column\s+` + objectNameForMsgPattern + `\s+already exists`,
-		},
-	}
-
-	// Penanganan khusus untuk "table ... does not exist" di PostgreSQL dan MySQL agar hanya ignore jika DDL adalah DROP
-	if (s.dstDialect == "postgres" && sqlStateOrCode == "42P01") ||
-		(s.dstDialect == "mysql" && (strings.Contains(errStrLower, "unknown table ") || sqlStateOrCode == "42S02" || sqlStateOrCode == "1051")) {
-		if strings.HasPrefix(upperDDL, "DROP TABLE") || strings.HasPrefix(upperDDL, "DROP TYPE") || strings.HasPrefix(upperDDL, "DROP SCHEMA") {
-			s.logger.Debug("DDL error (table/type/schema does not exist) for DROP statement matched. Ignoring.", zap.String("ddl", ddl), zap.String("error_original", errStrOriginal))
+	case "sqlite":
+		if (strings.Contains(errStrLower, "already exists") || strings.Contains(errStrLower, "duplicate column name")) &&
+			(isCreateTable || isCreateIndex || isAddConstraint || isAddColumn) {
+			currentDialectLog.Debug("SQLite: Ignoring 'already exists' or 'duplicate column' error for CREATE/ADD DDL.")
 			return true
 		}
-		s.logger.Debug("DDL error (table/type/schema does not exist) for non-DROP statement. Will rely on specific message patterns if any, otherwise NOT ignoring.", zap.String("ddl", ddl), zap.String("error_original", errStrOriginal))
-		// Jangan return false di sini, biarkan pola pesan lain mencoba jika ini bukan DROP
+		if strings.Contains(errStrLower, "no such table:") && isDropTable { currentDialectLog.Debug("SQLite: Ignoring 'no such table' for DROP TABLE."); return true }
+		if strings.Contains(errStrLower, "no such index:") && isDropIndex { currentDialectLog.Debug("SQLite: Ignoring 'no such index' for DROP INDEX."); return true }
+		// Hati-hati dengan "constraint ... failed", itu BUKAN "already exists" atau "does not exist"
 	}
 
-
-	if patterns, ok := ignorableMessagePatterns[s.dstDialect]; ok {
-		for _, pattern := range patterns {
-			fullPattern := `(?i)` + pattern // Case-insensitive match untuk keseluruhan pola
-			matched, _ := regexp.MatchString(fullPattern, errStrLower)
-			if matched {
-				s.logger.Debug("DDL error matched ignorable message pattern.", zap.String("dialect", s.dstDialect), zap.String("pattern_used", fullPattern), zap.String("error_original", errStrOriginal))
-				return true
-			}
-		}
-	}
-
-	s.logger.Debug("DDL error did not match any ignorable SQLSTATEs or message patterns and will NOT be ignored.", zap.String("dialect", s.dstDialect), zap.String("sqlstate_or_code_extracted", sqlStateOrCode), zap.String("error_original", errStrOriginal))
+	currentDialectLog.Debug("DDL error will NOT be ignored.")
 	return false
 }
-
 
 func (s *SchemaSyncer) splitPostgresFKsForDeferredExecution(allConstraints []string) (deferredFKs []string, nonDeferredFKs []string) {
 	for _, ddl := range allConstraints {
@@ -303,47 +336,83 @@ func (s *SchemaSyncer) splitPostgresFKsForDeferredExecution(allConstraints []str
 	return
 }
 
-func (s *SchemaSyncer) sortConstraintsForDrop(ddls []string) []string {
-	extractConstraintNameAndType := func(ddl string) (string, string) {
-		upperDDL := strings.ToUpper(ddl)
-		// Pola yang lebih baik untuk menangkap nama dan tipe constraint
-		re := regexp.MustCompile(`(?i)DROP (?:CONSTRAINT\s+(` + "`?" + `[^` + "`" + `\s;]+` + "`?" + `)|(FOREIGN KEY)\s+(` + "`?" + `[^` + "`" + `\s;]+` + "`?" + `)|(CHECK)\s+(` + "`?" + `[^` + "`" + `\s;]+` + "`?" + `)|(PRIMARY KEY))`)
-		matches := re.FindStringSubmatch(upperDDL)
+func extractConstraintNameAndTypeForDrop(ddl string, logger *zap.Logger) (string, string) {
+	upperDDL := strings.ToUpper(ddl)
+	var constraintName, constraintType string
 
-		if len(matches) > 0 {
-			if matches[6] != "" { // (PRIMARY KEY)
-				return "PRIMARY_KEY_IMPLICIT", "PRIMARY KEY"
-			} else if matches[2] != "" && matches[3] != "" { // (FOREIGN KEY) name
-				return strings.Trim(matches[3], "`'\""), "FOREIGN KEY"
-			} else if matches[4] != "" && matches[5] != "" { // (CHECK) name
-				return strings.Trim(matches[5], "`'\""), "CHECK"
-			} else if matches[1] != "" { // CONSTRAINT name
-				name := strings.Trim(matches[1], "`'\"")
-				// Tebak tipe dari nama jika ini adalah DROP CONSTRAINT <name>
-				if strings.HasPrefix(name, "FK_") || strings.Contains(name, "_FK_") || strings.HasSuffix(name, "_FK") || strings.HasPrefix(name, "fk_") { return name, "FOREIGN KEY" }
-				if strings.HasPrefix(name, "UQ_") || strings.Contains(name, "_UQ_") || strings.HasSuffix(name, "_UQ") || strings.HasPrefix(name, "uq_") { return name, "UNIQUE" }
-				if strings.HasPrefix(name, "PK_") || strings.Contains(name, "_PK_") || strings.HasSuffix(name, "_PK") || strings.HasPrefix(name, "pk_") { return name, "PRIMARY KEY" }
-				if strings.HasPrefix(name, "CHK_") || strings.Contains(name, "_CHK_") || strings.HasSuffix(name, "_CHK") || strings.HasPrefix(name, "chk_") { return name, "CHECK" }
-				return name, "UNKNOWN_FROM_NAME"
-			}
+	// Lebih baik deteksi tipe DDL dulu, baru nama.
+	if strings.Contains(upperDDL, "DROP PRIMARY KEY") {
+		constraintName = "PRIMARY_KEY_IMPLICIT_DROP_NAME"
+		constraintType = "PRIMARY KEY"
+	} else if strings.Contains(upperDDL, "DROP FOREIGN KEY") {
+		re := regexp.MustCompile(`(?i)DROP\s+FOREIGN\s+KEY\s+("?` + `[^"` + "`" + `\s;']+)`)
+		if matches := re.FindStringSubmatch(upperDDL); len(matches) > 1 {
+			constraintName = strings.Trim(matches[1], "\"`[]")
 		}
-		return "", "UNKNOWN_DDL_STRUCTURE"
+		constraintType = "FOREIGN KEY"
+	} else if strings.Contains(upperDDL, "DROP CHECK") {
+		re := regexp.MustCompile(`(?i)DROP\s+CHECK\s+("?` + `[^"` + "`" + `\s;']+)`)
+		if matches := re.FindStringSubmatch(upperDDL); len(matches) > 1 {
+			constraintName = strings.Trim(matches[1], "\"`[]")
+		}
+		constraintType = "CHECK"
+	} else if strings.Contains(upperDDL, "DROP CONSTRAINT") {
+		re := regexp.MustCompile(`(?i)DROP\s+CONSTRAINT\s+("?` + `[^"` + "`" + `\s;']+)`)
+		if matches := re.FindStringSubmatch(upperDDL); len(matches) > 1 {
+			constraintName = strings.Trim(matches[1], "\"`[]")
+		}
+		// Coba tebak tipe dari nama untuk DROP CONSTRAINT (jika nama ada)
+		if constraintName != "" {
+			lowerName := strings.ToLower(constraintName)
+			if strings.HasPrefix(lowerName, "fk_") || strings.Contains(lowerName, "_fk_") { constraintType = "FOREIGN KEY"
+			} else if strings.HasPrefix(lowerName, "uq_") || strings.Contains(lowerName, "_uq_") { constraintType = "UNIQUE"
+			} else if strings.HasPrefix(lowerName, "pk_") || strings.Contains(lowerName, "_pk_") { constraintType = "PRIMARY KEY"
+			} else if strings.HasPrefix(lowerName, "chk_") || strings.Contains(lowerName, "_chk_") { constraintType = "CHECK"
+			} else { constraintType = "UNKNOWN_FROM_NAME" }
+		} else {
+			constraintType = "UNKNOWN_DROP_CONSTRAINT_NO_NAME"
+		}
+	} else if strings.Contains(upperDDL, "DROP INDEX") {
+		re := regexp.MustCompile(`(?i)DROP\s+INDEX\s+("?` + `[^"` + "`" + `\s;']+)`)
+		if matches := re.FindStringSubmatch(upperDDL); len(matches) > 1 {
+			constraintName = strings.Trim(matches[1], "\"`[]")
+		}
+		constraintType = "INDEX"
+	} else {
+		logger.Warn("Could not parse DDL for DROP operation to determine constraint/index type.", zap.String("ddl_for_sort", ddl))
+		return ddl, "UNKNOWN_DDL_STRUCTURE"
 	}
 
+	// Jika nama tidak berhasil diekstrak tapi tipe diketahui (misal DROP PRIMARY KEY tanpa nama)
+	if constraintName == "" && constraintType != "UNKNOWN_DDL_STRUCTURE" && constraintType != "" {
+	    // Untuk PRIMARY_KEY_IMPLICIT_DROP_NAME sudah ditangani.
+	    // Untuk tipe lain, jika nama tidak ada, gunakan placeholder.
+	    if constraintType != "PRIMARY KEY" { // PK sudah punya nama placeholder
+	        constraintName = fmt.Sprintf("%s_IMPLICIT_DROP_NAME", strings.ReplaceAll(strings.ToLower(constraintType), " ", "_"))
+	    }
+	} else if constraintName == "" { // Jika nama masih kosong dan tipe juga tidak diketahui
+	    constraintName = ddl // Fallback: gunakan DDL sebagai nama
+	}
+
+	return constraintName, constraintType
+}
+
+
+func (s *SchemaSyncer) sortConstraintsForDrop(ddls []string) []string {
 	priority := func(ddl string) int {
-		_, consType := extractConstraintNameAndType(ddl)
+		_, consType := extractConstraintNameAndTypeForDrop(ddl, s.logger)
 		switch consType {
 		case "FOREIGN KEY": return 1
 		case "UNIQUE": return 2
 		case "CHECK": return 3
 		case "PRIMARY KEY": return 4
-		case "UNKNOWN_FROM_NAME": return 5
-		default:
-			s.logger.Debug("DROP CONSTRAINT DDL with unrecognized structure for priority sorting.", zap.String("ddl", ddl))
-			return 6
+		case "INDEX": return 5
+		case "UNKNOWN_FROM_NAME": return 6
+		case "UNKNOWN_DROP_CONSTRAINT_NO_NAME": return 6 // Sama dengan UNKNOWN_FROM_NAME
+		default: // UNKNOWN_DDL_STRUCTURE
+			return 7
 		}
 	}
-
 	sorted := make([]string, len(ddls))
 	copy(sorted, ddls)
 	sort.SliceStable(sorted, func(i, j int) bool {
@@ -378,7 +447,7 @@ func (s *SchemaSyncer) sortAlterColumns(ddls []string) []string {
 	priority := func(ddl string) int {
 		upperDDL := strings.ToUpper(ddl)
 		if strings.Contains(upperDDL, "DROP COLUMN") { return 1 }
-		if strings.Contains(upperDDL, "MODIFY COLUMN") || strings.Contains(upperDDL, "ALTER COLUMN") { return 2 }
+		if strings.Contains(upperDDL, "MODIFY COLUMN") || (strings.Contains(upperDDL, "ALTER COLUMN") && !strings.Contains(upperDDL, "ADD COLUMN") && !strings.Contains(upperDDL, "DROP COLUMN")) { return 2 }
 		if strings.Contains(upperDDL, "ADD COLUMN") { return 3 }
 		if !strings.EqualFold(upperDDL, "UNKNOWN DDL STATEMENT") { // Hanya log jika bukan kasus uji spesifik
 			s.logger.Debug("ALTER DDL with unknown priority category during sorting.", zap.String("ddl", ddl))
@@ -398,13 +467,19 @@ func (s *SchemaSyncer) sortAlterColumns(ddls []string) []string {
 func (s *SchemaSyncer) sortDropIndexes(ddls []string) []string {
 	sorted := make([]string, len(ddls))
 	copy(sorted, ddls)
-	sort.Strings(sorted)
+	sort.Strings(sorted) // Indeks biasanya bisa di-drop dalam urutan apa pun
 	return sorted
 }
 
 func (s *SchemaSyncer) sortAddIndexes(ddls []string) []string {
 	sorted := make([]string, len(ddls))
 	copy(sorted, ddls)
-	sort.Strings(sorted)
+	sort.Strings(sorted) // Indeks biasanya bisa di-add dalam urutan apa pun relatif satu sama lain
 	return sorted
+}
+
+// Helper min untuk logging
+func min(a, b int) int {
+	if a < b { return a }
+	return b
 }

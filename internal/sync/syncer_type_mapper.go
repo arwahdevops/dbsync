@@ -11,18 +11,102 @@ import (
 	"github.com/arwahdevops/dbsync/internal/config" // Diperlukan untuk config.GetTypeMappingForDialects
 )
 
+// --- Fungsi yang dipindahkan dari compare_utils.go ---
+
+// normalizeTypeName menormalisasi nama tipe data untuk perbandingan.
+// Menghapus ukuran generik, spasi berlebih, dan modifier umum.
+func normalizeTypeName(typeName string) string {
+	name := strings.ToLower(strings.TrimSpace(typeName))
+
+	// Hapus modifier umum MySQL terlebih dahulu
+	name = strings.ReplaceAll(name, " unsigned", "")
+	name = strings.ReplaceAll(name, " zerofill", "")
+	name = strings.TrimSpace(name) // Penting setelah replace
+
+	// Sekarang hapus ukuran/modifier generik dalam tanda kurung, misal (11) atau (255) atau (10,2)
+	name = regexp.MustCompile(`\s*\([^)]*\)\s*$`).ReplaceAllString(name, "")
+	name = regexp.MustCompile(`\s*\([^)]*\)$`).ReplaceAllString(name, "")
+	name = strings.TrimSpace(name)
+
+	// Alias umum
+	aliases := map[string]string{
+		"character varying":         "varchar",
+		"double precision":          "double",
+		"boolean":                   "bool",
+		"timestamp with time zone":    "timestamptz",
+		"timestamp without time zone": "timestamp",
+		"time with time zone":         "timetz",
+		"time without time zone":      "time",
+		"integer":                   "int",
+		"int4":                      "int",
+		"int8":                      "bigint",
+		"serial4":                   "serial",
+		"serial8":                   "bigserial",
+	}
+	if mapped, ok := aliases[name]; ok {
+		name = mapped
+	}
+	return strings.TrimSpace(name)
+}
+
+// isStringType memeriksa apakah tipe adalah tipe string (setelah normalisasi nama tipe).
+func isStringType(normTypeName string) bool {
+	return strings.Contains(normTypeName, "char") ||
+		strings.Contains(normTypeName, "text") ||
+		strings.Contains(normTypeName, "clob") ||
+		normTypeName == "enum" ||
+		normTypeName == "set" ||
+		normTypeName == "uuid" ||
+		normTypeName == "json" ||
+		normTypeName == "xml"
+}
+
+// isBinaryType memeriksa apakah tipe adalah tipe biner (setelah normalisasi nama tipe).
+func isBinaryType(normTypeName string) bool {
+	return strings.Contains(normTypeName, "binary") ||
+		strings.Contains(normTypeName, "blob") ||
+		normTypeName == "bytea"
+}
+
+// isNumericType memeriksa apakah tipe adalah tipe numerik (integer atau desimal/float).
+func isNumericType(normTypeName string) bool {
+	return isIntegerType(normTypeName) ||
+		strings.Contains(normTypeName, "decimal") ||
+		strings.Contains(normTypeName, "numeric") ||
+		strings.Contains(normTypeName, "float") ||
+		strings.Contains(normTypeName, "double") ||
+		strings.Contains(normTypeName, "real") ||
+		strings.Contains(normTypeName, "money")
+}
+
+// isIntegerType memeriksa apakah tipe adalah tipe integer (termasuk serial).
+func isIntegerType(normTypeName string) bool {
+	return strings.Contains(normTypeName, "int") ||
+		strings.Contains(normTypeName, "serial")
+}
+
+// isPrecisionRelevant memeriksa apakah presisi relevan untuk tipe ini.
+func isPrecisionRelevant(normTypeName string) bool {
+	return strings.Contains(normTypeName, "decimal") ||
+		strings.Contains(normTypeName, "numeric") ||
+		strings.Contains(normTypeName, "time") ||
+		(strings.Contains(normTypeName, "datetime") && strings.Contains(normTypeName, "offset"))
+}
+
+// isScaleRelevant memeriksa apakah skala relevan untuk tipe ini.
+func isScaleRelevant(normTypeName string) bool {
+	return strings.Contains(normTypeName, "decimal") ||
+		strings.Contains(normTypeName, "numeric")
+}
+
+// --- Fungsi asli dari syncer_type_mapper.go ---
+
 // populateMappedTypesForSourceColumns mengisi field MappedType untuk kolom sumber.
 func (s *SchemaSyncer) populateMappedTypesForSourceColumns(columns []ColumnInfo, tableName string) error {
 	log := s.logger.With(zap.String("table", tableName), zap.String("phase", "populate-source-mapped-types"))
 	for i := range columns {
-		// Untuk kolom yang di-generate, MappedType biasanya sama dengan Type aslinya,
-		// karena kita tidak melakukan pemetaan tipe untuknya, hanya mengambil tipe dasarnya
-		// saat perbandingan. DDL akan menggunakan tipe asli sumber.
 		if columns[i].IsGenerated {
-			// Ekstrak tipe dasar dari definisi generated untuk digunakan sebagai MappedType sementara,
-			// ini membantu dalam logika perbandingan jika tujuan juga generated.
-			// Namun, untuk DDL CREATE/ADD, kita akan menggunakan `columns[i].Type` asli.
-			baseSrcTypeForGenerated := extractBaseTypeFromGenerated(columns[i].Type, log)
+			baseSrcTypeForGenerated := extractBaseTypeFromGenerated(columns[i].Type, log) // extractBaseTypeFromGenerated dari compare_columns.go
 			columns[i].MappedType = baseSrcTypeForGenerated
 			log.Debug("Using extracted base type as MappedType for generated source column, for comparison purposes.",
 				zap.String("column", columns[i].Name),
@@ -30,7 +114,6 @@ func (s *SchemaSyncer) populateMappedTypesForSourceColumns(columns []ColumnInfo,
 				zap.String("mapped_type_for_comp", columns[i].MappedType))
 			continue
 		}
-		// Untuk kolom non-generated, lakukan pemetaan tipe penuh.
 		mapped, mapErr := s.mapDataType(columns[i].Type)
 		if mapErr != nil {
 			log.Error("Fatal type mapping error for source column",
@@ -43,14 +126,12 @@ func (s *SchemaSyncer) populateMappedTypesForSourceColumns(columns []ColumnInfo,
 	return nil
 }
 
-// populateMappedTypesForDestinationColumns mengisi MappedType untuk kolom tujuan (biasanya sama dengan Type-nya).
-// Ini digunakan untuk konsistensi dalam logika perbandingan.
+// populateMappedTypesForDestinationColumns mengisi MappedType untuk kolom tujuan.
 func (s *SchemaSyncer) populateMappedTypesForDestinationColumns(columns []ColumnInfo) {
 	for i := range columns {
-		if columns[i].MappedType == "" { // Hanya jika belum diisi
+		if columns[i].MappedType == "" {
 			if columns[i].IsGenerated {
-				// Sama seperti source, gunakan tipe dasar yang diekstrak untuk perbandingan.
-				columns[i].MappedType = extractBaseTypeFromGenerated(columns[i].Type, s.logger)
+				columns[i].MappedType = extractBaseTypeFromGenerated(columns[i].Type, s.logger) // extractBaseTypeFromGenerated dari compare_columns.go
 			} else {
 				columns[i].MappedType = columns[i].Type
 			}
@@ -65,7 +146,7 @@ func (s *SchemaSyncer) mapDataType(srcType string) (string, error) {
 		zap.String("action", "mapDataType"))
 
 	fullSrcTypeLower := strings.ToLower(strings.TrimSpace(srcType))
-	normalizedSrcTypeKey := normalizeTypeName(fullSrcTypeLower) // normalizeTypeName dari compare_utils.go
+	normalizedSrcTypeKey := normalizeTypeName(fullSrcTypeLower) // Fungsi yang baru dipindahkan
 
 	typeMappingConfigEntry := config.GetTypeMappingForDialects(s.srcDialect, s.dstDialect)
 
@@ -101,8 +182,6 @@ func (s *SchemaSyncer) mapDataType(srcType string) (string, error) {
 	if s.srcDialect == s.dstDialect {
 		log.Info("Source and destination dialects are the same, using source type directly (with modifiers).",
 			zap.String("source_type", srcType))
-		// Kita tetap panggil applyTypeModifiers untuk memastikan format modifier konsisten,
-		// meskipun base type tidak berubah.
 		return s.applyTypeModifiers(srcType, srcType), nil
 	}
 
@@ -130,10 +209,8 @@ func (s *SchemaSyncer) applyTypeModifiers(srcTypeRaw, mappedBaseType string) str
 		modifierContent = strings.TrimSpace(matches[1])
 	}
 
-	// Hapus modifier yang mungkin sudah ada di mappedBaseType (misal, dari "VARCHAR(255)" di typemap.json)
-	// agar kita bisa menerapkan modifier dari srcTypeRaw.
 	baseTypeWithoutExistingModifiers := strings.Split(mappedBaseType, "(")[0]
-	normBaseType := normalizeTypeName(baseTypeWithoutExistingModifiers) // normalizeTypeName dari compare_utils.go
+	normBaseType := normalizeTypeName(baseTypeWithoutExistingModifiers) // Fungsi yang baru dipindahkan
 
 	if modifierContent == "" {
 		log.Debug("No modifier found in source type. Returning mapped base type as is.", zap.String("final_type", baseTypeWithoutExistingModifiers))
@@ -141,29 +218,26 @@ func (s *SchemaSyncer) applyTypeModifiers(srcTypeRaw, mappedBaseType string) str
 	}
 
 	canHaveModifier := false
-	finalModifier := modifierContent // Default ke modifier sumber
+	finalModifier := modifierContent
 
 	switch {
-	// isStringType, isBinaryType, dll. dari compare_utils.go
-	case isStringType(normBaseType):
-		// Kecualikan tipe teks besar yang tidak mengambil panjang (atau panjangnya implisit maks)
+	case isStringType(normBaseType): // Fungsi yang baru dipindahkan
 		if !isLargeTextOrBlob(normBaseType) && // isLargeTextOrBlob dari compare_columns.go
 			normBaseType != "uuid" && normBaseType != "json" && normBaseType != "xml" &&
-			normBaseType != "enum" && normBaseType != "set" { // enum/set ditangani khusus
+			normBaseType != "enum" && normBaseType != "set" {
 			canHaveModifier = true
 		}
-	case isBinaryType(normBaseType):
-		if !isLargeTextOrBlob(normBaseType) && normBaseType != "bytea" {
+	case isBinaryType(normBaseType): // Fungsi yang baru dipindahkan
+		if !isLargeTextOrBlob(normBaseType) && normBaseType != "bytea" { // isLargeTextOrBlob dari compare_columns.go
 			canHaveModifier = true
 		}
-	case isScaleRelevant(normBaseType): // decimal, numeric
+	case isScaleRelevant(normBaseType): // Fungsi yang baru dipindahkan (decimal, numeric)
 		canHaveModifier = true
-	case isPrecisionRelevant(normBaseType) && (strings.Contains(normBaseType, "time") || strings.Contains(normBaseType, "timestamp")):
-		// Untuk tipe waktu, modifier biasanya hanya presisi tunggal (bukan P,S)
+	case isPrecisionRelevant(normBaseType) && (strings.Contains(normBaseType, "time") || strings.Contains(normBaseType, "timestamp")): // Fungsi yang baru dipindahkan
 		parts := strings.Split(modifierContent, ",")
 		if len(parts) == 1 {
 			if _, err := strconv.Atoi(strings.TrimSpace(parts[0])); err == nil {
-				finalModifier = strings.TrimSpace(parts[0]) // Ambil hanya presisi
+				finalModifier = strings.TrimSpace(parts[0])
 				canHaveModifier = true
 			}
 		}

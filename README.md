@@ -1,4 +1,5 @@
 ---
+
 # DBSync 🔄
 
 [![Go Version](https://img.shields.io/badge/Go-1.20%2B-blue.svg)](https://golang.org/)
@@ -15,7 +16,7 @@ A robust command-line utility for synchronizing schema and data between relation
 - [Configuration](#-configuration)
   - [Basic Configuration](#basic-configuration)
   - [Optional: Secret Management (Vault)](#optional-secret-management-vault)
-  - [Optional: Custom Type Mapping](#optional-custom-type-mapping)
+  - [Internal Type Mapping](#internal-type-mapping)
   - [Key Environment Variables](#key-environment-variables)
   - [Command-Line Overrides](#command-line-overrides)
 - [Usage](#-usage)
@@ -60,14 +61,24 @@ Handles table structure synchronization with configurable strategies:
 - Processes tables concurrently using a configurable worker pool.
 - Option (experimental) to disable foreign key constraints (`DISABLE_FK_DURING_SYNC`) during data load for potential speed improvements (risk of invalid data if source is inconsistent).
 
-### Custom Type Mapping
-- Allows defining custom data type mappings between source and target dialects via a JSON configuration file (`TYPE_MAPPING_FILE_PATH`).
-- **Mapping Process:**
+### Internal Type Mapping
+`dbsync` utilizes an internal, hardcoded system for mapping data types between source and target dialects. This system is defined within the application's Go code, primarily in `internal/config/default_typemaps.go`.
+
+-   **Mapping Process:**
     1.  The source data type is normalized (e.g., `varchar(255)` -> `varchar`, `int(11) unsigned` -> `int`).
-    2.  **`special_mappings`:** The JSON file can contain regex patterns (`source_type_pattern`) matched against the *full* original source type name (lowercase, e.g., `tinyint(1)`). If a pattern matches, the specified `target_type` is used. These take priority.
-    3.  **`mappings`:** If no special pattern matches, the normalized source type key (from step 1) is looked up in the `mappings` map. If found, the corresponding `target_type` is used.
-    4.  **Internal/Fallback:** If no match is found in the JSON configuration, or if the file isn't provided, dbsync might have internal fallbacks or use the source type directly if source and target dialects are the same. If no mapping is found, a generic fallback type (e.g., `TEXT`) is used.
-    5.  **Modifiers:** After the base target type is determined (from step 2, 3, or 4), `dbsync` attempts to apply modifiers (length, precision, scale) from the original source type to the target base type, if relevant for that target data type.
+    2.  **Internal `special_mappings`:** The internal configuration contains regex patterns (`source_type_pattern`) matched against the *full* original source type name (lowercase, e.g., `tinyint(1)`). If a pattern matches, the specified `target_type` and associated `ModifierHandlingStrategy` and `PostgresUsingExpr` (if any) are used. These take priority.
+    3.  **Internal `mappings`:** If no special pattern matches, the normalized source type key (from step 1) is looked up in the internal `mappings` map for the current source-target dialect pair. If found, the corresponding `target_type`, `ModifierHandlingStrategy`, and `PostgresUsingExpr` are used.
+    4.  **Internal/Fallback:** If no match is found in the internal configuration, `dbsync` might use the source type directly if source and target dialects are the same. If no mapping is found, a generic fallback type (e.g., `TEXT` for PostgreSQL/SQLite, `LONGTEXT` for MySQL) is used.
+    5.  **Modifier Handling:** After the base target type is determined (from step 2, 3, or 4), `dbsync` applies modifiers (length, precision, scale) based on the `ModifierHandlingStrategy` associated with the chosen mapping:
+        *   `apply_source` (Default): Attempts to apply modifiers (length, precision, scale) from the original source type to the target base type, if relevant for that target data type and the source modifier is considered generally transferable.
+        *   `use_target_defined`: Uses the target type string (including any modifiers) *exactly* as defined in the mapping configuration, ignoring source modifiers.
+        *   `ignore_source`: Uses the target base type from the mapping and does *not* attempt to apply any modifiers from the source type. The target type will be used without explicit length/precision unless those are part of the base target type string in the mapping (e.g., `VARCHAR(255)`).
+    6.  **PostgreSQL `USING` Clause:** For `ALTER COLUMN TYPE` DDLs in PostgreSQL, if a `PostgresUsingExpr` is defined in the mapping (e.g., `CAST(REPLACE(CAST({{column_name}} AS TEXT), ' ', 'T') AS TIMESTAMP WITHOUT TIME ZONE)`), it will be used to facilitate the type conversion. Otherwise, a default `USING {{column_name}}::target_type` clause is generated.
+
+-   **Customization:** To customize or extend type mappings, developers need to:
+    1.  Modify the `defaultTypeMappingsProvider()` function in `internal/config/default_typemaps.go`.
+    2.  Recompile the `dbsync` application.
+    Contributions to improve or expand the internal default mappings are welcome via Pull Requests.
 
 ### Robustness & Observability
 | Feature              | Description                                                                  |
@@ -150,7 +161,6 @@ DST_SSLMODE=disable           # disable, require, verify-ca, verify-full (adjust
 # ENABLE_JSON_LOGGING=false
 # ENABLE_PPROF=false
 # METRICS_PORT=9091
-# TYPE_MAPPING_FILE_PATH=./typemap.json
 # ... etc ...
 ```
 
@@ -202,46 +212,16 @@ DST_SECRET_PATH=secret/data/dbsync/dest_db   # Path to destination secret (KV v2
 
 **Priority:** If `SRC_PASSWORD`/`DST_PASSWORD` environment variables are set, they will be used **instead** of fetching from Vault, even if `VAULT_ENABLED=true`.
 
-### Optional: Custom Type Mapping
+### Internal Type Mapping
 
-You can provide a JSON file to define custom data type mappings between source and target dialects. This is useful for handling specific data types or for overriding default mapping behavior.
+Data type mappings between source and target dialects are managed internally within `dbsync`. The default mappings are defined in `internal/config/default_typemaps.go`.
 
-**Example `typemap.json`:**
-```json
-{
-  "type_mappings": [
-    {
-      "source_dialect": "mysql",
-      "target_dialect": "postgres",
-      "mappings": {
-        "int": "INTEGER",         // Mapping from normalized source type
-        "varchar": "VARCHAR",
-        "text": "TEXT"
-        // ... other standard mappings ...
-      },
-      "special_mappings": [
-        {
-          // Match original source type (lowercase) with regex
-          "source_type_pattern": "^tinyint\\(1\\)$",
-          "target_type": "BOOLEAN" // Target type if match
-        },
-        {
-          "source_type_pattern": "^enum\\((.*)\\)$", // Capture enum values (currently unused)
-          "target_type": "VARCHAR(255)" // Map all enums to VARCHAR
-        }
-      ]
-    }
-    // ... other mapping configurations between dialects ...
-  ]
-}
-```
-*   `mappings`: Direct mapping from the (basic normalized) source type name (e.g., "int" not "int(11)") to the target base type name.
-*   `special_mappings`:
-    *   `source_type_pattern`: A regex pattern matched against the full lowercase source type name (e.g., "tinyint(1)", "varchar(255)").
-    *   `target_type`: The target base type to use if the pattern matches.
-*   **Modifiers (Length/Precision/Scale):** After the target base type is determined from `mappings` or `special_mappings`, `dbsync` attempts to apply modifiers from the original source type to the target type if relevant.
-
-Set the `TYPE_MAPPING_FILE_PATH` environment variable to point to this file (e.g., `TYPE_MAPPING_FILE_PATH=./typemap.json`). If not configured or the file is not found, `dbsync` will use internal fallbacks or use types directly if dialects are the same or no mapping is found.
+-   **How it Works:** `dbsync` uses a sophisticated internal process to determine the target data type, considering base type normalization, special regex-based rules, standard mappings, and modifier handling strategies (see [Features > Internal Type Mapping](#internal-type-mapping) for details).
+-   **Customization:** If you need to adjust or add type mappings:
+    1.  You must modify the Go code in `internal/config/default_typemaps.go`.
+    2.  This involves updating the `TypeMappingConfigEntry` structures, potentially adding new `SpecialMapping` rules or `StandardTypeMapping` entries.
+    3.  After modifying the code, you need to recompile the `dbsync` executable (`go build -o dbsync .`).
+-   **Contributions:** Pull requests to enhance the default internal type mappings are welcome.
 
 ### Key Environment Variables
 
@@ -276,7 +256,6 @@ Set the `TYPE_MAPPING_FILE_PATH` environment variable to point to this file (e.g
 | `ENABLE_JSON_LOGGING`  | false         | Output logs in JSON format                                                         | No       |
 | `ENABLE_PPROF`         | false         | Enable pprof HTTP endpoints for profiling                                         | No       |
 | `METRICS_PORT`         | 9091          | Port for `/metrics`, `/healthz`, `/readyz`, `/debug/pprof/` endpoints           | No       |
-| `TYPE_MAPPING_FILE_PATH`| *(empty)*     | Path to custom type mapping JSON file (optional, default `./typemap.json`)         | No       |
 | **Vault Specific**     |               |                                                                                    |          |
 | `VAULT_ENABLED`        | `false`       | Set `true` to enable Vault integration                                             | No       |
 | `VAULT_ADDR`           | `https://...` | Vault server address                                                               | If Enabled |
@@ -300,11 +279,10 @@ Some configuration settings from environment variables can be overridden using c
 *   `-batch-size`: Overrides `BATCH_SIZE` (must be > 0).
 *   `-workers`: Overrides `WORKERS` (must be > 0).
 *   `-schema-strategy`: Overrides `SCHEMA_SYNC_STRATEGY` (`drop_create`, `alter`, `none`).
-*   `-type-map-file`: Overrides `TYPE_MAPPING_FILE_PATH`.
 
 **Example:**
 ```bash
-./dbsync -sync-direction sqlite-to-mysql -batch-size 500 -type-map-file /etc/dbsync/my_typemap.json
+./dbsync -sync-direction sqlite-to-mysql -batch-size 500
 ```
 CLI flags will take precedence over their corresponding environment variables.
 
@@ -369,7 +347,7 @@ curl http://localhost:9091/readyz
     *   The `drop_create` strategy is more reliable for significant schema changes.
 *   **SQLite `ALTER TABLE` Limitations:** SQLite has very limited `ALTER TABLE` support. The `alter` strategy **will not** attempt to change the type, nullability, default value, or collation of existing columns in SQLite. For such changes, you must recreate the table manually or use the `drop_create` strategy.
 *   **Constraint/Index Sync:** While the tool attempts to sync indexes and constraints, detection and DDL generation might be incomplete for all types (especially `CHECK` constraints) or database versions. Foreign Keys are typically applied *after* data sync, which could fail if data violates the constraint. `DISABLE_FK_DURING_SYNC` can help initial load but doesn't fix underlying data issues.
-*   **Complex Data Types:** Mapping for custom types, complex arrays, spatial data, etc., might be limited or require explicit definitions in `typemap.json`. Unknown types often fallback to generic text types.
+*   **Complex Data Types:** Mapping for custom types, complex arrays, spatial data, etc., might be limited or require additions/modifications to the internal `default_typemaps.go` file and a recompile of `dbsync`. Unknown types often fallback to generic text types.
 *   **Generated/Computed Columns:** Data in generated/computed columns is not directly synced; the destination DB is expected to compute them based on its definition. Type mapping is skipped for such columns.
 *   **Performance:** Sync speed depends heavily on network latency/bandwidth, disk I/O, database tuning, data volume, chosen `WORKERS`/`BATCH_SIZE`, complexity of transformations, etc.
 
@@ -387,8 +365,7 @@ curl http://localhost:9091/readyz
 | Permission Denied              | Check source/target DB user privileges match requirements (SELECT on source; SELECT, INSERT, UPDATE, DELETE, CREATE/ALTER/DROP on target depending on strategy). |
 | Schema DDL Errors (ALTER/CREATE)| Check logs for the specific failed DDL statement. Investigate incompatibility or syntax errors. Consider `SCHEMA_SYNC_STRATEGY=none` or `drop_create`. Note limitations of `alter` strategy, especially for type changes and SQLite. |
 | Data Sync Errors (Constraint)  | Data violates `UNIQUE`/`FK`/`CHECK` constraint on destination. Ensure target schema matches *or* clean source data. `DISABLE_FK_DURING_SYNC=true` might allow loading but doesn't fix the data. |
-| Data Sync Errors (Type)        | Data type mismatch between source/target not handled correctly by mapping (e.g., string too long for target `VARCHAR`, non-numeric in numeric column). Investigate source data or adjust `typemap.json`. |
-| Invalid Type Mapping File Error| Ensure `TYPE_MAPPING_FILE_PATH` points to a valid JSON file. Check JSON syntax & regex patterns. |
+| Data Sync Errors (Type)        | Data type mismatch between source/target not handled correctly by internal mapping (e.g., string too long for target `VARCHAR`, non-numeric in numeric column). Investigate source data or consider modifying `internal/config/default_typemaps.go` and recompiling. |
 | Slow Performance               | Tune `WORKERS`, `BATCH_SIZE`, `CONN_POOL_SIZE`. Monitor DB/network performance. Analyze query plans on source/destination. |
 | Pagination Issues (No PK / Rare)| Ensure PKs exist for large tables if using `alter` or `drop_create`. Check if PK values are stable and sortable correctly by the source DB. |
 
@@ -399,7 +376,7 @@ Set `DEBUG_MODE=true` in your `.env` file for more verbose logging, including SQ
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please feel free to submit issues or pull requests.
+Contributions are welcome! Please feel free to submit issues or pull requests. This includes enhancements to the internal default type mappings in `internal/config/default_typemaps.go`.
 
 1.  Fork the repository (`https://github.com/arwahdevops/dbsync/fork`)
 2.  Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
@@ -412,6 +389,5 @@ Contributions are welcome! Please feel free to submit issues or pull requests.
 ## 📄 License
 
 Distributed under the MIT License. See [LICENSE](LICENSE) file for more information.
-
 
 ---

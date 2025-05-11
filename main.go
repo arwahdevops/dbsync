@@ -76,8 +76,7 @@ func main() {
 	applyCliOverrides(cfg, appLogger)
 
 	// Muat pemetaan tipe data internal
-	// Parameter string kosong karena path file tidak lagi digunakan.
-	if err := config.LoadTypeMappings("", appLogger); err != nil {
+	if err := config.LoadTypeMappings(appLogger); err != nil { // Path file tidak lagi digunakan
 		appLogger.Fatal("Failed to initialize internal type mappings.", zap.Error(err))
 	}
 
@@ -182,16 +181,16 @@ func main() {
 
 	if ctx.Err() == nil {
 		appLogger.Info("Synchronization logic completed. Waiting for shutdown signal (Ctrl+C or SIGTERM) to stop HTTP server...")
-		<-ctx.Done()
+		<-ctx.Done() // Tunggu sinyal bahkan jika sinkronisasi selesai
 		appLogger.Info("Shutdown signal received after sync completion.")
 	} else {
-		appLogger.Info("Shutdown signal received during or after synchronization process. Proceeding with cleanup.", zap.Error(ctx.Err()))
+		appLogger.Warn("Shutdown signal received during or after synchronization process. Proceeding with cleanup.", zap.Error(ctx.Err()))
 	}
 
-	stop()
+	stop() // Beritahu goroutine lain untuk berhenti jika belum, misal server HTTP
 
 	appLogger.Info("Waiting for HTTP server to complete shutdown...")
-	httpServerWg.Wait()
+	httpServerWg.Wait() // Tunggu server HTTP selesai shutdown dengan bersih
 
 	appLogger.Info("Application shutdown complete.", zap.Int("exit_code", exitCode))
 	os.Exit(exitCode)
@@ -460,10 +459,10 @@ func buildDSN(cfg config.DatabaseConfig, username, password string, logger *zap.
 				}
 			case "allow", "prefer":
 				sslParam = "tls=preferred"
-			case "skip-verify":
+			case "skip-verify": // Sering digunakan untuk Testcontainers tanpa setup CA
 				sslParam = "tls=skip-verify"
 			default:
-				sslParam = "tls=true"
+				sslParam = "tls=true" // Default aman jika SSL mode tidak dikenal
 				logger.Warn("Unknown MySQL SSL mode, defaulting DSN tls parameter to 'true'.", zap.String("unknown_sslmode", sslmode))
 			}
 		}
@@ -491,7 +490,7 @@ func processSyncResults(results map[string]projectSync.SyncResult, logger *zap.L
 
 	if totalTables == 0 {
 		logger.Warn("Sync finished, but no tables were found in the source or all were filtered out.")
-		return 0
+		return 0 // Tidak ada yang diproses, anggap sukses (atau kode exit lain jika preferensi berbeda)
 	}
 
 	var schemaFailedTables, dataFailedTables, constraintFailedTables []string
@@ -533,51 +532,54 @@ func processSyncResults(results map[string]projectSync.SyncResult, logger *zap.L
 			dataFailedTables = append(dataFailedTables, table)
 			level = zap.ErrorLevel
 			statusMsg = "Table data synchronization FAILED."
-		} else if hasConstraintError {
+		} else if hasConstraintError { // Data sync sukses, tapi constraint gagal
 			constraintFailCount++
 			constraintFailedTables = append(constraintFailedTables, table)
-			level = zap.WarnLevel
+			level = zap.WarnLevel // Ini warning, bukan error kritis yang menghentikan data
 			statusMsg = "Table data sync SUCCEEDED, but applying constraints/indexes FAILED."
-			successCount++
-		} else {
+			successCount++ // Anggap sukses dari sisi data
+		} else { // Sukses penuh
 			successCount++
 		}
 		logger.Log(level, statusMsg, fields...)
 	}
 
+	// Ringkasan akhir
 	logger.Info("-------------------- Synchronization Summary --------------------",
 		zap.Int("total_tables_evaluated", totalTables),
 		zap.Int("tables_fully_successful_or_data_success_with_constraint_fail", successCount),
 		zap.Int("tables_with_schema_failures", schemaFailCount),
-		zap.Int("tables_with_data_failures", dataFailCount),
-		zap.Int("tables_with_only_constraint_failures", constraintFailCount),
+		zap.Int("tables_with_data_failures_after_successful_schema", dataFailCount), // Klarifikasi
+		zap.Int("tables_with_only_constraint_failures_after_successful_data", constraintFailCount), // Klarifikasi
 		zap.Int("tables_skipped_overall_processing", skippedCount),
 	)
 	if len(schemaFailedTables) > 0 {
 		logger.Error("Schema failures (analysis/execution) occurred for tables:", zap.Strings("tables", schemaFailedTables))
 	}
 	if len(dataFailedTables) > 0 {
-		logger.Error("Data sync failures occurred for tables:", zap.Strings("tables", dataFailedTables))
+		logger.Error("Data sync failures (after successful schema) occurred for tables:", zap.Strings("tables", dataFailedTables))
 	}
 	if len(constraintFailedTables) > 0 {
 		logger.Warn("Constraint/Index application failures occurred for tables (data was synced successfully):", zap.Strings("tables", constraintFailedTables))
 	}
 
+
+	// Tentukan kode exit
 	if schemaFailCount > 0 || dataFailCount > 0 {
 		logger.Error("Overall synchronization: COMPLETED WITH CRITICAL ERRORS (Schema or Data Failures).")
-		return 1
+		return 1 // Error kritis
 	}
 	if constraintFailCount > 0 {
 		logger.Warn("Overall synchronization: COMPLETED WITH CONSTRAINT/INDEX APPLICATION ERRORS (data was synced successfully).")
-		return 2
+		return 2 // Warning, data ada tapi skema mungkin tidak 100%
 	}
-	if skippedCount == totalTables && totalTables > 0 {
+	if skippedCount == totalTables && totalTables > 0 { // Jika semua tabel diskip
 		logger.Warn("Overall synchronization: COMPLETED, BUT ALL TABLES WERE SKIPPED (check logs for reasons).")
-		return 3
+		return 3 // Tidak ada yang dilakukan
 	}
-	if skippedCount > 0 {
+	if skippedCount > 0 { // Beberapa diskip, tapi yang lain mungkin sukses
 		logger.Info("Overall synchronization: COMPLETED (some tables may have been skipped).")
-		return 0
+		return 0 // Anggap sukses jika yang tidak diskip berhasil
 	}
 
 	logger.Info("Overall synchronization: COMPLETED SUCCESSFULLY.")

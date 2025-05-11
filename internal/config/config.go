@@ -68,7 +68,7 @@ type Config struct {
 	DstUsernameKey   string `env:"DST_USERNAME_KEY" envDefault:"username"`
 	DstPasswordKey   string `env:"DST_PASSWORD_KEY" envDefault:"password"`
 
-	// TypeMappingFilePath string `env:"TYPE_MAPPING_FILE_PATH" envDefault:""` // DIHAPUS
+	// TypeMappingFilePath string `env:"TYPE_MAPPING_FILE_PATH" envDefault:""` // DIHAPUS - Kustomisasi tipe eksternal dinonaktifkan sementara.
 }
 
 type DatabaseConfig struct {
@@ -80,13 +80,6 @@ type DatabaseConfig struct {
 	DBName   string `env:"DBNAME,required"`
 	SSLMode  string `env:"SSLMODE" envDefault:"disable"`
 }
-
-// Definisi StandardTypeMapping, TypeMappingConfigEntry, SpecialMapping, AllTypeMappings
-// tetap sama seperti di file default_typemaps.go karena dibutuhkan oleh provider
-// dan fungsi GetTypeMappingForDialects.
-// Alternatifnya, bisa dipindahkan ke file types.go terpisah dalam package config.
-// Untuk saat ini, biarkan di sini agar mudah direferensikan oleh default_typemaps.go
-// yang berada dalam package yang sama.
 
 type StandardTypeMapping struct {
 	TargetType        string                   `json:"target_type"`
@@ -127,7 +120,7 @@ func Load() (*Config, error) {
 
 	if cfg.VaultEnabled {
 		if cfg.VaultToken == "" {
-			fmt.Println("WARN: Vault is enabled but VAULT_TOKEN is not set. Ensure another auth method is configured or will be implemented.")
+			// Peringatan dipindahkan ke main.go setelah logger diinisialisasi
 		}
 		if cfg.SrcSecretPath == "" {
 			return nil, fmt.Errorf("Vault is enabled but SRC_SECRET_PATH is not set")
@@ -140,14 +133,14 @@ func Load() (*Config, error) {
 }
 
 // LoadTypeMappings sekarang menginisialisasi dari default internal.
-// Parameter filePath diabaikan.
-func LoadTypeMappings(_ string, logger *zap.Logger) error {
+// Kustomisasi melalui file eksternal saat ini dinonaktifkan.
+func LoadTypeMappings(logger *zap.Logger) error {
 	if loadedTypeMappingsCache != nil {
 		logger.Debug("Internal type mappings already initialized, skipping re-initialization.")
 		return nil
 	}
 
-	logger.Info("Initializing internal default type mappings.")
+	logger.Info("Initializing internal default type mappings. External type mapping files are currently not supported.")
 	mappings := defaultTypeMappingsProvider() // Panggil fungsi provider dari default_typemaps.go
 
 	// Validasi dan set default untuk ModifierHandling
@@ -204,11 +197,11 @@ func LoadTypeMappings(_ string, logger *zap.Logger) error {
 
 func GetTypeMappingForDialects(srcDialect, dstDialect string) *TypeMappingConfigEntry {
 	if loadedTypeMappingsCache == nil {
-		// Ini adalah kondisi kritis jika terjadi.
-		// Seharusnya LoadTypeMappings sudah dipanggil sebelumnya.
-		// Pertimbangkan untuk panic atau log fatal di sini jika ini terjadi di luar pengujian.
-		// fmt.Println("FATAL INTERNAL ERROR: GetTypeMappingForDialects called before LoadTypeMappings or cache is unexpectedly nil.")
-		// os.Exit(1)
+		// Ini kondisi kritis. Seharusnya LoadTypeMappings sudah dipanggil.
+		// Di aplikasi nyata, ini bisa jadi panic atau log fatal.
+		// Untuk saat ini, kembalikan nil agar pemanggil bisa menangani.
+		// fmt.Println("FATAL: GetTypeMappingForDialects called before LoadTypeMappings or cache is nil.")
+		// os.Exit(1) // Atau panic()
 		return nil
 	}
 	for _, cfgEntry := range loadedTypeMappingsCache.Mappings {

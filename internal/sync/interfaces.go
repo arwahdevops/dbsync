@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/arwahdevops/dbsync/internal/config"
+	"gorm.io/gorm" // Tambahkan impor GORM
 )
 
 // SchemaExecutionResult holds the DDLs generated for execution.
@@ -25,8 +26,11 @@ type SchemaSyncerInterface interface {
 	ExecuteDDLs(ctx context.Context, table string, ddls *SchemaExecutionResult) error
 
 	// GetPrimaryKeys explicitly fetches primary keys (can be part of SyncTableSchema result).
-	// May become redundant if SyncTableSchema always returns PKs.
 	GetPrimaryKeys(ctx context.Context, table string) ([]string, error)
+
+	// GetFKDependencies fetches outgoing foreign key dependencies for a list of tables.
+	// Returns a map where key is a table name and value is a slice of table names it has FKs to.
+	GetFKDependencies(ctx context.Context, db *gorm.DB, dialect string, tableNames []string) (map[string][]string, error)
 }
 
 // OrchestratorInterface defines the main synchronization runner.

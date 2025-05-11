@@ -241,7 +241,7 @@ func (s *SchemaSyncer) ExecuteDDLs(ctx context.Context, table string, ddls *Sche
 			}
 			// Teruskan dropSQL ke shouldIgnoreDDLError
 			if err := tx.Exec(dropSQL).Error; err != nil {
-				if !s.shouldIgnoreDDLError(err, dropSQL) { // <<--- PERBAIKAN DI SINI
+				if !s.shouldIgnoreDDLError(err, dropSQL) {
 					log.Error("Failed to execute DROP TABLE IF EXISTS, aborting.", zap.String("table", table), zap.Error(err))
 					return fmt.Errorf("failed to execute DROP TABLE IF EXISTS for '%s': %w", table, err)
 				}
@@ -325,18 +325,35 @@ func (s *SchemaSyncer) GetPrimaryKeys(ctx context.Context, table string) ([]stri
 	return pks, nil
 }
 
-// --- Helper Umum SchemaSyncer (definisi ada di file lain) ---
-// getPKColumnNames (di syncer_helpers.go)
-// isSystemTable (di syncer_helpers.go)
-// populateMappedTypesForSourceColumns (di syncer_type_mapper.go)
-// populateMappedTypesForDestinationColumns (di syncer_type_mapper.go)
-// fetchSchemaDetails (di syncer_fetch_dispatch.go)
-// generateCreateTableDDL (di schema_ddl_create.go)
-// generateCreateIndexDDLs (di schema_ddl_create.go)
-// generateAddConstraintDDLs (di schema_ddl_create.go)
-// generateAlterDDLs (di schema_alter.go)
-// shouldIgnoreDDLError (di syncer_ddl_executor.go - di file ini)
-// parseAndCategorizeDDLs (di syncer_ddl_executor.go - di file ini)
-// executeDDLPhase (di syncer_ddl_executor.go - di file ini)
-// splitPostgresFKsForDeferredExecution (di syncer_ddl_executor.go - di file ini)
-// Fungsi-fungsi sorting (di syncer_ddl_executor.go - di file ini)
+// GetFKDependencies mengambil dependensi FK keluar untuk daftar tabel yang diberikan.
+// Mengembalikan peta: nama tabel -> slice nama tabel yang dirujuk.
+func (s *SchemaSyncer) GetFKDependencies(ctx context.Context, db *gorm.DB, dialect string, tableNames []string) (map[string][]string, error) {
+	log := s.logger.With(zap.String("dialect", dialect), zap.String("action", "GetFKDependencies"))
+	log.Info("Fetching foreign key dependencies for tables.", zap.Strings("tables_to_query", tableNames))
+
+	dependencies := make(map[string][]string)
+	tableSet := make(map[string]bool)
+	for _, tn := range tableNames {
+		dependencies[tn] = []string{} // Inisialisasi
+		tableSet[tn] = true
+	}
+
+	for _, tableName := range tableNames {
+		constraints, err := s.getConstraints(ctx, db, dialect, tableName)
+		if err != nil {
+			log.Error("Failed to get constraints for FK dependency analysis", zap.String("table", tableName), zap.Error(err))
+			return nil, fmt.Errorf("failed to get constraints for table %s (dialect: %s) for FK dependency: %w", tableName, dialect, err)
+		}
+
+		for _, cons := range constraints {
+			if cons.Type == "FOREIGN KEY" && cons.ForeignTable != "" && cons.ForeignTable != tableName {
+				// Hanya pertimbangkan FK ke tabel lain yang juga ada dalam set yang disinkronkan
+				if _, isRelevantForeignTable := tableSet[cons.ForeignTable]; isRelevantForeignTable {
+					dependencies[tableName] = append(dependencies[tableName], cons.ForeignTable)
+				}
+			}
+		}
+	}
+	log.Debug("Foreign key dependencies fetched.", zap.Any("dependencies_map", dependencies))
+	return dependencies, nil
+}

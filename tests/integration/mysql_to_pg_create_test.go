@@ -6,6 +6,7 @@ package integration
 import (
 	"context"
 	"database/sql"
+	"fmt" // Impor fmt untuk t.Logf dengan format
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,15 +16,17 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
+	"go.uber.org/zap" // <<< IMPOR ZAP
 
 	"github.com/arwahdevops/dbsync/internal/config"
 	dbsync_db "github.com/arwahdevops/dbsync/internal/db"
 	dbsync_logger "github.com/arwahdevops/dbsync/internal/logger"
 	dbsync_metrics "github.com/arwahdevops/dbsync/internal/metrics"
 	dbsync_sync "github.com/arwahdevops/dbsync/internal/sync"
+	"github.com/arwahdevops/dbsync/internal/utils" // <<< IMPOR UTILS
 )
 
-// getPgActualDataType (helper yang sudah kita definisikan sebelumnya)
+// getPgActualDataTypeTestHelper (helper yang sudah kita definisikan sebelumnya)
 func getPgActualDataTypeTestHelper(colDataType, colUdtName string) string {
 	actual := strings.ToLower(colUdtName)
 	if actual == "" ||
@@ -39,7 +42,7 @@ func getPgActualDataTypeTestHelper(colDataType, colUdtName string) string {
 	case "int2": return "smallint"
 	case "bool": return "boolean"
 	case "bpchar": return "character"
-	case "varchar": return "character varying" // udt_name untuk character varying adalah varchar
+	case "varchar": return "character varying"
 	}
 	return actual
 }
@@ -50,7 +53,7 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 		t.Skip("Skipping integration test (MySQL to PG Create Strategy).")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Minute) // Sedikit lebih lama untuk CI
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Minute)
 	defer cancel()
 
 	errLoggerInit := dbsync_logger.Init(true, false)
@@ -67,12 +70,15 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 	testLogger.Info("Setting up source database schema and data...")
 	sourceTablesToDrop := []string{"comments", "post_categories", "posts", "categories", "users"}
 	for _, tableName := range sourceTablesToDrop {
-		if err := sourceDB.DB.Exec("DROP TABLE IF EXISTS " + sourceDB.DB.Quote(tableName) + ";").Error; err != nil {
-			testLogger.Warn("Failed to drop source table (may not exist)", zap.String("table", tableName), zap.Error(err))
+		// Gunakan utils.QuoteIdentifier
+		quotedTableName := utils.QuoteIdentifier(tableName, sourceDB.Dialect)
+		if err := sourceDB.DB.Exec("DROP TABLE IF EXISTS " + quotedTableName + ";").Error; err != nil {
+			// Gunakan logger yang sudah di-scope (testLogger) dan field zap
+			testLogger.Warn("Failed to drop source table (may not exist)",
+				zap.String("table", tableName),
+				zap.Error(err))
 		}
 	}
-	// Pastikan path ini benar relatif terhadap lokasi file tes Anda
-	// Jika file tes ada di tests/integration/, dan testdata sejajar dengan tests/:
 	sourceSchemaFilePath := filepath.Join("..", "testdata", "mysql_to_pg_create", "source_schema.sql")
 	executeSQLFile(t, sourceDB.DB, sourceSchemaFilePath)
 	testLogger.Info("Source database setup complete.", zap.String("schema_file", sourceSchemaFilePath))
@@ -81,16 +87,18 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 	testLogger.Info("Cleaning up target database...")
 	targetTablesToDrop := []string{"comments", "post_categories", "posts", "categories", "users"}
 	for _, tableName := range targetTablesToDrop {
-		// Menggunakan Quote dari GORM untuk nama tabel di DDL jika diperlukan oleh dialek (PG pakai double quote)
-		if err := targetDB.DB.Exec("DROP TABLE IF EXISTS " + targetDB.DB.Quote(tableName) + " CASCADE;").Error; err != nil {
-			testLogger.Warn("Failed to drop target table (may not exist)", zap.String("table", tableName), zap.Error(err))
+		quotedTableName := utils.QuoteIdentifier(tableName, targetDB.Dialect)
+		if err := targetDB.DB.Exec("DROP TABLE IF EXISTS " + quotedTableName + " CASCADE;").Error; err != nil {
+			testLogger.Warn("Failed to drop target table (may not exist)",
+				zap.String("table", tableName),
+				zap.Error(err))
 		}
 	}
 	testLogger.Info("Target database cleanup complete.")
 
 	cfg := &config.Config{
 		SyncDirection:          "mysql-to-postgres",
-		SchemaSyncStrategy:     config.SchemaSyncDropCreate, // Menggunakan drop_create karena ini yang paling umum untuk "membuat dari awal"
+		SchemaSyncStrategy:     config.SchemaSyncDropCreate,
 		BatchSize:              100,
 		Workers:                2,
 		TableTimeout:           3 * time.Minute,
@@ -113,7 +121,7 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 	dstConnInternal := &dbsync_db.Connector{DB: targetDB.DB, Dialect: targetDB.Dialect}
 
 	testLogger.Info("Loading internal type mappings...")
-	errLoadMappings := config.LoadTypeMappings(testLogger) // Memastikan mappings termuat
+	errLoadMappings := config.LoadTypeMappings(testLogger)
 	require.NoError(t, errLoadMappings, "Failed to load internal type mappings for test")
 
 	testLogger.Info("Starting dbsync orchestrator...")
@@ -201,14 +209,13 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 			assert.Equal(t, expected.IsNullable, col.IsNullable, "Nullability mismatch for column '%s'", col.ColumnName)
 
 			if expected.CharMaxLen.Valid {
-				if col.CharacterMaximumLength.Valid { // Hanya assert jika aktualnya juga valid
+				if col.CharacterMaximumLength.Valid {
 					assert.Equal(t, expected.CharMaxLen.Int64, col.CharacterMaximumLength.Int64, "CharacterMaximumLength mismatch for column '%s'", col.ColumnName)
-				} else if expected.TargetType == "character varying" && !strings.Contains(expected.TargetType, "(") { // PG varchar tanpa panjang -> maxlen null
-				     // OK, tidak perlu assert
+				} else if expected.TargetType == "character varying" && !strings.Contains(expected.TargetType, "(") {
 				} else if expected.TargetType != "text" {
 					assert.True(t, col.CharacterMaximumLength.Valid, "Expected CharacterMaximumLength to be valid for column '%s', but was NULL", col.ColumnName)
 				}
-			} else { // Jika ekspektasi tidak punya panjang (misal, text)
+			} else {
 				assert.False(t, col.CharacterMaximumLength.Valid, "Expected CharacterMaximumLength to be NULL for column '%s', but had value", col.ColumnName)
 			}
 
@@ -227,7 +234,6 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 		}
 	})
 
-	// Verifikasi Jumlah Data (Menggunakan angka dari source_schema.txt yang Anda berikan)
 	t.Run("VerifyDataCount_users", func(t *testing.T) { res, _ := results["users"]; assert.EqualValues(t, 3, res.RowsSynced, "users row count") })
 	t.Run("VerifyDataCount_categories", func(t *testing.T) { res, _ := results["categories"]; assert.EqualValues(t, 3, res.RowsSynced, "categories row count") })
 	t.Run("VerifyDataCount_posts", func(t *testing.T) { res, _ := results["posts"]; assert.EqualValues(t, 4, res.RowsSynced, "posts row count") })
@@ -257,6 +263,7 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 		}
 		require.NoError(t, errQuery, "Error querying for FK %s(%s) -> %s(%s) (hint: %s)", fromTable, fromColumn, toTable, toColumn, fkNameHint)
 		assert.NotEmpty(t, constraintName, "Foreign key from %s(%s) to %s(%s) (hint: %s) should exist and have a name", fromTable, fromColumn, toTable, toColumn, fkNameHint)
+		// Gunakan fmt.Sprintf untuk t.Logf jika menggunakan argumen tambahan
 		t.Logf("Found FK from %s(%s) to %s(%s) with name: %s (Hint was: '%s')", fromTable, fromColumn, toTable, toColumn, constraintName, fkNameHint)
 	}
 
@@ -275,7 +282,7 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 	t.Run("VerifyForeignKey_post_categories_to_categories", func(t *testing.T) {
 		verifyForeignKeyExists(t, targetDB.DB, "post_categories", "category_id", "categories", "category_id", "fk_pc_category")
 	})
-    t.Run("VerifyForeignKey_comments_to_self_comments", func(t *testing.T) { // FK self-referencing
+    t.Run("VerifyForeignKey_comments_to_self_comments", func(t *testing.T) {
 		verifyForeignKeyExists(t, targetDB.DB, "comments", "parent_comment_id", "comments", "comment_id", "fk_comment_parent")
 	})
 
@@ -283,8 +290,6 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 	verifyUniqueConstraintExistsOnColumn := func(t *testing.T, db *gorm.DB, tableName, columnName, constraintNameHint string) {
 		t.Helper()
 		var count int
-		// Query ini akan mencari constraint UNIQUE atau PRIMARY KEY yang secara eksplisit didefinisikan
-		// dan melibatkan kolom yang ditentukan.
 		query := `
 			SELECT COUNT(DISTINCT tc.constraint_name)
 			FROM information_schema.table_constraints tc
@@ -294,11 +299,6 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 			  AND ccu.column_name = ?
 			  AND tc.constraint_type IN ('UNIQUE', 'PRIMARY KEY');
 		`
-		// Jika Anda tahu nama constraint dari sumber, Anda bisa query berdasarkan nama:
-		// query_by_name := `SELECT COUNT(*) FROM information_schema.table_constraints WHERE constraint_schema = current_schema() AND table_name = ? AND constraint_name = ? AND constraint_type = 'UNIQUE'`
-		// errQuery := db.WithContext(queryCtx).Raw(query_by_name, tableName, constraintNameHint).Scan(&count).Error
-		// Namun, jika PG membuat nama otomatis, ini tidak akan berfungsi.
-
 		queryCtx, queryCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer queryCancel()
 		errQuery := db.WithContext(queryCtx).Raw(query, tableName, columnName).Scan(&count).Error
@@ -307,7 +307,6 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 		t.Logf("Found %d UNIQUE or PK constraint(s) involving column %s on table %s (Hint was: '%s')", count, columnName, tableName, constraintNameHint)
 	}
 
-	// Menggunakan nama constraint dari source_schema.txt sebagai petunjuk
 	t.Run("VerifyUniqueConstraint_users_username", func(t *testing.T) {
 		verifyUniqueConstraintExistsOnColumn(t, targetDB.DB, "users", "username", "uq_username")
 	})

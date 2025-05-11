@@ -8,6 +8,7 @@ require (
 	github.com/docker/go-connections v0.5.0
 	github.com/hashicorp/vault/api v1.16.0
 	github.com/joho/godotenv v1.5.1
+	github.com/lib/pq v1.10.7
 	github.com/prometheus/client_golang v1.22.0
 	github.com/stretchr/testify v1.10.0
 	github.com/testcontainers/testcontainers-go v0.37.0

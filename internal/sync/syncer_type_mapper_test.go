@@ -1,3 +1,4 @@
+// internal/sync/syncer_type_mapper_test.go
 package sync
 
 import (
@@ -6,12 +7,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
+
+	"github.com/arwahdevops/dbsync/internal/config" // Impor config untuk ModifierHandlingStrategy
 )
 
-// Helper untuk membuat instance SchemaSyncer untuk pengujian applyTypeModifiers
+// Helper newTestTypeMapperSyncer untuk membuat instance SchemaSyncer untuk pengujian.
 func newTestTypeMapperSyncer(srcDialect, dstDialect string, logger *zap.Logger) *SchemaSyncer {
 	if logger == nil {
-		logger = zap.NewNop()
+		logger = zap.NewNop() // Default ke No-Op logger jika tidak disediakan
 	}
 	return &SchemaSyncer{
 		srcDialect: srcDialect,
@@ -19,7 +22,6 @@ func newTestTypeMapperSyncer(srcDialect, dstDialect string, logger *zap.Logger) 
 		logger:     logger,
 	}
 }
-
 
 func TestNormalizeTypeName(t *testing.T) {
 	testCases := []struct {
@@ -46,13 +48,14 @@ func TestNormalizeTypeName(t *testing.T) {
 		{"Type with trailing space before numeric paren", "VARCHAR (255)", "varchar"},
 		{"Type with no space before numeric paren", "INT(11)", "int"},
 		{"Timestamp with time zone PG", "timestamp with time zone", "timestamptz"},
-		{"Timestamp (3) with time zone PG", "timestamp(3) with time zone", "timestamptz"}, // Expected setelah normalisasi & alias
-		{"bit varying with numeric mod", "bit varying(10)", "varbit"},                   // Expected setelah normalisasi & alias
-		{"character with numeric mod", "character(5)", "char"},                         // Expected setelah normalisasi & alias
+		{"Timestamp (3) with time zone PG", "timestamp(3) with time zone", "timestamptz"},
+		{"bit varying with numeric mod", "bit varying(10)", "varbit"},
+		{"character with numeric mod", "character(5)", "char"},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			// Asumsi normalizeTypeName ada di compare_helpers.go (package sync)
 			actual := normalizeTypeName(tc.input)
 			assert.Equal(t, tc.expected, actual, "Test Case: %s, Input: '%s'", tc.name, tc.input)
 		})
@@ -60,180 +63,131 @@ func TestNormalizeTypeName(t *testing.T) {
 }
 
 func TestIsStringType(t *testing.T) {
-	stringTypes := []string{
-		"char", "varchar", "nchar", "nvarchar",
-		"text", "tinytext", "mediumtext", "longtext",
-		"clob", "enum", "set", "uuid", "json", "xml",
-	}
-	nonStringTypes := []string{
-		"int", "decimal", "bool", "date", "timestamp", "binary", "blob", "bytea",
-	}
-
+	stringTypes := []string{"char", "varchar", "nchar", "nvarchar", "text", "tinytext", "mediumtext", "longtext", "clob", "enum", "set", "uuid", "json", "xml"}
+	nonStringTypes := []string{"int", "decimal", "bool", "date", "timestamp", "binary", "blob", "bytea"}
 	for _, sType := range stringTypes {
-		t.Run("IsString_"+sType, func(t *testing.T) {
-			assert.True(t, isStringType(sType), "Expected '%s' to be a string type", sType)
-		})
+		t.Run("IsString_"+sType, func(t *testing.T) { assert.True(t, isStringType(sType), "Expected '%s' to be a string type", sType) })
 	}
 	for _, nsType := range nonStringTypes {
-		t.Run("IsNotString_"+nsType, func(t *testing.T) {
-			assert.False(t, isStringType(nsType), "Expected '%s' NOT to be a string type", nsType)
-		})
+		t.Run("IsNotString_"+nsType, func(t *testing.T) { assert.False(t, isStringType(nsType), "Expected '%s' NOT to be a string type", nsType) })
 	}
 }
 
 func TestIsBinaryType(t *testing.T) {
 	binaryTypes := []string{"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bytea", "bit", "varbit"}
 	nonBinaryTypes := []string{"char", "text", "int", "json"}
-
 	for _, bType := range binaryTypes {
-		t.Run("IsBinary_"+bType, func(t *testing.T) {
-			assert.True(t, isBinaryType(bType), "Expected '%s' to be a binary type", bType)
-		})
+		t.Run("IsBinary_"+bType, func(t *testing.T) { assert.True(t, isBinaryType(bType), "Expected '%s' to be a binary type", bType) })
 	}
 	for _, nbType := range nonBinaryTypes {
-		t.Run("IsNotBinary_"+nbType, func(t *testing.T) {
-			assert.False(t, isBinaryType(nbType), "Expected '%s' NOT to be a binary type", nbType)
-		})
+		t.Run("IsNotBinary_"+nbType, func(t *testing.T) { assert.False(t, isBinaryType(nbType), "Expected '%s' NOT to be a binary type", nbType) })
 	}
 }
 
 func TestIsNumericType(t *testing.T) {
-	numericTypes := []string{
-		"tinyint", "smallint", "mediumint", "int", "integer", "bigint",
-		"serial", "bigserial", "decimal", "numeric",
-		"float", "double", "real", "money",
-	}
+	numericTypes := []string{"tinyint", "smallint", "mediumint", "int", "integer", "bigint", "serial", "bigserial", "decimal", "numeric", "float", "double", "real", "money"}
 	nonNumericTypes := []string{"char", "varchar", "text", "date", "timestamp", "bool", "blob", "json"}
-
 	for _, numType := range numericTypes {
-		t.Run("IsNumeric_"+numType, func(t *testing.T) {
-			assert.True(t, isNumericType(numType), "Expected '%s' to be a numeric type", numType)
-		})
+		t.Run("IsNumeric_"+numType, func(t *testing.T) { assert.True(t, isNumericType(numType), "Expected '%s' to be a numeric type", numType) })
 	}
 	for _, nonNumType := range nonNumericTypes {
-		t.Run("IsNotNumeric_"+nonNumType, func(t *testing.T) {
-			assert.False(t, isNumericType(nonNumType), "Expected '%s' NOT to be a numeric type", nonNumType)
-		})
+		t.Run("IsNotNumeric_"+nonNumType, func(t *testing.T) { assert.False(t, isNumericType(nonNumType), "Expected '%s' NOT to be a numeric type", nonNumType) })
 	}
 }
 
 func TestIsIntegerType(t *testing.T) {
 	integerTypes := []string{"tinyint", "smallint", "mediumint", "int", "integer", "bigint", "serial", "bigserial"}
 	nonIntegerTypes := []string{"decimal", "float", "varchar", "text", "date"}
-
 	for _, intType := range integerTypes {
-		t.Run("IsInteger_"+intType, func(t *testing.T) {
-			assert.True(t, isIntegerType(intType), "Expected '%s' to be an integer type", intType)
-		})
+		t.Run("IsInteger_"+intType, func(t *testing.T) { assert.True(t, isIntegerType(intType), "Expected '%s' to be an integer type", intType) })
 	}
 	for _, nonIntType := range nonIntegerTypes {
-		t.Run("IsNotInteger_"+nonIntType, func(t *testing.T) {
-			assert.False(t, isIntegerType(nonIntType), "Expected '%s' NOT to be an integer type", nonIntType)
-		})
+		t.Run("IsNotInteger_"+nonIntType, func(t *testing.T) { assert.False(t, isIntegerType(nonIntType), "Expected '%s' NOT to be an integer type", nonIntType) })
 	}
 }
 
 func TestIsPrecisionRelevant(t *testing.T) {
 	relevantTypes := []string{"decimal", "numeric", "time", "timetz", "timestamp", "timestamptz", "datetime"}
 	nonRelevantTypes := []string{"int", "varchar", "text", "date", "bool"}
-
 	for _, relType := range relevantTypes {
-		t.Run("IsPrecisionRelevant_"+relType, func(t *testing.T) {
-			assert.True(t, isPrecisionRelevant(relType), "Expected precision to be relevant for '%s'", relType)
-		})
+		t.Run("IsPrecisionRelevant_"+relType, func(t *testing.T) { assert.True(t, isPrecisionRelevant(relType), "Expected precision to be relevant for '%s'", relType) })
 	}
 	for _, nonRelType := range nonRelevantTypes {
-		t.Run("IsNotPrecisionRelevant_"+nonRelType, func(t *testing.T) {
-			assert.False(t, isPrecisionRelevant(nonRelType), "Expected precision NOT to be relevant for '%s'", nonRelType)
-		})
+		t.Run("IsNotPrecisionRelevant_"+nonRelType, func(t *testing.T) { assert.False(t, isPrecisionRelevant(nonRelType), "Expected precision NOT to be relevant for '%s'", nonRelType) })
 	}
 }
 
 func TestIsScaleRelevant(t *testing.T) {
 	relevantTypes := []string{"decimal", "numeric"}
 	nonRelevantTypes := []string{"int", "varchar", "text", "date", "bool", "time", "timestamp"}
-
 	for _, relType := range relevantTypes {
-		t.Run("IsScaleRelevant_"+relType, func(t *testing.T) {
-			assert.True(t, isScaleRelevant(relType), "Expected scale to be relevant for '%s'", relType)
-		})
+		t.Run("IsScaleRelevant_"+relType, func(t *testing.T) { assert.True(t, isScaleRelevant(relType), "Expected scale to be relevant for '%s'", relType) })
 	}
 	for _, nonRelType := range nonRelevantTypes {
-		t.Run("IsNotScaleRelevant_"+nonRelType, func(t *testing.T) {
-			assert.False(t, isScaleRelevant(nonRelType), "Expected scale NOT to be relevant for '%s'", nonRelType)
-		})
+		t.Run("IsNotScaleRelevant_"+nonRelType, func(t *testing.T) { assert.False(t, isScaleRelevant(nonRelType), "Expected scale NOT to be relevant for '%s'", nonRelType) })
 	}
 }
-
 
 func TestApplyTypeModifiers(t *testing.T) {
 	logger := zaptest.NewLogger(t)
 
 	testCases := []struct {
-		name           string
-		srcTypeRaw     string
-		mappedBaseType string
-		dstDialect     string
-		expected       string
+		name                 string
+		srcTypeRaw           string
+		mappedTypeFromConfig string
+		dstDialect           string
+		modHandling          config.ModifierHandlingStrategy
+		expected             string
 	}{
-		// Sumber tanpa modifier
-		{"SrcNoMod_MappedNoMod", "TEXT", "TEXT", "postgres", "TEXT"},
-		{"SrcNoMod_MappedWithMod", "TEXT", "VARCHAR(255)", "postgres", "VARCHAR(255)"},
-		{"SrcNoMod_MappedNoMod_Time", "TIMESTAMP", "TIMESTAMP", "mysql", "TIMESTAMP"},
+		// --- Kasus untuk ModifierHandlingApplySource ---
+		{"ApplySrc_SrcNoMod_MappedNoMod", "TEXT", "TEXT", "postgres", config.ModifierHandlingApplySource, "TEXT"},
+		{"ApplySrc_SrcNoMod_MappedWithMod", "TEXT", "VARCHAR(255)", "postgres", config.ModifierHandlingApplySource, "VARCHAR(255)"}, // mappedTypeFromConfig (target) punya modifier, sumber tidak
+		{"ApplySrc_SrcVARCHAR_MappedVARCHAR_NoModInTarget", "VARCHAR(100)", "VARCHAR", "postgres", config.ModifierHandlingApplySource, "VARCHAR(100)"},
+		{"ApplySrc_SrcCHAR_MappedCHAR_NoModInTarget", "CHAR(10)", "CHAR", "mysql", config.ModifierHandlingApplySource, "CHAR(10)"},
+		{"ApplySrc_SrcDECIMAL_MappedNUMERIC_NoModInTarget", "DECIMAL(12,4)", "NUMERIC", "postgres", config.ModifierHandlingApplySource, "NUMERIC(12,4)"},
+		{"ApplySrc_SrcTIMESTAMP_MappedTIMESTAMP_PG_WithPrec", "TIMESTAMP(3) WITH TIME ZONE", "TIMESTAMP WITH TIME ZONE", "postgres", config.ModifierHandlingApplySource, "TIMESTAMP WITH TIME ZONE(3)"},
+		{"ApplySrc_SrcDATETIME_MappedDATETIME_MySQL_WithPrec", "DATETIME(6)", "DATETIME", "mysql", config.ModifierHandlingApplySource, "DATETIME(6)"},
+		{"ApplySrc_SrcTIME_MappedTIME_MySQL_WithPrec", "TIME(2)", "TIME", "mysql", config.ModifierHandlingApplySource, "TIME(2)"},
+		{"ApplySrc_SrcTIME_MappedTIME_PG_WithPrec", "TIME(4) WITHOUT TIME ZONE", "TIME WITHOUT TIME ZONE", "postgres", config.ModifierHandlingApplySource, "TIME WITHOUT TIME ZONE(4)"},
+		{"ApplySrc_MySQL_INT_to_PG_INTEGER_SrcModIgnored", "INT(11)", "INTEGER", "postgres", config.ModifierHandlingApplySource, "INTEGER"},
+		{"ApplySrc_PG_TIMESTAMP_to_MySQL_DATETIME_SrcModApplied", "TIMESTAMP(3)", "DATETIME(6)", "mysql", config.ModifierHandlingApplySource, "DATETIME(3)"}, // mappedTypeFromConfig punya modifier, tapi apply_source akan mencoba menerapkan modifier sumber ke tipe dasar target
+		{"ApplySrc_PG_TIMESTAMP_to_MySQL_DATETIME_SrcModOutOfRange", "TIMESTAMP(7)", "DATETIME(6)", "mysql", config.ModifierHandlingApplySource, "DATETIME"}, // presisi sumber (7) invalid untuk DATETIME MySQL, jadi modifier sumber diabaikan, dan karena DATETIME(6) punya modifier sendiri, itu yang dipakai
+		{"ApplySrc_SrcDATETIME_MySQL_PrecInRange", "DATETIME(3)", "DATETIME", "mysql", config.ModifierHandlingApplySource, "DATETIME(3)"},
+		{"ApplySrc_SrcDATETIME_MySQL_PrecOutOfRangeHi", "DATETIME(7)", "DATETIME", "mysql", config.ModifierHandlingApplySource, "DATETIME"},
+		{"ApplySrc_SrcDATETIME_MySQL_PrecOutOfRangeLow_InvalidSrcMod", "DATETIME(-1)", "DATETIME", "mysql", config.ModifierHandlingApplySource, "DATETIME"}, // Modifier sumber (-1) tidak valid
+		{"ApplySrc_SrcTIMESTAMP_SQLite_PrecIgnored", "TIMESTAMP(3)", "TIMESTAMP", "sqlite", config.ModifierHandlingApplySource, "TIMESTAMP"},
+		{"ApplySrc_SrcVARBINARY_MappedBYTEA", "VARBINARY(100)", "BYTEA", "postgres", config.ModifierHandlingApplySource, "BYTEA"}, // BYTEA PG tidak pakai panjang eksplisit
+		{"ApplySrc_SrcBINARY_MappedBINARYMySQL", "BINARY(10)", "BINARY", "mysql", config.ModifierHandlingApplySource, "BINARY(10)"},
+		{"ApplySrc_SrcBIT_MappedBITMySQL", "BIT(8)", "BIT", "mysql", config.ModifierHandlingApplySource, "BIT(8)"},
+		{"ApplySrc_SrcBIT_MappedVARBITPG", "BIT(64)", "VARBIT", "postgres", config.ModifierHandlingApplySource, "VARBIT(64)"},
 
-		// Sumber dengan modifier, Mapped tanpa modifier
-		{"SrcVARCHAR_MappedVARCHAR", "VARCHAR(100)", "VARCHAR", "postgres", "VARCHAR(100)"},
-		{"SrcCHAR_MappedCHAR", "CHAR(10)", "CHAR", "mysql", "CHAR(10)"},
-		{"SrcDECIMAL_MappedNUMERIC", "DECIMAL(12,4)", "NUMERIC", "postgres", "NUMERIC(12,4)"},
-		{"SrcNUMERIC_MappedDECIMAL", "NUMERIC(8)", "DECIMAL", "mysql", "DECIMAL(8)"},
-		{"SrcFLOAT_MappedREAL_NoMod", "FLOAT(10,2)", "REAL", "postgres", "REAL"},
-		{"SrcDOUBLE_MappedDOUBLE_NoMod", "DOUBLE(15,4)", "DOUBLE", "mysql", "DOUBLE"},
-		{"SrcTIMESTAMP_MappedTIMESTAMP_PG_WithPrec", "TIMESTAMP(3) WITH TIME ZONE", "TIMESTAMP WITH TIME ZONE", "postgres", "TIMESTAMP WITH TIME ZONE(3)"},
-		{"SrcDATETIME_MappedDATETIME_MySQL_WithPrec", "DATETIME(6)", "DATETIME", "mysql", "DATETIME(6)"},
-		{"SrcTIME_MappedTIME_MySQL_WithPrec", "TIME(2)", "TIME", "mysql", "TIME(2)"},
-		{"SrcTIME_MappedTIME_PG_WithPrec", "TIME(4) WITHOUT TIME ZONE", "TIME WITHOUT TIME ZONE", "postgres", "TIME WITHOUT TIME ZONE(4)"},
+		// --- Kasus untuk ModifierHandlingUseTargetDefined ---
+		{"UseTargetDef_SrcVARCHAR_MappedVARCHARWithMod", "VARCHAR(100)", "VARCHAR(50)", "postgres", config.ModifierHandlingUseTargetDefined, "VARCHAR(50)"},
+		{"UseTargetDef_SrcDECIMAL_MappedNUMERICNoMod", "DECIMAL(10,2)", "NUMERIC", "postgres", config.ModifierHandlingUseTargetDefined, "NUMERIC"},
+		{"UseTargetDef_SrcINT_MappedSpecificTarget", "INT(11)", "INTEGER /* target specific */ (123)", "postgres", config.ModifierHandlingUseTargetDefined, "INTEGER /* target specific */ (123)"},
+		{"UseTargetDef_SrcTEXT_MappedTargetWithLength", "TEXT", "VARCHAR(MAX)", "mysql", config.ModifierHandlingUseTargetDefined, "VARCHAR(MAX)"}, // VARCHAR(MAX) tidak ada di MySQL, ini contoh saja, seharusnya LONGTEXT
 
-		// Sumber dengan modifier, Mapped DENGAN modifier (prioritas)
-		{"SrcENUM_MappedVARCHARWithMod", "ENUM('a','b')", "VARCHAR(50)", "postgres", "VARCHAR(50)"},
-		{"SrcSET_MappedTEXT", "SET('x','y')", "TEXT", "postgres", "TEXT"},
-		{"SrcDECIMAL_MappedNUMERICWithMod_SrcModWins", "DECIMAL(10,2)", "NUMERIC(20,5)", "postgres", "NUMERIC(10,2)"},
+		// --- Kasus untuk ModifierHandlingIgnoreSource ---
+		{"IgnoreSrc_SrcVARCHAR_MappedVARCHARWithMod", "VARCHAR(100)", "VARCHAR(30)", "postgres", config.ModifierHandlingIgnoreSource, "VARCHAR(30)"}, // Menggunakan tipe target apa adanya
+		{"IgnoreSrc_SrcVARCHAR_MappedTEXTNoMod", "VARCHAR(255)", "TEXT", "postgres", config.ModifierHandlingIgnoreSource, "TEXT"},                     // Menggunakan tipe target apa adanya
+		{"IgnoreSrc_SrcINT_MappedBIGINT", "INT(11)", "BIGINT", "mysql", config.ModifierHandlingIgnoreSource, "BIGINT"},
+		{"IgnoreSrc_SrcDECIMAL_MappedNUMERICNoMod", "DECIMAL(10,2)", "NUMERIC", "postgres", config.ModifierHandlingIgnoreSource, "NUMERIC"},
 
-		// Modifier sumber tidak valid atau tidak relevan / tidak transferable
-		{"SrcVARCHAR_MappedINT_ModIgnored", "VARCHAR(50)", "INTEGER", "postgres", "INTEGER"},
-		{"SrcTEXT_NonNumericMod_MappedVARCHAR_ModIgnored", "TEXT(MAX)", "VARCHAR", "postgres", "VARCHAR"},
-		{"SrcTEXT_NumericMod_MappedVARCHAR_ModIgnored", "TEXT(100)", "VARCHAR", "postgres", "VARCHAR"},
-		{"SrcDECIMAL_MappedVARCHAR_ModIgnored", "DECIMAL(8,2)", "VARCHAR", "postgres", "VARCHAR"},
-		{"SrcINT_DisplayWidth_MappedVARCHAR_ModIgnored", "INT(11)", "VARCHAR", "mysql", "VARCHAR"},
-
-		// Validasi range presisi waktu MySQL
-		{"SrcDATETIME_MySQL_PrecInRange", "DATETIME(3)", "DATETIME", "mysql", "DATETIME(3)"},
-		{"SrcDATETIME_MySQL_PrecOutOfRangeHi", "DATETIME(7)", "DATETIME", "mysql", "DATETIME"},
-		{"SrcDATETIME_MySQL_PrecOutOfRangeLow_Invalid", "DATETIME(-1)", "DATETIME", "mysql", "DATETIME"},
-		{"SrcTIMESTAMP_MySQL_PrecValid", "TIMESTAMP(0)", "TIMESTAMP", "mysql", "TIMESTAMP(0)"},
-		
-		// Validasi presisi/skala DECIMAL/NUMERIC
-		{"SrcDECIMAL_InvalidPrec_Char", "DECIMAL(A,2)", "NUMERIC", "postgres", "NUMERIC"},
-		{"SrcDECIMAL_InvalidScale_Char", "DECIMAL(10,B)", "NUMERIC", "postgres", "NUMERIC"},
-		{"SrcDECIMAL_InvalidPrec_Zero", "DECIMAL(0,0)", "NUMERIC", "postgres", "NUMERIC"},
-		{"SrcDECIMAL_InvalidScale_Negative", "DECIMAL(10,-1)", "NUMERIC", "postgres", "NUMERIC"},
-		{"SrcDECIMAL_InvalidScale_GtPrec", "DECIMAL(5,6)", "NUMERIC", "postgres", "NUMERIC"},
-
-		// Kasus SQLite dengan presisi waktu (harus diabaikan)
-		{"SrcTIMESTAMP_SQLite_PrecIgnored", "TIMESTAMP(3)", "TIMESTAMP", "sqlite", "TIMESTAMP"},
-		{"SrcDATETIME_SQLite_PrecIgnored", "DATETIME(6)", "DATETIME", "sqlite", "DATETIME"},
-
-		// MappedBaseType dari pemetaan internal (contoh)
-		{"MySQL_INT_to_PG_INTEGER_SrcModIgnored", "INT(11)", "INTEGER", "postgres", "INTEGER"},
-		{"MySQL_DECIMAL_to_PG_NUMERIC_SrcModApplied", "DECIMAL(15,5)", "NUMERIC", "postgres", "NUMERIC(15,5)"},
-		{"PG_TIMESTAMP_to_MySQL_DATETIME_SrcModApplied", "TIMESTAMP(3)", "DATETIME(6)", "mysql", "DATETIME(3)"},
-		{"PG_TIMESTAMP_to_MySQL_DATETIME_SrcModOutOfRange", "TIMESTAMP(7)", "DATETIME(6)", "mysql", "DATETIME"},
+		// --- Kasus Khusus dan Tepi ---
+		{"ApplySrc_SrcENUM_MappedVARCHARWithMod_TargetModWinsForEnum", "ENUM('a','b')", "VARCHAR(50)", "postgres", config.ModifierHandlingApplySource, "VARCHAR(50)"}, // ENUM adalah kasus khusus
+		{"ApplySrc_SrcWithNonNumericMod_TargetNoMod", "GEOMETRY(POINT, 4326)", "GEOMETRY", "postgres", config.ModifierHandlingApplySource, "GEOMETRY"},                  // Modifier sumber tidak transferable, target tidak punya modifier
+		{"ApplySrc_SrcWithNonNumericMod_TargetWithMod", "GEOMETRY(POINT, 4326)", "GEOMETRY(Point)", "postgres", config.ModifierHandlingApplySource, "GEOMETRY(Point)"}, // Modifier sumber tidak transferable, target punya modifiernya sendiri
+		{"ApplySrc_SrcINT_Unsigned_MappedINT_PG", "INT(10) UNSIGNED", "INTEGER", "postgres", config.ModifierHandlingApplySource, "INTEGER"},                                // UNSIGNED diabaikan, (10) diabaikan untuk INTEGER PG
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			syncer := newTestTypeMapperSyncer("any_src_dialect_for_test", tc.dstDialect, logger.Named(tc.name))
-			actual := syncer.applyTypeModifiers(tc.srcTypeRaw, tc.mappedBaseType)
-			assert.Equal(t, tc.expected, actual)
+			// srcDialect dalam newTestTypeMapperSyncer tidak terlalu penting untuk unit test applyTypeModifiers ini,
+			// karena fungsi ini lebih fokus pada dstDialect dan bagaimana modifier diterapkan.
+			// Namun, jika ada logika di applyTypeModifiers yang bergantung pada srcDialect, ini perlu disesuaikan.
+			syncer := newTestTypeMapperSyncer("any_src_for_test", tc.dstDialect, logger.Named(tc.name))
+			actual := syncer.applyTypeModifiers(tc.srcTypeRaw, tc.mappedTypeFromConfig, tc.modHandling)
+			assert.Equal(t, tc.expected, actual, "Test Case: %s\nSrcType: %s\nMappedTypeFromCfg: %s\nDstDialect: %s\nModHandling: %s", tc.name, tc.srcTypeRaw, tc.mappedTypeFromConfig, tc.dstDialect, tc.modHandling)
 		})
 	}
 }

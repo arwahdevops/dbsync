@@ -6,7 +6,6 @@ package integration
 import (
 	"context"
 	"database/sql"
-	"fmt" // Impor fmt untuk t.Logf dengan format
 	"os"
 	"path/filepath"
 	"strings"

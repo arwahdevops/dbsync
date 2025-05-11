@@ -7,7 +7,6 @@ import (
 	"context"
 	"database/sql"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"

@@ -1,10 +1,8 @@
 package config
 
 import (
-	"encoding/json"
-	"errors" // Diperlukan untuk os.IsNotExist
+	// Impor yang tidak lagi dibutuhkan seperti "encoding/json", "os", "errors" sudah dihapus
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -19,6 +17,14 @@ const (
 	SchemaSyncDropCreate SchemaSyncStrategy = "drop_create"
 	SchemaSyncAlter      SchemaSyncStrategy = "alter"
 	SchemaSyncNone       SchemaSyncStrategy = "none"
+)
+
+type ModifierHandlingStrategy string
+
+const (
+	ModifierHandlingApplySource    ModifierHandlingStrategy = "apply_source"
+	ModifierHandlingUseTargetDefined ModifierHandlingStrategy = "use_target_defined"
+	ModifierHandlingIgnoreSource   ModifierHandlingStrategy = "ignore_source"
 )
 
 type Config struct {
@@ -62,10 +68,7 @@ type Config struct {
 	DstUsernameKey   string `env:"DST_USERNAME_KEY" envDefault:"username"`
 	DstPasswordKey   string `env:"DST_PASSWORD_KEY" envDefault:"password"`
 
-	// --- Type Mapping Configuration ---
-	TypeMappingFilePath string `env:"TYPE_MAPPING_FILE_PATH" envDefault:""` // Default kosong
-	// Tambahkan field untuk Opsi 3 jika dipilih:
-	// FailOnInvalidTypeMap bool `env:"FAIL_ON_INVALID_TYPEMAP" envDefault:"true"`
+	// TypeMappingFilePath string `env:"TYPE_MAPPING_FILE_PATH" envDefault:""` // DIHAPUS
 }
 
 type DatabaseConfig struct {
@@ -78,16 +81,31 @@ type DatabaseConfig struct {
 	SSLMode  string `env:"SSLMODE" envDefault:"disable"`
 }
 
+// Definisi StandardTypeMapping, TypeMappingConfigEntry, SpecialMapping, AllTypeMappings
+// tetap sama seperti di file default_typemaps.go karena dibutuhkan oleh provider
+// dan fungsi GetTypeMappingForDialects.
+// Alternatifnya, bisa dipindahkan ke file types.go terpisah dalam package config.
+// Untuk saat ini, biarkan di sini agar mudah direferensikan oleh default_typemaps.go
+// yang berada dalam package yang sama.
+
+type StandardTypeMapping struct {
+	TargetType        string                   `json:"target_type"`
+	ModifierHandling  ModifierHandlingStrategy `json:"modifier_handling,omitempty"`
+	PostgresUsingExpr string                   `json:"postgres_using_expr,omitempty"`
+}
+
 type TypeMappingConfigEntry struct {
-	SourceDialect   string            `json:"source_dialect"`
-	TargetDialect   string            `json:"target_dialect"`
-	Mappings        map[string]string `json:"mappings"`
-	SpecialMappings []SpecialMapping  `json:"special_mappings"`
+	SourceDialect   string                         `json:"source_dialect"`
+	TargetDialect   string                         `json:"target_dialect"`
+	Mappings        map[string]StandardTypeMapping `json:"mappings"`
+	SpecialMappings []SpecialMapping               `json:"special_mappings"`
 }
 
 type SpecialMapping struct {
-	SourceTypePattern string `json:"source_type_pattern"`
-	TargetType        string `json:"target_type"`
+	SourceTypePattern string                   `json:"source_type_pattern"`
+	TargetType        string                   `json:"target_type"`
+	ModifierHandling  ModifierHandlingStrategy `json:"modifier_handling,omitempty"`
+	PostgresUsingExpr string                   `json:"postgres_using_expr,omitempty"`
 }
 
 type AllTypeMappings struct {
@@ -121,76 +139,76 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
-// LoadTypeMappings memuat mapping tipe data dari file JSON.
-// Perubahan: Jika filePath (dari cfg.TypeMappingFilePath) diset dan ada error saat load/parse,
-// fungsi ini akan mengembalikan error tersebut.
-func LoadTypeMappings(filePath string, logger *zap.Logger) error {
-	// Jika cache sudah ada dan filePath yang baru sama dengan yang lama (atau keduanya kosong),
-	// tidak perlu reload. Ini mencegah reload jika fungsi dipanggil berkali-kali dengan path yang sama.
-	// Namun, jika filePath berbeda dari yang di-cache, kita harus reload.
-	// Untuk kesederhanaan, kita akan selalu reload jika filePath tidak kosong,
-	// dan hanya menggunakan cache jika filePath kosong setelah load pertama.
-	// Atau, kita bisa membuat logika cache lebih canggih, tapi untuk sekarang,
-	// asumsikan LoadTypeMappings dipanggil sekali dengan path final.
-
-	// Jika sudah pernah dipanggil dan filePath sekarang kosong, gunakan cache atau state termuat sebelumnya.
-	if loadedTypeMappingsCache != nil && filePath == "" {
-		logger.Debug("External type mappings already processed or path is empty now, skipping reload from file.")
-		return nil
-	}
-	// Reset cache jika filePath baru diberikan (atau load pertama)
-	loadedTypeMappingsCache = nil
-
-
-	if filePath == "" {
-		logger.Info("Type mapping file path (TYPE_MAPPING_FILE_PATH) is not configured. " +
-			"No external type mappings will be loaded. The application will rely on internal fallbacks or direct type usage if dialects are the same.")
-		loadedTypeMappingsCache = &AllTypeMappings{Mappings: []TypeMappingConfigEntry{}} // Inisialisasi kosong
+// LoadTypeMappings sekarang menginisialisasi dari default internal.
+// Parameter filePath diabaikan.
+func LoadTypeMappings(_ string, logger *zap.Logger) error {
+	if loadedTypeMappingsCache != nil {
+		logger.Debug("Internal type mappings already initialized, skipping re-initialization.")
 		return nil
 	}
 
-	logger.Info("Attempting to load custom type mappings from file.", zap.String("path", filePath))
+	logger.Info("Initializing internal default type mappings.")
+	mappings := defaultTypeMappingsProvider() // Panggil fungsi provider dari default_typemaps.go
 
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			// File tidak ada, ini adalah error konfigurasi jika path eksplisit diberikan.
-			logger.Error("Custom type mapping file specified but not found.",
-				zap.String("path", filePath),
-				zap.Error(err))
-			// Kembalikan error agar aplikasi gagal jika file yang dikonfigurasi tidak ada.
-			return fmt.Errorf("custom type mapping file specified at '%s' but not found: %w", filePath, err)
+	// Validasi dan set default untuk ModifierHandling
+	for i, entry := range mappings.Mappings {
+		for key, stdMap := range entry.Mappings {
+			if stdMap.ModifierHandling == "" {
+				stdMap.ModifierHandling = ModifierHandlingApplySource
+			}
+			isValidModifierHandling := false
+			for _, validMH := range []ModifierHandlingStrategy{ModifierHandlingApplySource, ModifierHandlingUseTargetDefined, ModifierHandlingIgnoreSource} {
+				if stdMap.ModifierHandling == validMH {
+					isValidModifierHandling = true
+					break
+				}
+			}
+			if !isValidModifierHandling {
+				logger.Warn("Invalid modifier_handling in internal standard mapping, defaulting to 'apply_source'",
+					zap.String("source_dialect", entry.SourceDialect),
+					zap.String("target_dialect", entry.TargetDialect),
+					zap.String("source_type_key", key),
+					zap.String("invalid_value", string(stdMap.ModifierHandling)))
+				stdMap.ModifierHandling = ModifierHandlingApplySource
+			}
+			mappings.Mappings[i].Mappings[key] = stdMap
 		}
-		// Error lain saat membaca file
-		logger.Error("Failed to read custom type mapping file.",
-			zap.String("path", filePath),
-			zap.Error(err))
-		return fmt.Errorf("failed to read custom type mapping file '%s': %w", filePath, err)
+		for j, spMap := range entry.SpecialMappings {
+			if spMap.ModifierHandling == "" {
+				spMap.ModifierHandling = ModifierHandlingApplySource
+			}
+			isValidModifierHandling := false
+			for _, validMH := range []ModifierHandlingStrategy{ModifierHandlingApplySource, ModifierHandlingUseTargetDefined, ModifierHandlingIgnoreSource} {
+				if spMap.ModifierHandling == validMH {
+					isValidModifierHandling = true
+					break
+				}
+			}
+			if !isValidModifierHandling {
+				logger.Warn("Invalid modifier_handling in internal special mapping, defaulting to 'apply_source'",
+					zap.String("source_dialect", entry.SourceDialect),
+					zap.String("target_dialect", entry.TargetDialect),
+					zap.String("source_type_pattern", spMap.SourceTypePattern),
+					zap.String("invalid_value", string(spMap.ModifierHandling)))
+				spMap.ModifierHandling = ModifierHandlingApplySource
+			}
+			mappings.Mappings[i].SpecialMappings[j] = spMap
+		}
 	}
 
-	var mappings AllTypeMappings
-	if err := json.Unmarshal(data, &mappings); err != nil {
-		logger.Error("Failed to unmarshal custom type mapping file. Check JSON syntax and structure.",
-			zap.String("path", filePath),
-			zap.Error(err))
-		return fmt.Errorf("failed to unmarshal custom type mapping file '%s': %w", filePath, err)
-	}
-
-	loadedTypeMappingsCache = &mappings
-	logger.Info("Successfully loaded custom type mappings from file.",
-		zap.String("path", filePath),
+	loadedTypeMappingsCache = mappings
+	logger.Info("Successfully initialized internal default type mappings.",
 		zap.Int("configurations_loaded", len(loadedTypeMappingsCache.Mappings)))
 	return nil
 }
 
-
 func GetTypeMappingForDialects(srcDialect, dstDialect string) *TypeMappingConfigEntry {
 	if loadedTypeMappingsCache == nil {
-		// Ini seharusnya tidak terjadi jika LoadTypeMappings dipanggil saat startup,
-		// bahkan jika file tidak ada (akan diinisialisasi cache kosong).
-		// Log sebagai warning jika ini terjadi, menandakan potensi masalah urutan inisialisasi.
-		// fmt.Printf("Warning: GetTypeMappingForDialects called before LoadTypeMappings or cache is unexpectedly nil. Src: %s, Dst: %s\n", srcDialect, dstDialect)
-		// Untuk keamanan, return nil. Pemanggil harus menangani ini.
+		// Ini adalah kondisi kritis jika terjadi.
+		// Seharusnya LoadTypeMappings sudah dipanggil sebelumnya.
+		// Pertimbangkan untuk panic atau log fatal di sini jika ini terjadi di luar pengujian.
+		// fmt.Println("FATAL INTERNAL ERROR: GetTypeMappingForDialects called before LoadTypeMappings or cache is unexpectedly nil.")
+		// os.Exit(1)
 		return nil
 	}
 	for _, cfgEntry := range loadedTypeMappingsCache.Mappings {

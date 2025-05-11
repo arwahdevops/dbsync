@@ -3,10 +3,10 @@ package main
 
 import (
 	"context"
-	"errors" // Untuk errors.Is
+	"errors"
 	"flag"
 	"fmt"
-	stdlog "log" // Logger standar Go, digunakan sebelum Zap diinisialisasi
+	stdlog "log"
 	"os"
 	"os/signal"
 	"strings"
@@ -20,45 +20,35 @@ import (
 
 	"github.com/arwahdevops/dbsync/internal/config"
 	"github.com/arwahdevops/dbsync/internal/db"
-	dbsync_logger "github.com/arwahdevops/dbsync/internal/logger" // Alias agar jelas
+	dbsync_logger "github.com/arwahdevops/dbsync/internal/logger"
 	"github.com/arwahdevops/dbsync/internal/metrics"
 	"github.com/arwahdevops/dbsync/internal/secrets"
 	"github.com/arwahdevops/dbsync/internal/server"
-	projectSync "github.com/arwahdevops/dbsync/internal/sync" // Alias untuk menghindari konflik nama
+	projectSync "github.com/arwahdevops/dbsync/internal/sync"
 )
 
 var (
-	// Variabel untuk flag CLI
-	syncDirectionOverride       string
-	batchSizeOverride           int
-	workersOverride             int
-	schemaSyncStrategyOverride  string
-	typeMappingFilePathOverride string
-	// Tambahkan flag lain yang ingin di-override di sini
+	syncDirectionOverride      string
+	batchSizeOverride          int
+	workersOverride            int
+	schemaSyncStrategyOverride string
+	// typeMappingFilePathOverride string // DIHAPUS
 )
 
 const (
-	// Konstanta untuk timeout yang lebih terstruktur
-	vaultCredentialTimeout = 20 * time.Second
-	dbConnectTimeout       = 15 * time.Second // Timeout per upaya koneksi DB
-	dbPingTimeout          = 5 * time.Second
+	vaultCredentialTimeout    = 20 * time.Second
+	dbConnectTimeout          = 15 * time.Second
+	dbPingTimeout             = 5 * time.Second
 	httpServerShutdownTimeout = 10 * time.Second
 )
 
 func main() {
-	// 0. Inisialisasi awal dan parsing flag
-	initFlags() // Pindahkan definisi dan parsing flag ke fungsi terpisah
+	initFlags()
 
-	// 1. Load .env file (jika ada, akan menimpa environment variables yang sudah ada)
-	// `godotenv.Overload` lebih aman karena tidak akan menimpa var env yang sudah diset secara eksplisit.
-	// Jika ingin .env menimpa var env sistem, gunakan `godotenv.Load`.
-	// Untuk aplikasi CLI, `Overload` biasanya lebih intuitif.
 	if err := godotenv.Overload(".env"); err != nil {
 		stdlog.Printf("Info: Could not load .env file (this is optional): %v. Relying on explicit environment variables or defaults.\n", err)
 	}
 
-	// 2. Konfigurasi awal untuk logger
-	// Parsing variabel env yang dibutuhkan untuk konfigurasi logger saja.
 	preCfg := &struct {
 		EnableJsonLogging bool `env:"ENABLE_JSON_LOGGING" envDefault:"false"`
 		DebugMode         bool `env:"DEBUG_MODE" envDefault:"false"`
@@ -67,63 +57,46 @@ func main() {
 		stdlog.Fatalf("FATAL: Failed to parse pre-configuration for logger: %v", err)
 	}
 
-	// 3. Inisialisasi Zap logger global
 	if err := dbsync_logger.Init(preCfg.DebugMode, preCfg.EnableJsonLogging); err != nil {
 		stdlog.Fatalf("FATAL: Failed to initialize logger: %v", err)
 	}
-	// Defer sync logger untuk memastikan semua buffer log ditulis sebelum exit.
 	defer func() {
 		if err := dbsync_logger.Log.Sync(); err != nil {
-			// Jangan Fatal di sini karena mungkin sudah dalam proses shutdown karena error lain.
-			// Cukup log ke stderr jika Zap sync gagal.
 			stdlog.Printf("Error syncing Zap logger: %v\n", err)
 		}
 	}()
 
-	// Mulai menggunakan Zap logger dari sini
-	appLogger := dbsync_logger.Log // Alias untuk kemudahan
+	appLogger := dbsync_logger.Log
 
-	// 4. Load dan validasi konfigurasi aplikasi utama
 	cfg, err := config.Load()
 	if err != nil {
 		appLogger.Fatal("Configuration loading error from environment", zap.Error(err))
 	}
 
-	// Terapkan override dari flag CLI setelah konfigurasi dari env dimuat
-	applyCliOverrides(cfg, appLogger) // Berikan logger untuk mencatat override
+	applyCliOverrides(cfg, appLogger)
 
-	// Muat pemetaan tipe data dari file (path bisa di-override oleh CLI)
-	if err := config.LoadTypeMappings(cfg.TypeMappingFilePath, appLogger); err != nil {
-		// Jika LoadTypeMappings mengembalikan error, itu berarti file path dikonfigurasi
-		// tapi ada masalah saat memuatnya. Ini harus dianggap fatal.
-		appLogger.Fatal("Failed to load custom type mappings from configured file. Please check the file path and its content.",
-			zap.String("configured_path", cfg.TypeMappingFilePath),
-			zap.Error(err))
+	// Muat pemetaan tipe data internal
+	// Parameter string kosong karena path file tidak lagi digunakan.
+	if err := config.LoadTypeMappings("", appLogger); err != nil {
+		appLogger.Fatal("Failed to initialize internal type mappings.", zap.Error(err))
 	}
 
-	logFinalConfig(cfg, appLogger) // Log konfigurasi final yang akan digunakan
+	logFinalConfig(cfg, appLogger)
 
-	// 5. Setup context untuk graceful shutdown
-	// Context utama untuk seluruh aplikasi.
-	// `stop` adalah fungsi yang akan dipanggil untuk membatalkan context ini.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop() // Pastikan stop dipanggil saat main() selesai, untuk membersihkan resources context.
+	defer stop()
 
-	// 6. Initialize Metrics Store
 	metricsStore := metrics.NewMetricsStore()
 
-	// 7. Initialize Secret Manager (Vault)
 	vaultMgr, vaultErr := secrets.NewVaultManager(cfg, appLogger)
 	if vaultErr != nil {
-		if cfg.VaultEnabled { // Hanya fatal jika Vault memang diaktifkan
+		if cfg.VaultEnabled {
 			appLogger.Fatal("Failed to initialize Vault secret manager", zap.Error(vaultErr))
 		} else {
-			// Jika Vault tidak diaktifkan, error inisialisasi mungkin karena konfigurasi default yang salah,
-			// tapi tidak fatal.
 			appLogger.Warn("Could not initialize Vault secret manager (Vault is not enabled or config error)", zap.Error(vaultErr))
 		}
 	}
-	availableSecretManagers := make([]secrets.SecretManager, 0, 1) // Kapasitas 1 jika hanya Vault
+	availableSecretManagers := make([]secrets.SecretManager, 0, 1)
 	if vaultMgr != nil && vaultMgr.IsEnabled() {
 		availableSecretManagers = append(availableSecretManagers, vaultMgr)
 		appLogger.Info("Vault secret manager is active.")
@@ -131,7 +104,6 @@ func main() {
 		appLogger.Info("Vault secret manager is not active.")
 	}
 
-	// 8. Load Database Credentials
 	appLogger.Info("Loading database credentials...")
 	srcCreds, srcCredsErr := loadCredentials(ctx, cfg, &cfg.SrcDB, "source", cfg.SrcSecretPath, cfg.SrcUsernameKey, cfg.SrcPasswordKey, availableSecretManagers, appLogger)
 	if srcCredsErr != nil {
@@ -142,11 +114,10 @@ func main() {
 		appLogger.Fatal("Failed to load destination DB credentials", zap.Error(dstCredsErr))
 	}
 
-	// 9. Initialize Database Connections (dengan retry)
 	appLogger.Info("Connecting to databases...")
 	var srcConn, dstConn *db.Connector
-	var dbWg sync.WaitGroup // WaitGroup untuk menunggu koneksi selesai
-	var srcErrDB, dstErrDB error // Error spesifik untuk setiap koneksi
+	var dbWg sync.WaitGroup
+	var srcErrDB, dstErrDB error
 
 	dbWg.Add(2)
 	go func() {
@@ -157,7 +128,7 @@ func main() {
 		defer dbWg.Done()
 		dstConn, dstErrDB = connectDBWithRetry(ctx, cfg.DstDB, dstCreds.Username, dstCreds.Password, cfg, "destination", metricsStore, appLogger)
 	}()
-	dbWg.Wait() // Tunggu kedua goroutine koneksi selesai
+	dbWg.Wait()
 
 	if srcErrDB != nil {
 		appLogger.Fatal("Failed to establish source DB connection", zap.Error(srcErrDB))
@@ -166,7 +137,6 @@ func main() {
 		appLogger.Fatal("Failed to establish destination DB connection", zap.Error(dstErrDB))
 	}
 
-	// Defer penutupan koneksi DB
 	defer func() {
 		appLogger.Info("Closing database connections...")
 		if srcConn != nil {
@@ -185,7 +155,6 @@ func main() {
 		}
 	}()
 
-	// 10. Optimalkan connection pool untuk setiap koneksi
 	appLogger.Info("Optimizing database connection pools.")
 	if err := srcConn.Optimize(cfg.ConnPoolSize, cfg.ConnMaxLifetime); err != nil {
 		appLogger.Warn("Failed to optimize source DB connection pool", zap.Error(err))
@@ -194,9 +163,6 @@ func main() {
 		appLogger.Warn("Failed to optimize destination DB connection pool", zap.Error(err))
 	}
 
-	// 11. Start HTTP Server untuk metrik dan health checks
-	// Jalankan di goroutine agar tidak memblokir proses sinkronisasi utama.
-	// Context `ctx` akan digunakan oleh server HTTP untuk graceful shutdown.
 	httpServerWg := &sync.WaitGroup{}
 	httpServerWg.Add(1)
 	go func() {
@@ -205,55 +171,41 @@ func main() {
 		appLogger.Info("HTTP server has shut down.")
 	}()
 
-
-	// 12. Buat dan jalankan proses sinkronisasi utama
 	appLogger.Info("Initializing synchronization orchestrator...")
 	syncer := projectSync.NewOrchestrator(srcConn, dstConn, cfg, appLogger, metricsStore)
 
 	appLogger.Info("Starting main database synchronization process...")
-	results := syncer.Run(ctx) // results adalah map[string]projectSync.SyncResult
+	results := syncer.Run(ctx)
 
-	// 13. Proses dan log hasil sinkronisasi
 	appLogger.Info("Main synchronization process finished. Processing results...")
 	exitCode := processSyncResults(results, appLogger)
 
-	// 14. Tunggu sinyal shutdown atau penyelesaian
-	// Jika sinkronisasi selesai tanpa interupsi eksternal (Ctrl+C), kita masih ingin
-	// menunggu sinyal tersebut untuk shutdown server HTTP, atau jika ada proses background lain.
-	// Jika `syncer.Run(ctx)` selesai karena `ctx` dibatalkan, blok ini akan langsung dilewati.
-	if ctx.Err() == nil { // Jika context *belum* dibatalkan
+	if ctx.Err() == nil {
 		appLogger.Info("Synchronization logic completed. Waiting for shutdown signal (Ctrl+C or SIGTERM) to stop HTTP server...")
-		<-ctx.Done() // Blok hingga sinyal diterima atau `stop()` dipanggil secara manual
+		<-ctx.Done()
 		appLogger.Info("Shutdown signal received after sync completion.")
 	} else {
 		appLogger.Info("Shutdown signal received during or after synchronization process. Proceeding with cleanup.", zap.Error(ctx.Err()))
 	}
 
-	// Panggil `stop()` secara eksplisit untuk memastikan semua turunan context juga dibatalkan,
-	// meskipun `signal.NotifyContext` juga melakukannya. Ini juga berguna jika ada pembatalan manual.
 	stop()
 
-	// Tunggu server HTTP selesai shutdown (jika masih berjalan)
 	appLogger.Info("Waiting for HTTP server to complete shutdown...")
-	httpServerWg.Wait() // Tunggu goroutine server.RunHTTPServer selesai
+	httpServerWg.Wait()
 
 	appLogger.Info("Application shutdown complete.", zap.Int("exit_code", exitCode))
 	os.Exit(exitCode)
 }
 
-// initFlags mendefinisikan dan mem-parse flag command-line.
 func initFlags() {
 	flag.StringVar(&syncDirectionOverride, "sync-direction", "", "Override SYNC_DIRECTION (e.g., mysql-to-postgres)")
 	flag.IntVar(&batchSizeOverride, "batch-size", 0, "Override BATCH_SIZE (must be > 0)")
 	flag.IntVar(&workersOverride, "workers", 0, "Override WORKERS (must be > 0)")
 	flag.StringVar(&schemaSyncStrategyOverride, "schema-strategy", "", "Override SCHEMA_SYNC_STRATEGY (drop_create, alter, none)")
-	flag.StringVar(&typeMappingFilePathOverride, "type-map-file", "", "Override TYPE_MAPPING_FILE_PATH")
-	// ... tambahkan definisi flag lainnya di sini ...
+	// flag.StringVar(&typeMappingFilePathOverride, "type-map-file", "", "Override TYPE_MAPPING_FILE_PATH") // DIHAPUS
 	flag.Parse()
 }
 
-// applyCliOverrides menerapkan nilai dari flag CLI ke struct Config.
-// Menggunakan logger untuk mencatat override yang dilakukan.
 func applyCliOverrides(cfg *config.Config, logger *zap.Logger) {
 	if syncDirectionOverride != "" {
 		logger.Info("Overriding SYNC_DIRECTION with CLI flag", zap.String("env_value", cfg.SyncDirection), zap.String("cli_value", syncDirectionOverride))
@@ -279,14 +231,14 @@ func applyCliOverrides(cfg *config.Config, logger *zap.Logger) {
 				zap.String("allowed_values", fmt.Sprintf("%s, %s, %s", config.SchemaSyncDropCreate, config.SchemaSyncAlter, config.SchemaSyncNone)))
 		}
 	}
+	/* // DIHAPUS
 	if typeMappingFilePathOverride != "" {
 		logger.Info("Overriding TYPE_MAPPING_FILE_PATH with CLI flag", zap.String("env_value", cfg.TypeMappingFilePath), zap.String("cli_value", typeMappingFilePathOverride))
 		cfg.TypeMappingFilePath = typeMappingFilePathOverride
 	}
-	// ... terapkan override flag lainnya ...
+	*/
 }
 
-// logFinalConfig mencatat konfigurasi final yang digunakan.
 func logFinalConfig(cfg *config.Config, logger *zap.Logger) {
 	srcPassSource := "not set"
 	if cfg.SrcDB.Password != "" {
@@ -306,7 +258,7 @@ func logFinalConfig(cfg *config.Config, logger *zap.Logger) {
 		zap.Int("batch_size", cfg.BatchSize),
 		zap.Int("workers", cfg.Workers),
 		zap.String("schema_strategy", string(cfg.SchemaSyncStrategy)),
-		zap.String("type_mapping_file_path", cfg.TypeMappingFilePath),
+		// zap.String("type_mapping_file_path", cfg.TypeMappingFilePath), // DIHAPUS
 		zap.String("src_dialect", cfg.SrcDB.Dialect), zap.String("src_host", cfg.SrcDB.Host), zap.Int("src_port", cfg.SrcDB.Port), zap.String("src_user", cfg.SrcDB.User), zap.String("src_password_source", srcPassSource), zap.String("src_dbname", cfg.SrcDB.DBName), zap.String("src_sslmode", cfg.SrcDB.SSLMode),
 		zap.String("dst_dialect", cfg.DstDB.Dialect), zap.String("dst_host", cfg.DstDB.Host), zap.Int("dst_port", cfg.DstDB.Port), zap.String("dst_user", cfg.DstDB.User), zap.String("dst_password_source", dstPassSource), zap.String("dst_dbname", cfg.DstDB.DBName), zap.String("dst_sslmode", cfg.DstDB.SSLMode),
 		zap.Duration("table_timeout", cfg.TableTimeout), zap.Bool("skip_failed_tables", cfg.SkipFailedTables), zap.Bool("disable_fk_during_sync", cfg.DisableFKDuringSync),
@@ -320,7 +272,7 @@ func logFinalConfig(cfg *config.Config, logger *zap.Logger) {
 	)
 }
 
-// loadCredentials memuat kredensial dari env var atau secret manager.
+// loadCredentials (fungsi tetap sama)
 func loadCredentials(
 	ctx context.Context,
 	cfg *config.Config,
@@ -344,34 +296,30 @@ func loadCredentials(
 	}
 	log.Info("Password not found in direct environment variable for this DB. Checking secret managers...")
 
-	if !cfg.VaultEnabled || secretPath == "" { // Periksa juga apakah Vault di-enable
+	if !cfg.VaultEnabled || secretPath == "" {
 		log.Info("Vault is not enabled or secret path is not configured for this DB. Cannot use Vault.", zap.Bool("vault_enabled_cfg", cfg.VaultEnabled), zap.String("secret_path_cfg", secretPath))
-		// Jika tidak ada password & Vault tidak bisa digunakan, ini error.
 		return nil, fmt.Errorf("password for %s DB not found in environment variables, and Vault is not enabled or secret path is not configured", dbLabel)
 	}
-
 
 	if len(secretManagers) == 0 {
 		log.Error("Vault is enabled and secret path is configured, but no secret managers were successfully initialized or made available.")
 		return nil, fmt.Errorf("vault is enabled for %s DB, but no active secret manager found (initialization might have failed)", dbLabel)
 	}
 
-	for _, sm := range secretManagers { // Harusnya hanya ada VaultManager di sini jika hanya Vault yang diimplementasikan
+	for _, sm := range secretManagers {
 		log.Info("Attempting to retrieve credentials from configured secret manager.",
 			zap.String("manager_type", fmt.Sprintf("%T", sm)),
 			zap.String("path_or_id", secretPath),
 		)
 		getCtx, cancel := context.WithTimeout(ctx, vaultCredentialTimeout)
 		creds, err := sm.GetCredentials(getCtx, secretPath, usernameKey, passwordKey)
-		cancel() // Selalu panggil cancel
+		cancel()
 
 		if err == nil && creds != nil {
 			if creds.Password == "" {
 				log.Error("Retrieved credentials from secret manager, but password field is empty.")
 				return nil, fmt.Errorf("password for %s DB from %T is empty", dbLabel, sm)
 			}
-			// Jika username dari secret kosong, gunakan dari config DB (env var)
-			// Ini sudah dicek di awal bahwa dbCfg.User tidak kosong.
 			if creds.Username == "" {
 				log.Warn("Username field empty in retrieved secret. Falling back to DB config username from environment variable.",
 					zap.String("db_config_user", dbCfg.User))
@@ -386,26 +334,25 @@ func loadCredentials(
 		)
 	}
 
-	// Jika loop selesai tanpa hasil
 	log.Error("Failed to retrieve credentials from all configured/enabled secret managers for the specified path.", zap.String("path_or_id", secretPath))
 	return nil, fmt.Errorf("could not load credentials for %s DB using Vault. Path: '%s'", dbLabel, secretPath)
 }
 
-// connectDBWithRetry mencoba menghubungkan ke DB dengan logika retry.
+// connectDBWithRetry (fungsi tetap sama)
 func connectDBWithRetry(
 	ctx context.Context,
 	dbCfg config.DatabaseConfig,
 	username string,
 	password string,
-	appCfg *config.Config, // Pass cfg aplikasi utama untuk MaxRetries, RetryInterval
+	appCfg *config.Config,
 	dbLabel string,
 	metricsStore *metrics.Store,
 	logger *zap.Logger,
 ) (*db.Connector, error) {
-	gl := dbsync_logger.GetGormLogger() // Dapatkan GORM logger wrapper
+	gl := dbsync_logger.GetGormLogger()
 	var lastErr error
 
-	dsn := buildDSN(dbCfg, username, password, logger) // Berikan logger ke buildDSN
+	dsn := buildDSN(dbCfg, username, password, logger)
 	if dsn == "" {
 		err := fmt.Errorf("could not build DSN for %s DB (unsupported dialect: %s)", dbLabel, dbCfg.Dialect)
 		metricsStore.SyncErrorsTotal.WithLabelValues("connection", dbLabel).Inc()
@@ -414,7 +361,6 @@ func connectDBWithRetry(
 
 	for i := 0; i <= appCfg.MaxRetries; i++ {
 		attemptStartTime := time.Now()
-		// Tunggu sebelum retry (kecuali percobaan pertama)
 		if i > 0 {
 			logFields := []zap.Field{
 				zap.String("db", dbLabel),
@@ -427,7 +373,7 @@ func connectDBWithRetry(
 			timer := time.NewTimer(appCfg.RetryInterval)
 			select {
 			case <-timer.C:
-			case <-ctx.Done(): // Periksa context utama
+			case <-ctx.Done():
 				timer.Stop()
 				errMsg := fmt.Errorf("context cancelled while waiting to retry connection to %s DB (attempt %d/%d): %w; last error: %v", dbLabel, i+1, appCfg.MaxRetries+1, ctx.Err(), lastErr)
 				metricsStore.SyncErrorsTotal.WithLabelValues("connection_cancelled", dbLabel).Inc()
@@ -445,18 +391,17 @@ func connectDBWithRetry(
 			zap.Int("attempt", i+1),
 			zap.Int("max_attempts", appCfg.MaxRetries+1))
 
-		// Context dengan timeout untuk satu upaya koneksi
 		connectAttemptCtx, connectAttemptCancel := context.WithTimeout(ctx, dbConnectTimeout)
-		conn, err := db.New(dbCfg.Dialect, dsn, gl) // db.New tidak menerima context, GORM handle di internal
-		connectAttemptCancel() // Cancel setelah db.New selesai atau timeout
+		conn, err := db.New(dbCfg.Dialect, dsn, gl)
+		connectAttemptCancel()
 
 		if err != nil {
-			if errors.Is(connectAttemptCtx.Err(), context.DeadlineExceeded) { // Cek apakah timeout upaya koneksi
+			if errors.Is(connectAttemptCtx.Err(), context.DeadlineExceeded) {
 				lastErr = fmt.Errorf("connect attempt %d for %s DB timed out after %v: %w", i+1, dbLabel, dbConnectTimeout, err)
-			} else if errors.Is(ctx.Err(), context.Canceled) { // Cek apakah context utama dibatalkan
+			} else if errors.Is(ctx.Err(), context.Canceled) {
 				lastErr = fmt.Errorf("context cancelled during connect attempt %d for %s DB: %w; underlying error: %v", i+1, dbLabel, ctx.Err(), err)
 				metricsStore.SyncErrorsTotal.WithLabelValues("connection_cancelled", dbLabel).Inc()
-				return nil, lastErr // Keluar segera jika context utama dibatalkan
+				return nil, lastErr
 			} else {
 				lastErr = fmt.Errorf("connect attempt %d for %s DB failed: %w", i+1, dbLabel, err)
 			}
@@ -468,7 +413,7 @@ func connectDBWithRetry(
 		pingAttemptCancel()
 
 		if pingErr != nil {
-			_ = conn.Close() // Tutup koneksi yang gagal ping
+			_ = conn.Close()
 			if errors.Is(pingAttemptCtx.Err(), context.DeadlineExceeded) {
 				lastErr = fmt.Errorf("ping attempt %d for %s DB timed out after %v: %w", i+1, dbLabel, dbPingTimeout, pingErr)
 			} else if errors.Is(ctx.Err(), context.Canceled) {
@@ -495,8 +440,7 @@ func connectDBWithRetry(
 	return nil, fmt.Errorf("failed to connect to %s DB (%s at %s:%d) after %d attempts: %w", dbLabel, dbCfg.Dialect, dbCfg.Host, dbCfg.Port, appCfg.MaxRetries+1, lastErr)
 }
 
-
-// buildDSN membangun Data Source Name (DSN) string.
+// buildDSN (fungsi tetap sama)
 func buildDSN(cfg config.DatabaseConfig, username, password string, logger *zap.Logger) string {
 	host := cfg.Host
 	port := cfg.Port
@@ -507,21 +451,18 @@ func buildDSN(cfg config.DatabaseConfig, username, password string, logger *zap.
 	case "mysql":
 		sslParam := "tls=false"
 		if sslmode != "disable" && sslmode != "" {
-			// Mapping SSL mode ke parameter DSN MySQL
-			// https://github.com/go-sql-driver/mysql#tls
-			// "true", "false", "skip-verify", "preferred", atau nama profil TLS yang terdaftar.
 			switch sslmode {
-			case "require", "verify-ca", "verify-full": // Untuk ini, idealnya gunakan profil TLS kustom.
-				sslParam = "tls=true"                 // Minimal TLS, verifikasi tergantung server & client config.
+			case "require", "verify-ca", "verify-full":
+				sslParam = "tls=true"
 				if sslmode == "verify-ca" || sslmode == "verify-full" {
 					logger.Warn("MySQL SSL modes 'verify-ca' or 'verify-full' might require a pre-registered TLS config name in the DSN for full effect (e.g., 'customSSLProfile') instead of just 'tls=true'. Ensure client and server are properly configured for verification.",
 						zap.String("sslmode_used", sslmode))
 				}
-			case "allow", "prefer": // MySQL tidak punya 'allow'. 'preferred' paling dekat.
-				sslParam = "tls=preferred" // Coba TLS, fallback ke non-TLS jika gagal.
+			case "allow", "prefer":
+				sslParam = "tls=preferred"
 			case "skip-verify":
 				sslParam = "tls=skip-verify"
-			default: // Jika ada nilai lain, default ke 'tls=true' sebagai tindakan aman.
+			default:
 				sslParam = "tls=true"
 				logger.Warn("Unknown MySQL SSL mode, defaulting DSN tls parameter to 'true'.", zap.String("unknown_sslmode", sslmode))
 			}
@@ -539,7 +480,7 @@ func buildDSN(cfg config.DatabaseConfig, username, password string, logger *zap.
 	}
 }
 
-// processSyncResults memproses hasil sinkronisasi dan menentukan exit code.
+// processSyncResults (fungsi tetap sama)
 func processSyncResults(results map[string]projectSync.SyncResult, logger *zap.Logger) (exitCode int) {
 	successCount := 0
 	schemaFailCount := 0
@@ -550,7 +491,7 @@ func processSyncResults(results map[string]projectSync.SyncResult, logger *zap.L
 
 	if totalTables == 0 {
 		logger.Warn("Sync finished, but no tables were found in the source or all were filtered out.")
-		return 0 // Exit code 0 karena tidak ada error, hanya tidak ada pekerjaan
+		return 0
 	}
 
 	var schemaFailedTables, dataFailedTables, constraintFailedTables []string
@@ -597,7 +538,7 @@ func processSyncResults(results map[string]projectSync.SyncResult, logger *zap.L
 			constraintFailedTables = append(constraintFailedTables, table)
 			level = zap.WarnLevel
 			statusMsg = "Table data sync SUCCEEDED, but applying constraints/indexes FAILED."
-			successCount++ // Tetap dihitung sukses jika hanya constraint yg gagal
+			successCount++
 		} else {
 			successCount++
 		}
@@ -609,7 +550,7 @@ func processSyncResults(results map[string]projectSync.SyncResult, logger *zap.L
 		zap.Int("tables_fully_successful_or_data_success_with_constraint_fail", successCount),
 		zap.Int("tables_with_schema_failures", schemaFailCount),
 		zap.Int("tables_with_data_failures", dataFailCount),
-		zap.Int("tables_with_only_constraint_failures", constraintFailCount), // Diperjelas
+		zap.Int("tables_with_only_constraint_failures", constraintFailCount),
 		zap.Int("tables_skipped_overall_processing", skippedCount),
 	)
 	if len(schemaFailedTables) > 0 {
@@ -622,22 +563,21 @@ func processSyncResults(results map[string]projectSync.SyncResult, logger *zap.L
 		logger.Warn("Constraint/Index application failures occurred for tables (data was synced successfully):", zap.Strings("tables", constraintFailedTables))
 	}
 
-	// Menentukan exit code berdasarkan tingkat keparahan error
 	if schemaFailCount > 0 || dataFailCount > 0 {
 		logger.Error("Overall synchronization: COMPLETED WITH CRITICAL ERRORS (Schema or Data Failures).")
-		return 1 // Error paling parah
+		return 1
 	}
 	if constraintFailCount > 0 {
 		logger.Warn("Overall synchronization: COMPLETED WITH CONSTRAINT/INDEX APPLICATION ERRORS (data was synced successfully).")
-		return 2 // Error, tapi tidak se-kritis kegagalan data/skema
+		return 2
 	}
 	if skippedCount == totalTables && totalTables > 0 {
 		logger.Warn("Overall synchronization: COMPLETED, BUT ALL TABLES WERE SKIPPED (check logs for reasons).")
-		return 3 // Bukan error, tapi mungkin tidak sesuai harapan
+		return 3
 	}
-	if skippedCount > 0 { // Jika ada yang sukses dan ada yang diskip
+	if skippedCount > 0 {
 		logger.Info("Overall synchronization: COMPLETED (some tables may have been skipped).")
-		return 0 // Anggap sukses jika ada yang berhasil dan tidak ada error kritis
+		return 0
 	}
 
 	logger.Info("Overall synchronization: COMPLETED SUCCESSFULLY.")

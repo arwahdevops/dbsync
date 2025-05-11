@@ -15,17 +15,17 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
-	"go.uber.org/zap" // <<< IMPOR ZAP
+	"go.uber.org/zap"
 
 	"github.com/arwahdevops/dbsync/internal/config"
 	dbsync_db "github.com/arwahdevops/dbsync/internal/db"
 	dbsync_logger "github.com/arwahdevops/dbsync/internal/logger"
 	dbsync_metrics "github.com/arwahdevops/dbsync/internal/metrics"
 	dbsync_sync "github.com/arwahdevops/dbsync/internal/sync"
-	"github.com/arwahdevops/dbsync/internal/utils" // <<< IMPOR UTILS
+	"github.com/arwahdevops/dbsync/internal/utils"
 )
 
-// getPgActualDataTypeTestHelper (helper yang sudah kita definisikan sebelumnya)
+// getPgActualDataTypeTestHelper (tetap sama)
 func getPgActualDataTypeTestHelper(colDataType, colUdtName string) string {
 	actual := strings.ToLower(colUdtName)
 	if actual == "" ||
@@ -69,16 +69,22 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 	testLogger.Info("Setting up source database schema and data...")
 	sourceTablesToDrop := []string{"comments", "post_categories", "posts", "categories", "users"}
 	for _, tableName := range sourceTablesToDrop {
-		// Gunakan utils.QuoteIdentifier
 		quotedTableName := utils.QuoteIdentifier(tableName, sourceDB.Dialect)
 		if err := sourceDB.DB.Exec("DROP TABLE IF EXISTS " + quotedTableName + ";").Error; err != nil {
-			// Gunakan logger yang sudah di-scope (testLogger) dan field zap
 			testLogger.Warn("Failed to drop source table (may not exist)",
 				zap.String("table", tableName),
 				zap.Error(err))
 		}
 	}
-	sourceSchemaFilePath := filepath.Join("..", "source_schema.sql")
+	// === PERUBAHAN PATH DI SINI ===
+	// Mengasumsikan source_schema.sql ada di direktori yang sama dengan file tes ini (tests/integration/)
+	sourceSchemaFilePath := "source_schema.sql" // Atau filepath.Join(".", "source_schema.sql")
+	// Jika Anda ingin lebih eksplisit dengan path relatif dari root proyek:
+	// cwd, _ := os.Getwd() // Dapat membantu untuk debugging path
+	// testLogger.Info("Current working directory for test", zap.String("cwd", cwd))
+	// sourceSchemaFilePath := filepath.Join("tests", "integration", "source_schema.sql") // Jika dijalankan dari root proyek
+	// Namun, karena `go test` biasanya dijalankan dari direktori package, path relatif terhadap file tes lebih aman.
+
 	executeSQLFile(t, sourceDB.DB, sourceSchemaFilePath)
 	testLogger.Info("Source database setup complete.", zap.String("schema_file", sourceSchemaFilePath))
 
@@ -262,7 +268,6 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 		}
 		require.NoError(t, errQuery, "Error querying for FK %s(%s) -> %s(%s) (hint: %s)", fromTable, fromColumn, toTable, toColumn, fkNameHint)
 		assert.NotEmpty(t, constraintName, "Foreign key from %s(%s) to %s(%s) (hint: %s) should exist and have a name", fromTable, fromColumn, toTable, toColumn, fkNameHint)
-		// Gunakan fmt.Sprintf untuk t.Logf jika menggunakan argumen tambahan
 		t.Logf("Found FK from %s(%s) to %s(%s) with name: %s (Hint was: '%s')", fromTable, fromColumn, toTable, toColumn, constraintName, fkNameHint)
 	}
 

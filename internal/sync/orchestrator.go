@@ -1,18 +1,20 @@
+// internal/sync/orchestrator.go
+
 package sync
 
 import (
 	"context"
 	"fmt"
-	"sort" // Diperlukan untuk mengurutkan map keys untuk logging deterministik (opsional)
+	"sort"
 	"time"
 
 	"go.uber.org/zap"
-	"gorm.io/gorm" // Diperlukan untuk method getDestinationTablePKs
+	"gorm.io/gorm"
 
 	"github.com/arwahdevops/dbsync/internal/config"
 	"github.com/arwahdevops/dbsync/internal/db"
 	"github.com/arwahdevops/dbsync/internal/metrics"
-	"github.com/arwahdevops/dbsync/internal/utils" // Untuk QuoteIdentifier di getDestinationTablePKs
+	"github.com/arwahdevops/dbsync/internal/utils"
 )
 
 // Orchestrator mengelola keseluruhan proses sinkronisasi.
@@ -21,7 +23,7 @@ type Orchestrator struct {
 	dstConn      *db.Connector
 	cfg          *config.Config
 	logger       *zap.Logger
-	schemaSyncer SchemaSyncerInterface // Tetap menggunakan interface untuk schema syncer utama
+	schemaSyncer SchemaSyncerInterface
 	metrics      *metrics.Store
 }
 
@@ -34,12 +36,12 @@ func NewOrchestrator(srcConn, dstConn *db.Connector, cfg *config.Config, logger 
 		dstConn:      dstConn,
 		cfg:          cfg,
 		logger:       logger.Named("orchestrator"),
-		schemaSyncer: NewSchemaSyncer(
+		schemaSyncer: NewSchemaSyncer( // schemaSyncer untuk operasi skema sumber -> tujuan
 			srcConn.DB,
 			dstConn.DB,
 			srcConn.Dialect,
 			dstConn.Dialect,
-			logger,
+			logger, // Logger utama akan di-scope lebih lanjut oleh SchemaSyncer
 		),
 		metrics: metricsStore,
 	}
@@ -57,6 +59,7 @@ func (f *Orchestrator) Run(ctx context.Context) map[string]SyncResult {
 	defer f.metrics.SyncRunning.Set(0)
 
 	results := make(map[string]SyncResult)
+	// listSourceTables sudah mengurutkan tabel secara alfabetis
 	allSourceTables, err := f.listSourceTables(ctx)
 	if err != nil {
 		f.logger.Error("Failed to list source tables", zap.Error(err))
@@ -70,28 +73,33 @@ func (f *Orchestrator) Run(ctx context.Context) map[string]SyncResult {
 		f.metrics.SyncDuration.Observe(time.Since(startTime).Seconds())
 		return results
 	}
-	f.logger.Info("Found source tables", zap.Int("count", len(allSourceTables)), zap.Strings("tables", allSourceTables))
+	f.logger.Info("Found source tables (alphabetical order initially)", zap.Int("count", len(allSourceTables)), zap.Strings("tables", allSourceTables))
 
-	var tablesToProcess []string
-	if f.cfg.SchemaSyncStrategy == config.SchemaSyncDropCreate || f.cfg.SchemaSyncStrategy == config.SchemaSyncAlter {
-		// Untuk drop_create, urutan sangat penting. Untuk alter, juga bisa penting jika ada ADD FK baru.
-		// Kita akan mengurutkan berdasarkan dependensi FK dari SUMBER.
+	tablesToProcess := allSourceTables // Default ke urutan alfabetis
+	// Hanya lakukan pengurutan topologis jika strategi memerlukannya dan ada >1 tabel
+	if (f.cfg.SchemaSyncStrategy == config.SchemaSyncDropCreate || f.cfg.SchemaSyncStrategy == config.SchemaSyncAlter) && len(allSourceTables) > 1 {
+		f.logger.Info("Attempting to determine table processing order based on FK dependencies from source DB.")
+		// Menggunakan koneksi SUMBER (f.srcConn) untuk mendapatkan dependensi FK
 		orderedTables, orderErr := f.getExecutionOrder(ctx, allSourceTables, f.srcConn)
 		if orderErr != nil {
-			f.logger.Error("Failed to determine table execution order due to FK dependencies. Proceeding with alphabetical order (THIS IS RISKY and may lead to errors).",
-				zap.Error(orderErr))
-			// Fallback: gunakan urutan alfabetis (seperti sebelumnya), tapi ini berisiko.
-			// Atau, bisa juga return error di sini jika urutan sangat kritis.
-			// Untuk saat ini, kita log error dan lanjutkan dengan alphabetical.
-			tablesToProcess = allSourceTables // Sudah diurutkan alfabetis oleh listSourceTables
+			// Jika gagal mengurutkan (misalnya karena siklus), log error dan putuskan bagaimana melanjutkan.
+			// Untuk produksi, mungkin lebih aman gagal jika urutan sangat krusial.
+			// Untuk saat ini, kita log error dan fallback ke urutan alfabetis dengan peringatan.
+			f.logger.Error("Failed to determine FK-based table execution order. Proceeding with alphabetical order. This may cause FK creation errors if 'drop_create' or 'alter' (with new FKs) strategy is used.",
+				zap.Error(orderErr),
+				zap.Strings("fallback_alphabetical_order", allSourceTables))
+			// tablesToProcess tetap allSourceTables (alphabetical)
 		} else {
 			tablesToProcess = orderedTables
 			f.logger.Info("Table processing order determined by FK dependencies.", zap.Strings("ordered_tables", tablesToProcess))
 		}
-	} else {
-		// Untuk strategi 'none', urutan tabel mungkin tidak sekritis itu untuk DDL.
-		tablesToProcess = allSourceTables
+	} else if len(allSourceTables) > 1 { // Log jika ordering diskip padahal ada >1 tabel
+		f.logger.Info("Skipping FK-based table ordering.",
+			zap.String("reason", "Strategy is 'none' or other reason."),
+			zap.String("schema_strategy", string(f.cfg.SchemaSyncStrategy)),
+			zap.Int("table_count", len(allSourceTables)))
 	}
+
 
 	results = f.runTableProcessingPool(ctx, tablesToProcess)
 
@@ -106,133 +114,154 @@ func (f *Orchestrator) Run(ctx context.Context) map[string]SyncResult {
 }
 
 // getExecutionOrder mengurutkan tabel berdasarkan dependensi FK (topological sort).
-// Tabel yang tidak memiliki dependensi keluar (atau hanya ke dirinya sendiri) akan lebih dulu.
+// Graf: node = tabel. Edge U -> V jika V memiliki FK ke U (U harus ada sebelum V).
+// InDegree[V] = jumlah tabel U yang V punya FK ke (jumlah prasyarat untuk V).
 func (f *Orchestrator) getExecutionOrder(ctx context.Context, tableNames []string, dbConn *db.Connector) ([]string, error) {
-	log := f.logger.Named("table-orderer")
-	log.Info("Determining table execution order based on FK dependencies from source.", zap.String("dialect", dbConn.Dialect))
+	log := f.logger.Named("table-orderer").With(zap.String("dialect", dbConn.Dialect))
+	log.Info("Fetching FK dependencies to determine execution order.")
 
-	// dependencies: map[table_name] -> list of tables it has FKs to (outgoing dependencies)
-	dependencies, err := f.schemaSyncer.GetFKDependencies(ctx, dbConn.DB, dbConn.Dialect, tableNames)
+	// fkSourceToTargets: map[table_V_with_FK] -> list of tables U_referenced_by_V
+	fkSourceToTargets, err := f.schemaSyncer.GetFKDependencies(ctx, dbConn.DB, dbConn.Dialect, tableNames)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get FK dependencies: %w", err)
+		return nil, fmt.Errorf("failed to get FK dependencies for ordering: %w", err)
 	}
 
-	// Validasi bahwa semua tabel dari tableNames ada di map dependencies
+	// Adjacency list untuk graf: map[table_U_prerequisite] -> list of tables V_that_depend_on_U
+	adj := make(map[string][]string)
+	inDegree := make(map[string]int) // inDegree[V] = jumlah U yang menjadi prasyarat V
+	tableSet := make(map[string]bool)
+
 	for _, tn := range tableNames {
-		if _, ok := dependencies[tn]; !ok {
-			// Ini seharusnya tidak terjadi jika GetFKDependencies menginisialisasi semua
-			log.Warn("Table from initial list not found in dependency map, adding with no dependencies.", zap.String("table", tn))
-			dependencies[tn] = []string{}
-		}
+		tableSet[tn] = true
+		adj[tn] = []string{}
+		inDegree[tn] = 0
 	}
 
-
-	// reverseDependencies: map[table_name] -> list of tables that have FKs to it (incoming dependencies for processing order)
-	reverseDependencies := make(map[string][]string)
-	inDegree := make(map[string]int)
-
-	for _, tableName := range tableNames {
-		// Inisialisasi untuk semua tabel, bahkan yang tidak punya FK keluar atau masuk
-		if _, ok := reverseDependencies[tableName]; !ok {
-			reverseDependencies[tableName] = []string{}
-		}
-		if _, ok := inDegree[tableName]; !ok {
-			inDegree[tableName] = 0
-		}
+	if f.cfg.DebugMode {
+		// Log fkSourceToTargets dengan key yang diurutkan untuk determinisme
+		sortedFkKeys := make([]string, 0, len(fkSourceToTargets))
+		for k := range fkSourceToTargets { sortedFkKeys = append(sortedFkKeys, k) }
+		sort.Strings(sortedFkKeys)
+		logFkDeps := make(map[string][]string)
+		for _, k := range sortedFkKeys { logFkDeps[k] = fkSourceToTargets[k] }
+		log.Debug("Raw FK dependencies (Table V -> [Tables U it references])", zap.Any("fk_source_to_targets", logFkDeps))
 	}
 
-
-	for depender, depList := range dependencies {
-		// `depender` adalah tabel yang memiliki FK.
-		// `dep` adalah tabel yang dirujuk oleh FK dari `depender`.
-		// Artinya, `dep` harus ada sebelum `depender` bisa dibuat dengan FK-nya.
-		// Jadi, edge di graf dependensi proses adalah `dep` -> `depender`.
-		// `inDegree[depender]` adalah jumlah tabel yang `depender` rujuk.
-		inDegree[depender] = len(depList)
-		for _, dependedOn := range depList {
-			// `dependedOn` adalah tabel yang menjadi prasyarat.
-			// `depender` adalah tabel yang akan bergantung pada `dependedOn`.
-			// Jadi, `dependents[dependedOn]` harus berisi `depender`.
-			if _, ok := reverseDependencies[dependedOn]; !ok {
-				// Jika dependedOn tidak ada di tableNames (FK ke tabel di luar scope), abaikan untuk reverse graph.
-				// Tapi inDegree untuk depender tetap dihitung.
-				log.Debug("FK target is outside the set of tables being synced. Ignoring for reverse dependency graph construction.",
-					zap.String("depender_table", depender),
-					zap.String("fk_target_table", dependedOn))
-				continue
+	// Bangun graf dan hitung in-degree
+	for tableV, referencedTablesU := range fkSourceToTargets {
+		if !tableSet[tableV] { // Seharusnya selalu ada jika fkSourceToTargets dari tableNames
+			log.Warn("TableV from dependency map not in initial table set, skipping its outgoing FKs for graph.", zap.String("tableV", tableV))
+			continue
+		}
+		// tableV memiliki FK ke setiap tableU dalam referencedTablesU.
+		// Ini berarti tableU adalah prasyarat untuk tableV.
+		// Edge di graf dependensi proses adalah tableU -> tableV.
+		for _, tableU := range referencedTablesU {
+			if !tableSet[tableU] {
+				// Jika tabel yang direferensikan (tableU) tidak ada dalam daftar sinkronisasi,
+				// maka dependensi ini tidak relevan untuk pengurutan *internal* set tabel ini.
+				log.Debug("FK target is outside the set of tables being synced. Ignoring for ordering graph construction.",
+					zap.String("table_v_with_fk", tableV),
+					zap.String("fk_target_table_u_external", tableU))
+				continue // Abaikan edge ini
 			}
-			reverseDependencies[dependedOn] = append(reverseDependencies[dependedOn], depender)
+			// Tambahkan edge: tableU -> tableV
+			adj[tableU] = append(adj[tableU], tableV)
+			inDegree[tableV]++ // Tambah in-degree untuk tableV
 		}
 	}
 
-	if f.cfg.DebugMode { // Log detail graf hanya jika debug
-		// Urutkan key map untuk logging yang konsisten (opsional)
-		sortedInDegreeKeys := make([]string, 0, len(inDegree))
-		for k := range inDegree { sortedInDegreeKeys = append(sortedInDegreeKeys, k) }
-		sort.Strings(sortedInDegreeKeys)
-		logInDegree := make(map[string]int)
-		for _, k := range sortedInDegreeKeys { logInDegree[k] = inDegree[k] }
+	if f.cfg.DebugMode {
+		// Log inDegree dan adj dengan key yang diurutkan
+		sortedInDegreeKeys := make([]string, 0, len(inDegree)); for k := range inDegree { sortedInDegreeKeys = append(sortedInDegreeKeys, k) }; sort.Strings(sortedInDegreeKeys)
+		logInDegree := make(map[string]int); for _, k := range sortedInDegreeKeys { logInDegree[k] = inDegree[k] }
 
-		sortedRevDepKeys := make([]string, 0, len(reverseDependencies))
-		for k := range reverseDependencies { sortedRevDepKeys = append(sortedRevDepKeys, k) }
-		sort.Strings(sortedRevDepKeys)
-		logRevDep := make(map[string][]string)
-		for _, k := range sortedRevDepKeys { logRevDep[k] = reverseDependencies[k] }
+		sortedAdjKeys := make([]string, 0, len(adj)); for k := range adj { sortedAdjKeys = append(sortedAdjKeys, k) }; sort.Strings(sortedAdjKeys)
+		logAdj := make(map[string][]string); for _, k := range sortedAdjKeys { logAdj[k] = adj[k] }
 
-		log.Debug("Constructed dependency graph details for topological sort:",
-			zap.Any("outgoing_fk_dependencies (table_X -> [tables_it_refs])", dependencies),
-			zap.Any("effective_in_degree_for_processing_order (table_X_needs_these_many_refs_to_be_processed_first)", logInDegree),
-			zap.Any("reverse_dependencies (table_X_is_refd_by -> [these_tables])", logRevDep),
+		log.Debug("Constructed graph for topological sort:",
+			zap.Any("in_degree (V -> count of U's that are prereq for V)", logInDegree),
+			zap.Any("adjacency_list (U -> list of V's that depend on U)", logAdj),
 		)
 	}
 
-
+	// Inisialisasi antrian dengan node ber-in-degree 0
+	// Iterasi tableNames (yang sudah diurutkan alfabetis) untuk antrian awal yang deterministik
 	queue := make([]string, 0)
-	for tableName, degree := range inDegree {
-		if degree == 0 {
+	for _, tableName := range tableNames {
+		if deg, ok := inDegree[tableName]; ok && deg == 0 {
 			queue = append(queue, tableName)
+		} else if !ok {
+			// Seharusnya semua tabel ada di inDegree map setelah inisialisasi
+			log.Error("Table missing from inDegree map during queue initialization. This is a bug.", zap.String("table", tableName))
 		}
 	}
-	// Urutkan antrian awal secara alfabetis untuk pemrosesan yang lebih deterministik jika ada banyak node dengan in-degree 0
-	sort.Strings(queue)
+	// Antrian awal tidak perlu di-sort lagi karena sumbernya (tableNames) sudah di-sort.
+
+	if f.cfg.DebugMode && len(queue) > 0 {
+		log.Debug("Initial queue for Kahn's algorithm (nodes with in-degree 0):", zap.Strings("queue", queue))
+	}
 
 
 	var sortedOrder []string
+	processedCount := 0
 	for len(queue) > 0 {
-		table := queue[0]
-		queue = queue[1:]
-		sortedOrder = append(sortedOrder, table)
+		// Untuk konsistensi jika beberapa item di antrian bisa diproses,
+		// dan untuk kasus di mana item ditambahkan ke antrian dalam urutan yang tidak terduga,
+		// sortir antrian sebelum mengambil elemen.
+		sort.Strings(queue)
 
-		// Untuk setiap tabel `dependentTable` yang merujuk ke `table` yang baru saja diproses:
-		dependentsOfTable := reverseDependencies[table]
-		// Urutkan dependentsOfTable secara alfabetis untuk konsistensi jika ada beberapa yang in-degree nya jadi 0 bersamaan
-		sort.Strings(dependentsOfTable)
+		tableU := queue[0] // Ambil dari depan
+		queue = queue[1:]  // Hapus dari depan
 
-		for _, dependentTable := range dependentsOfTable {
-			inDegree[dependentTable]--
-			if inDegree[dependentTable] == 0 {
-				queue = append(queue, dependentTable)
-				// Urutkan kembali antrian setiap kali item baru ditambahkan untuk menjaga determinisme
-				// Ini bisa jadi mahal, alternatifnya adalah hanya mengurutkan di awal.
-				// Untuk kebanyakan kasus, urutan antrian tidak krusial selama topologinya benar.
-				// sort.Strings(queue) // Opsional, untuk determinisme absolut
+		sortedOrder = append(sortedOrder, tableU)
+		processedCount++
+
+		if f.cfg.DebugMode {
+			log.Debug("Processing table from queue (Kahn's)", zap.String("table_u", tableU), zap.Int("processed_count", processedCount))
+		}
+
+		// Kurangi in-degree dari semua node yang bergantung pada tableU
+		// Urutkan adj[tableU] untuk pemrosesan yang deterministik
+		dependentsV := adj[tableU]
+		sort.Strings(dependentsV) // Penting untuk determinisme jika beberapa jadi 0
+
+		for _, tableV := range dependentsV {
+			if _, ok := inDegree[tableV]; !ok {
+				// Ini seharusnya tidak terjadi jika semua tabel sudah diinisialisasi di inDegree
+				log.Error("Dependent tableV not found in inDegree map. This is a bug.", zap.String("tableU_prereq", tableU), zap.String("tableV_dependent", tableV))
+				continue
+			}
+			inDegree[tableV]--
+			if f.cfg.DebugMode {
+				log.Debug("Decremented in-degree", zap.String("table_v_dependent_on_u", tableV), zap.Int("new_in_degree", inDegree[tableV]), zap.String("prereq_u_just_processed", tableU))
+			}
+			if inDegree[tableV] == 0 {
+				if f.cfg.DebugMode {
+					log.Debug("Adding to queue as in-degree is now 0", zap.String("table_v_to_add", tableV))
+				}
+				queue = append(queue, tableV)
 			}
 		}
 	}
 
-	if len(sortedOrder) != len(tableNames) {
+	if processedCount != len(tableNames) {
 		var cycleTables []string
-		for tableName, degree := range inDegree {
-			if degree > 0 {
+		// Iterasi tableNames (input asli) untuk menemukan yang tidak terproses
+		for _, tableName := range tableNames {
+			if deg, ok := inDegree[tableName]; ok && deg > 0 {
 				cycleTables = append(cycleTables, tableName)
+			} else if !ok {
+				// Jika tabel tidak ada di inDegree, itu masalah inisialisasi.
+				// Tapi jika ada dan degree bukan >0, dia seharusnya sudah diproses atau in-degree awalnya 0.
 			}
 		}
-		sort.Strings(cycleTables)
+		sort.Strings(cycleTables) // Laporkan secara konsisten
 		log.Error("Circular dependency detected among tables. Cannot determine a strict processing order.",
 			zap.Int("total_tables_in_scope", len(tableNames)),
-			zap.Int("tables_in_sorted_order", len(sortedOrder)),
-			zap.Strings("tables_involved_in_or_affected_by_cycle", cycleTables))
-		return nil, fmt.Errorf("circular FK dependency detected, cannot establish processing order. Tables potentially in cycle: %v", cycleTables)
+			zap.Int("tables_in_sorted_order", processedCount),
+			zap.Strings("tables_involved_in_or_affected_by_cycle (remaining_in_degree > 0)", cycleTables))
+		return nil, fmt.Errorf("circular FK dependency detected. Tables in/affected by cycle: %v", cycleTables)
 	}
 
 	log.Info("Successfully determined table execution order.", zap.Strings("ordered_tables", sortedOrder))
@@ -241,6 +270,7 @@ func (f *Orchestrator) getExecutionOrder(ctx context.Context, tableNames []strin
 
 
 // listSourceTables mengambil daftar tabel dari database sumber.
+// Query sudah mengurutkan berdasarkan nama tabel.
 func (f *Orchestrator) listSourceTables(ctx context.Context) ([]string, error) {
 	var tables []string
 	var err error
@@ -249,31 +279,31 @@ func (f *Orchestrator) listSourceTables(ctx context.Context) ([]string, error) {
 	log := f.logger.With(zap.String("dialect", dialect), zap.String("database", dbCfg.DBName), zap.String("action", "listSourceTables"))
 	log.Info("Listing user tables from source database")
 
-	db := f.srcConn.DB.WithContext(ctx) // Gunakan koneksi sumber
+	db := f.srcConn.DB.WithContext(ctx)
 
 	switch dialect {
 	case "mysql":
 		query := `SELECT table_name FROM information_schema.tables
 				  WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'
-				  ORDER BY table_name;` // MySQL sudah mengurutkan
+				  ORDER BY table_name;`
 		err = db.Raw(query).Scan(&tables).Error
 	case "postgres":
 		query := `SELECT table_name FROM information_schema.tables
 				  WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
 				  AND table_name NOT LIKE 'pg_%' AND table_name NOT LIKE 'sql_%'
-				  ORDER BY table_name;` // Postgres juga mengurutkan
+				  ORDER BY table_name;`
 		err = db.Raw(query).Scan(&tables).Error
 	case "sqlite":
 		query := `SELECT name FROM sqlite_master
 				  WHERE type='table' AND name NOT LIKE 'sqlite_%'
-				  ORDER BY name;` // SQLite juga mengurutkan
+				  ORDER BY name;`
 		err = db.Raw(query).Scan(&tables).Error
 	default:
 		return nil, fmt.Errorf("unsupported dialect for listing tables: %s", dialect)
 	}
 
 	if err != nil {
-		if ctx.Err() != nil { // Cek apakah context dibatalkan
+		if ctx.Err() != nil {
 			log.Error("Context cancelled during table listing", zap.Error(ctx.Err()), zap.NamedError("db_error", err))
 			return nil, fmt.Errorf("context cancelled during table listing: %w (db error: %v)", ctx.Err(), err)
 		}
@@ -281,13 +311,11 @@ func (f *Orchestrator) listSourceTables(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("failed to list tables for database '%s' (%s): %w", dbCfg.DBName, dialect, err)
 	}
 
-	// Tidak perlu sort lagi di sini karena query sudah ORDER BY table_name
 	log.Debug("Table listing successful, already sorted alphabetically by query.", zap.Int("table_count", len(tables)))
 	return tables, nil
 }
 
-// getDestinationTablePKs mengambil Primary Key untuk tabel di database tujuan.
-// Ini adalah method privat dari Orchestrator.
+// getDestinationTablePKs (tetap sama seperti sebelumnya)
 func (f *Orchestrator) getDestinationTablePKs(ctx context.Context, tableName string) ([]string, error) {
 	log := f.logger.With(zap.String("table", tableName), zap.String("dialect", f.dstConn.Dialect), zap.String("action", "getDestinationTablePKs"))
 	log.Debug("Fetching primary keys for destination table")
@@ -334,18 +362,23 @@ func (f *Orchestrator) getDestinationTablePKs(ctx context.Context, tableName str
 					if col.Pk > maxPkOrder { maxPkOrder = col.Pk }
 				}
 			}
-			if maxPkOrder > 0 { // Hanya buat slice jika ada PK
+			if maxPkOrder > 0 {
 				pks = make([]string, maxPkOrder)
+				allPksFound := true
 				for i := 1; i <= maxPkOrder; i++ {
 					if pkName, ok := pkMap[i]; ok {
 						pks[i-1] = pkName
 					} else {
-						// Ini tidak seharusnya terjadi jika Pk continuous
-						return nil, fmt.Errorf("inconsistency in SQLite PK ordinal numbers for table %s, missing Pk order %d", tableName, i)
+						log.Error("Inconsistency in SQLite PK ordinal numbers", zap.String("table", tableName), zap.Int("missing_pk_order", i), zap.Any("pk_map", pkMap))
+						allPksFound = false
+						break
 					}
 				}
+				if !allPksFound {
+					return nil, fmt.Errorf("inconsistency in SQLite PK ordinal numbers for table %s, missing Pk order", tableName)
+				}
 			} else {
-				pks = []string{} // Tidak ada PK
+				pks = []string{}
 			}
 		}
 	default:
@@ -366,3 +399,6 @@ func (f *Orchestrator) getDestinationTablePKs(ctx context.Context, tableName str
     }
 	return pks, nil
 }
+
+// --- orchestrator_pool.go dan orchestrator_table_processor.go TIDAK PERLU DIUBAH ---
+// --- orchestrator_data_sync.go TIDAK PERLU DIUBAH untuk logika pengurutan tabel ---

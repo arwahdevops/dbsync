@@ -78,7 +78,7 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 				zap.Error(err))
 		}
 	}
-	sourceSchemaFilePath := filepath.Join("..", "testdata", "mysql_to_pg_create", "source_schema.sql")
+	sourceSchemaFilePath := filepath.Join("..", "source_schema.sql")
 	executeSQLFile(t, sourceDB.DB, sourceSchemaFilePath)
 	testLogger.Info("Source database setup complete.", zap.String("schema_file", sourceSchemaFilePath))
 

@@ -4,30 +4,14 @@ package sync
 import (
 	"context"
 	"fmt"
-	"sync"
+	"sync" // Diperlukan untuk WaitGroup
 
 	"go.uber.org/zap"
-
-	"github.com/arwahdevops/dbsync/internal/config"
-	"github.com/arwahdevops/dbsync/internal/db"
-	"github.com/arwahdevops/dbsync/internal/metrics"
+	// Tidak perlu impor config, db, metrics, dll. secara langsung jika sudah ada di processTableInput
+	// yang didefinisikan di syncer_types.go
 )
 
-// processTableInput adalah argumen untuk fungsi pemrosesan tabel.
-// Ini mendefinisikan dependensi yang dibutuhkan oleh processSingleTable.
-type processTableInput struct {
-	ctx          context.Context
-	tableName    string
-	cfg          *config.Config
-	logger       *zap.Logger // Logger utama (akan di-scope lebih lanjut)
-	metrics      *metrics.Store
-	schemaSyncer SchemaSyncerInterface
-	srcConn      *db.Connector // Koneksi sumber
-	dstConn      *db.Connector // Koneksi tujuan
-}
-
-// processTableResult adalah alias untuk SyncResult, digunakan sebagai tipe return dari goroutine.
-type processTableResult SyncResult
+// Definisi processTableInput dan processTableResult sekarang ada di syncer_types.go
 
 // runTableProcessingPool mengelola worker pool untuk memproses tabel.
 // Ini adalah method dari Orchestrator.
@@ -35,6 +19,7 @@ func (f *Orchestrator) runTableProcessingPool(ctx context.Context, tables []stri
 	results := make(map[string]SyncResult)
 	var wg sync.WaitGroup
 	// Buffer channel sejumlah tabel untuk menghindari deadlock jika goroutine exit lebih dulu
+	// atau jika context dibatalkan dan kita ingin mengirim hasil skip.
 	resultChan := make(chan processTableResult, len(tables))
 	// Semaphore untuk membatasi jumlah goroutine yang berjalan secara bersamaan
 	sem := make(chan struct{}, f.cfg.Workers)
@@ -43,6 +28,10 @@ func (f *Orchestrator) runTableProcessingPool(ctx context.Context, tables []stri
 		// Cek apakah context utama sudah dibatalkan sebelum memulai goroutine baru
 		select {
 		case <-ctx.Done():
+			f.logger.Warn("Main context cancelled. Halting scheduling of new table processing tasks.",
+				zap.String("current_table_not_started", tableName),
+				zap.Int("index_of_table", i),
+				zap.Error(ctx.Err()))
 			f.handleRemainingTablesOnCancel(ctx, tables[i:], results)
 			goto endloop // Langsung ke akhir loop jika dibatalkan
 		default:
@@ -58,7 +47,8 @@ func (f *Orchestrator) runTableProcessingPool(ctx context.Context, tables []stri
 			case sem <- struct{}{}:
 				defer func() { <-sem }() // Pastikan slot dilepaskan setelah selesai
 			case <-ctx.Done(): // Jika context dibatalkan saat menunggu slot
-				f.logger.Warn("Context cancelled while waiting for worker slot", zap.String("table", tblName), zap.Error(ctx.Err()))
+				f.logger.Warn("Context cancelled while waiting for worker slot to process table.",
+					zap.String("table", tblName), zap.Error(ctx.Err()))
 				resultChan <- processTableResult{
 					Table:      tblName,
 					Skipped:    true,
@@ -69,6 +59,7 @@ func (f *Orchestrator) runTableProcessingPool(ctx context.Context, tables []stri
 			}
 
 			// Siapkan input untuk processSingleTable
+			// processTableInput didefinisikan di syncer_types.go
 			input := processTableInput{
 				ctx:          ctx, // Teruskan context utama (processSingleTable akan membuat sub-context dengan timeout)
 				tableName:    tblName,
@@ -80,6 +71,7 @@ func (f *Orchestrator) runTableProcessingPool(ctx context.Context, tables []stri
 				dstConn:      f.dstConn,
 			}
 			// Panggil method processSingleTable dari Orchestrator (f)
+			// processSingleTable didefinisikan di orchestrator_table_processor.go
 			resultChan <- f.processSingleTable(input)
 		}(tableName)
 	}
@@ -90,7 +82,7 @@ endloop:
 		wg.Wait()
 		close(resultChan)
 		// Tidak perlu close(sem) karena sem digunakan sebagai counter, bukan untuk komunikasi data
-		f.logger.Debug("All table processing goroutines in pool have completed.")
+		f.logger.Debug("All table processing goroutines in pool have completed their work.")
 	}()
 
 	// Kumpulkan hasil dari channel
@@ -105,18 +97,18 @@ endloop:
 // Ini adalah method dari Orchestrator.
 func (f *Orchestrator) handleRemainingTablesOnCancel(ctx context.Context, remainingTables []string, results map[string]SyncResult) {
 	if len(remainingTables) > 0 {
-		f.logger.Warn("Context cancelled; marking remaining tables as skipped",
-			zap.String("first_remaining_table", remainingTables[0]),
-			zap.Int("count_remaining", len(remainingTables)),
+		f.logger.Warn("Context cancelled; marking remaining tables as skipped before processing could start.",
+			zap.String("first_remaining_table_not_started", remainingTables[0]),
+			zap.Int("count_of_remaining_tables_not_started", len(remainingTables)),
 			zap.Error(ctx.Err()),
 		)
 		for _, tbl := range remainingTables {
-			if _, exists := results[tbl]; !exists { // Hanya jika belum ada hasil
+			if _, exists := results[tbl]; !exists { // Hanya jika belum ada hasil (misalnya dari worker yang sudah jalan)
 				results[tbl] = SyncResult{
 					Table:      tbl,
 					Skipped:    true,
 					SkipReason: "Context cancelled before processing could start for this table",
-					DataError:  fmt.Errorf("context cancelled: %w", ctx.Err()),
+					DataError:  fmt.Errorf("context cancelled: %w", ctx.Err()), // Atau error yang lebih spesifik
 				}
 			}
 		}

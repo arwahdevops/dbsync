@@ -1,49 +1,56 @@
+// internal/sync/syncer_types.go
 package sync
 
 import (
+	"context" // Diperlukan untuk processTableInput
 	"database/sql"
 	"time"
+
+	// Impor yang diperlukan untuk processTableInput
+	"github.com/arwahdevops/dbsync/internal/config"
+	"github.com/arwahdevops/dbsync/internal/db"
+	"github.com/arwahdevops/dbsync/internal/metrics"
+	"go.uber.org/zap" // Diperlukan untuk processTableInput
 )
 
 // ColumnInfo menyimpan detail tentang sebuah kolom.
 type ColumnInfo struct {
 	Name                 string
-	Type                 string         // Tipe asli dari database sumber
-	MappedType           string         // Tipe yang sudah dimapping ke dialek tujuan
+	Type                 string
+	MappedType           string
 	IsNullable           bool
 	IsPrimary            bool
 	IsGenerated          bool
 	DefaultValue         sql.NullString
 	AutoIncrement        bool
 	OrdinalPosition      int
-	Length               sql.NullInt64  // Untuk tipe string/biner
-	Precision            sql.NullInt64  // Untuk tipe numerik/waktu
-	Scale                sql.NullInt64  // Untuk tipe numerik
+	Length               sql.NullInt64
+	Precision            sql.NullInt64
+	Scale                sql.NullInt64
 	Collation            sql.NullString
 	Comment              sql.NullString
-	GenerationExpression sql.NullString // Ekspresi untuk kolom generated (jika bisa diambil)
+	GenerationExpression sql.NullString
 }
 
 // IndexInfo menyimpan detail tentang sebuah indeks.
 type IndexInfo struct {
 	Name      string
-	Columns   []string // Kolom dalam urutan definisi indeks
+	Columns   []string
 	IsUnique  bool
 	IsPrimary bool
-	RawDef    string // Definisi mentah jika ada (berguna untuk PostgreSQL, misal USING GIN)
-	// IndexType string // Opsional: BTREE, HASH, GIN, GIST (mungkin bisa diekstrak dari RawDef)
+	RawDef    string
 }
 
 // ConstraintInfo menyimpan detail tentang sebuah constraint.
 type ConstraintInfo struct {
 	Name           string
-	Type           string   // PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK
-	Columns        []string // Kolom yang terlibat dalam constraint (dalam urutan definisi)
-	Definition     string   // Untuk CHECK constraints: ekspresi check
-	ForeignTable   string   // Untuk FOREIGN KEY: nama tabel referensi
-	ForeignColumns []string // Untuk FOREIGN KEY: kolom di tabel referensi (dalam urutan definisi)
-	OnDelete       string   // Untuk FOREIGN KEY: aksi ON DELETE (NO ACTION, CASCADE, SET NULL, SET DEFAULT, RESTRICT)
-	OnUpdate       string   // Untuk FOREIGN KEY: aksi ON UPDATE
+	Type           string
+	Columns        []string
+	Definition     string
+	ForeignTable   string
+	ForeignColumns []string
+	OnDelete       string
+	OnUpdate       string
 }
 
 // schemaDetails adalah struct internal untuk mengelompokkan hasil fetch skema.
@@ -56,7 +63,7 @@ type schemaDetails struct {
 // categorizedDDLs adalah struct untuk menampung DDL yang sudah dikategorikan untuk eksekusi.
 type categorizedDDLs struct {
 	CreateTableDDL     string
-	AlterColumnDDLs    []string // Bisa berisi multiple ALTER statement untuk satu tabel (ADD, DROP, MODIFY)
+	AlterColumnDDLs    []string
 	AddIndexDDLs       []string
 	DropIndexDDLs      []string
 	AddConstraintDDLs  []string
@@ -66,14 +73,31 @@ type categorizedDDLs struct {
 // SyncResult menyimpan hasil sinkronisasi untuk satu tabel.
 type SyncResult struct {
 	Table                    string
-	SchemaSyncSkipped        bool // True jika schema sync dilewati karena strategi 'none' atau tabel sistem
+	SchemaSyncSkipped        bool
 	SchemaAnalysisError      error
-	SchemaExecutionError     error // Bisa jadi multierr jika ada beberapa DDL yang gagal dan continueOnError
+	SchemaExecutionError     error
 	DataError                error
-	ConstraintExecutionError error // Bisa jadi multierr
+	ConstraintExecutionError error
 	SkipReason               string
 	RowsSynced               int64
 	Batches                  int
 	Duration                 time.Duration
-	Skipped                  bool // True jika keseluruhan pemrosesan tabel ini dilewati karena error fatal sebelumnya
+	Skipped                  bool
 }
+
+// processTableInput adalah argumen untuk fungsi pemrosesan tabel.
+// Didefinisikan di sini untuk sentralisasi.
+type processTableInput struct {
+	ctx          context.Context
+	tableName    string
+	cfg          *config.Config
+	logger       *zap.Logger // Logger utama (akan di-scope lebih lanjut)
+	metrics      *metrics.Store
+	schemaSyncer SchemaSyncerInterface
+	srcConn      *db.Connector // Koneksi sumber
+	dstConn      *db.Connector // Koneksi tujuan
+}
+
+// processTableResult adalah alias untuk SyncResult, digunakan sebagai tipe return dari goroutine.
+// Didefinisikan di sini untuk sentralisasi.
+type processTableResult SyncResult

@@ -3,57 +3,51 @@ package sync
 
 import (
 	"context"
-	"fmt" // Dipertahankan untuk fmt.Errorf
+	"fmt"
 	"time"
 
 	"go.uber.org/zap"
-	// "gorm.io/gorm" // Tidak dibutuhkan langsung di sini jika data sync dipisah
-	// "gorm.io/gorm/clause" // Tidak dibutuhkan langsung di sini
 
 	"github.com/arwahdevops/dbsync/internal/config"
-	// "github.com/arwahdevops/dbsync/internal/db" // Tidak dibutuhkan jika koneksi dilewatkan
 	"github.com/arwahdevops/dbsync/internal/metrics"
-	// "github.com/arwahdevops/dbsync/internal/utils" // Tidak dibutuhkan jika pagination dipisah
 )
 
 // processSingleTable menangani seluruh siklus hidup sinkronisasi untuk satu tabel.
-// Ini adalah method dari Orchestrator.
 func (f *Orchestrator) processSingleTable(input processTableInput) processTableResult {
 	log := input.logger.With(zap.String("table", input.tableName))
 	startTime := time.Now()
 	result := processTableResult{Table: input.tableName}
 
+	// Defer untuk logging hasil akhir dan metrik durasi tabel
 	defer func() {
 		result.Duration = time.Since(startTime)
 		input.metrics.TableSyncDuration.WithLabelValues(input.tableName).Observe(result.Duration.Seconds())
-		logFinalTableResult(log, result, input.metrics)
+		logFinalTableResult(log, result, input.metrics) // logFinalTableResult tidak berubah
 	}()
 
+	// Context dengan timeout untuk seluruh pemrosesan tabel ini
 	tableCtx, cancelTableCtx := context.WithTimeout(input.ctx, input.cfg.TableTimeout)
 	defer cancelTableCtx()
 
 	// --- Tahap 1: Analisis Skema & Pembuatan DDL ---
 	log.Info("Starting schema analysis and DDL generation phase.")
 	schemaResult, schemaErr := input.schemaSyncer.SyncTableSchema(tableCtx, input.tableName, input.cfg.SchemaSyncStrategy)
-	// ... (logika penanganan error schemaErr seperti sebelumnya) ...
+	
 	if schemaErr != nil {
 		log.Error("Schema analysis/generation failed", zap.Error(schemaErr))
 		result.SchemaAnalysisError = schemaErr
 		input.metrics.SyncErrorsTotal.WithLabelValues("schema_analysis", input.tableName).Inc()
-		if !input.cfg.SkipFailedTables {
-			result.Skipped = true
-			result.SkipReason = "Schema analysis/generation failed (SkipFailedTables=false)"
-			return result
-		}
+		// Jika analisis skema gagal, tidak ada gunanya melanjutkan untuk tabel ini, bahkan jika SkipFailedTables=true.
+		// SkipFailedTables=true berarti kita lanjut ke *tabel berikutnya*, bukan tahap berikutnya untuk tabel yang gagal ini.
 		result.Skipped = true
-		result.SkipReason = "Schema analysis/generation failed (SkipFailedTables=true)"
-		return result
+		result.SkipReason = fmt.Sprintf("Schema analysis/generation failed (SkipFailedTables=%t)", input.cfg.SkipFailedTables)
+		return result // Langsung keluar untuk tabel ini
 	}
-	// ... (logika handle strategi 'none' dan logging schemaResult seperti sebelumnya) ...
+
 	if input.cfg.SchemaSyncStrategy == config.SchemaSyncNone {
 		result.SchemaSyncSkipped = true
 		log.Info("Schema synchronization explicitly skipped due to 'none' strategy.")
-	} else if schemaResult != nil {
+	} else if schemaResult != nil { // schemaResult tidak akan nil jika schemaErr nil
 		log.Info("Schema analysis/generation phase complete.",
 			zap.Bool("table_ddl_present", schemaResult.TableDDL != ""),
 			zap.Int("index_ddls_count", len(schemaResult.IndexDDLs)),
@@ -61,39 +55,41 @@ func (f *Orchestrator) processSingleTable(input processTableInput) processTableR
 			zap.Strings("detected_pks_for_data_sync", schemaResult.PrimaryKeys),
 		)
 	}
-	// ... (cek context error setelah tahap 1 seperti sebelumnya) ...
+
+	// Cek context setelah tahap 1
 	if err := tableCtx.Err(); err != nil {
 		log.Error("Context cancelled or timed out after schema analysis/generation phase", zap.Error(err))
-		result.SchemaAnalysisError = fmt.Errorf("context error after schema analysis: %w", err)
+		if result.SchemaAnalysisError == nil { // Hanya set jika belum ada error dari tahap ini
+			result.SchemaAnalysisError = fmt.Errorf("context error after schema analysis: %w", err)
+		}
 		result.Skipped = true
 		result.SkipReason = "Context cancelled/timed out after schema analysis/generation"
 		return result
 	}
 
-
 	// --- Tahap 2: Eksekusi DDL Struktur Tabel (CREATE/ALTER) ---
-	// ... (logika tahap 2 seperti sebelumnya) ...
+	// Hanya jalankan jika skema tidak diskip dan ada DDL tabel
 	if !result.SchemaSyncSkipped && schemaResult != nil && schemaResult.TableDDL != "" {
 		log.Info("Starting table DDL (CREATE/ALTER) execution phase.")
 		tableStructureDDLs := &SchemaExecutionResult{TableDDL: schemaResult.TableDDL}
+		// schemaSyncer.ExecuteDDLs akan menjalankan dalam transaksi (jika didukung DB)
 		schemaExecErr := input.schemaSyncer.ExecuteDDLs(tableCtx, input.tableName, tableStructureDDLs)
+		
 		if schemaExecErr != nil {
 			log.Error("Table DDL (CREATE/ALTER) execution failed", zap.Error(schemaExecErr))
 			result.SchemaExecutionError = schemaExecErr
 			input.metrics.SyncErrorsTotal.WithLabelValues("schema_execution", input.tableName).Inc()
-			if !input.cfg.SkipFailedTables {
-				result.Skipped = true
-				result.SkipReason = "Table DDL execution failed (SkipFailedTables=false)"
-				return result
-			}
-			log.Warn("Table DDL execution failed (SkipFailedTables=true). Data sync might proceed on an incorrect schema.")
-		} else {
-			log.Info("Table DDL (CREATE/ALTER) execution phase complete.")
+			// Jika eksekusi DDL struktur tabel gagal, kita tidak boleh melanjutkan ke data sync untuk tabel ini.
+			result.Skipped = true
+			result.SkipReason = fmt.Sprintf("Table DDL execution failed (SkipFailedTables=%t)", input.cfg.SkipFailedTables)
+			return result // Langsung keluar untuk tabel ini
 		}
+		log.Info("Table DDL (CREATE/ALTER) execution phase complete.")
 	} else if !result.SchemaSyncSkipped {
 		log.Info("No table structure DDL (CREATE/ALTER) to execute for this table.")
 	}
-    // ... (cek context error setelah tahap 2 seperti sebelumnya) ...
+
+	// Cek context setelah tahap 2
 	if err := tableCtx.Err(); err != nil {
 		log.Error("Context cancelled or timed out after table DDL execution phase", zap.Error(err))
 		if result.SchemaExecutionError == nil {
@@ -104,95 +100,109 @@ func (f *Orchestrator) processSingleTable(input processTableInput) processTableR
 		return result
 	}
 
-
 	// --- Tahap 3: Sinkronisasi Data ---
-	pkColumnsForDataSync := []string{}
-	if schemaResult != nil {
-		pkColumnsForDataSync = schemaResult.PrimaryKeys
-	}
-	shouldSkipDataSync := (result.SchemaExecutionError != nil && !input.cfg.SkipFailedTables)
-
-	if !shouldSkipDataSync {
-		// ... (logika peringatan PK tetap sama) ...
-		if len(pkColumnsForDataSync) == 0 {
-			if input.cfg.SchemaSyncStrategy == config.SchemaSyncNone {
-				log.Warn("Data sync: Schema strategy is 'none' and no primary key detected. Attempting full table load without pagination (unsafe for large tables).")
-			} else {
-				log.Warn("Data sync: No primary key found/generated for table. Pagination will not be used, which is unsafe and slow for large tables.")
-			}
+	// Lanjutkan ke data sync hanya jika tidak ada error skema sebelumnya (analysis atau execution).
+	// `result.Skipped` akan true jika ada error skema sebelumnya dan kita sudah return.
+	// Kondisi ini sebagai double check.
+	if result.Skipped {
+		log.Warn("Skipping data synchronization phase due to prior critical schema errors.",
+			zap.NamedError("schema_analysis_err_cause", result.SchemaAnalysisError),
+			zap.NamedError("schema_execution_err_cause", result.SchemaExecutionError))
+	} else {
+		pkColumnsForDataSync := []string{}
+		if schemaResult != nil { // schemaResult pasti tidak nil di sini jika tidak ada error skema
+			pkColumnsForDataSync = schemaResult.PrimaryKeys
 		}
+
+		if len(pkColumnsForDataSync) == 0 && input.cfg.SchemaSyncStrategy != config.SchemaSyncNone {
+			log.Warn("Data sync: No primary key identified for table after schema operations. Pagination will not be used, which is unsafe and slow for large tables. Data sync might also fail if upsert requires PKs.",
+			    zap.Strings("pks_from_schema_result", pkColumnsForDataSync))
+		} else if len(pkColumnsForDataSync) == 0 && input.cfg.SchemaSyncStrategy == config.SchemaSyncNone {
+		    log.Warn("Data sync: Schema strategy is 'none' and no primary key detected via source schema analysis. Attempting full table load without pagination (unsafe for large tables). Data sync might also fail if upsert requires PKs.")
+		}
+
 		log.Info("Starting data synchronization phase.")
-		// Panggil f.syncData dari file orchestrator_data_sync.go
 		rowsSynced, batchesProcessed, dataSyncErr := f.syncData(tableCtx, input.tableName, pkColumnsForDataSync)
 		result.RowsSynced = rowsSynced
 		result.Batches = batchesProcessed
+		
 		if dataSyncErr != nil {
-			// ... (logika penanganan error dataSyncErr seperti sebelumnya) ...
 			log.Error("Data synchronization failed", zap.Error(dataSyncErr))
 			result.DataError = dataSyncErr
 			input.metrics.SyncErrorsTotal.WithLabelValues("data_sync", input.tableName).Inc()
+			// Jika data sync gagal, kita mungkin masih ingin mencoba menerapkan constraint/indeks,
+			// tergantung pada cfg.SkipFailedTables.
+			// Jika !cfg.SkipFailedTables, Orchestrator akan menghentikan pemrosesan tabel *lain*.
+			// Untuk tabel *ini*, kita catat errornya dan biarkan tahap constraint/index berjalan jika diinginkan.
+			// Keputusan untuk `result.Skipped = true` di sini bergantung apakah kita mau menghentikan
+			// tahap constraint jika data gagal. Saat ini, tidak diset true, jadi constraint akan dicoba.
 			if !input.cfg.SkipFailedTables {
-				result.Skipped = true
-				result.SkipReason = "Data synchronization failed (SkipFailedTables=false)"
-				return result
+				log.Warn("Data synchronization failed for table. Since SkipFailedTables is false, this will be treated as a critical failure for the overall sync if not handled at a higher level, but constraint application for this table will still be attempted.")
+				// Tidak set result.Skipped = true di sini agar constraint tetap dicoba.
+				// Exit code di main.go akan menangani ini sebagai error.
+			} else {
+				log.Warn("Data synchronization failed (SkipFailedTables=true). Attempting to apply constraints/indexes if any.")
 			}
-			log.Warn("Data synchronization failed (SkipFailedTables=true). Attempting to apply constraints/indexes if any.")
 		} else {
 			log.Info("Data synchronization phase complete.")
 		}
-	} else {
-		log.Warn("Skipping data synchronization phase due to prior critical schema DDL execution errors and SkipFailedTables=false.",
-			zap.NamedError("triggering_schema_error", result.SchemaExecutionError))
 	}
-	// ... (cek context error setelah tahap 3 seperti sebelumnya) ...
+
+	// Cek context setelah tahap 3
 	if err := tableCtx.Err(); err != nil {
 		log.Error("Context cancelled or timed out during/after data synchronization phase", zap.Error(err))
 		if result.DataError == nil {
 			result.DataError = fmt.Errorf("context error during/after data sync: %w", err)
 		}
-		result.Skipped = true
+		result.Skipped = true // Jika context batal di sini, skip sisa tahap untuk tabel ini
 		result.SkipReason = "Context cancelled/timed out during/after data synchronization"
 		return result
 	}
 
-
 	// --- Tahap 4: Eksekusi DDL Indeks & Constraint ---
-	// ... (logika tahap 4 seperti sebelumnya) ...
-	shouldSkipConstraints := ( (result.SchemaExecutionError != nil || result.DataError != nil) && !input.cfg.SkipFailedTables )
-	if !result.SchemaSyncSkipped && schemaResult != nil && (len(schemaResult.IndexDDLs) > 0 || len(schemaResult.ConstraintDDLs) > 0) {
-		if shouldSkipConstraints {
-			log.Warn("Skipping index/constraint application due to prior critical schema/data errors and SkipFailedTables=false.")
+	// Lanjutkan ke tahap ini meskipun ada DataError (jika SkipFailedTables=true),
+	// tapi jangan jika Skema gagal atau context sudah batal.
+	if result.Skipped {
+		log.Warn("Skipping index and constraint application phase due to prior critical errors or context cancellation for this table.")
+	} else if !result.SchemaSyncSkipped && schemaResult != nil && (len(schemaResult.IndexDDLs) > 0 || len(schemaResult.ConstraintDDLs) > 0) {
+		log.Info("Starting index and constraint application phase.")
+		indexAndConstraintDDLs := &SchemaExecutionResult{
+			IndexDDLs:      schemaResult.IndexDDLs,
+			ConstraintDDLs: schemaResult.ConstraintDDLs,
+		}
+		constraintErr := input.schemaSyncer.ExecuteDDLs(tableCtx, input.tableName, indexAndConstraintDDLs)
+		
+		if constraintErr != nil {
+			log.Error("Failed to apply indexes/constraints after data sync", zap.Error(constraintErr))
+			result.ConstraintExecutionError = constraintErr
+			input.metrics.SyncErrorsTotal.WithLabelValues("constraint_apply", input.tableName).Inc()
+			// Error di sini tidak akan membuat result.Skipped = true, karena data mungkin sudah masuk.
+			// Ini akan dilaporkan sebagai warning/error di summary akhir.
 		} else {
-			log.Info("Starting index and constraint application phase.")
-			indexAndConstraintDDLs := &SchemaExecutionResult{
-				IndexDDLs:      schemaResult.IndexDDLs,
-				ConstraintDDLs: schemaResult.ConstraintDDLs,
-			}
-			constraintErr := input.schemaSyncer.ExecuteDDLs(tableCtx, input.tableName, indexAndConstraintDDLs)
-			if constraintErr != nil {
-				log.Error("Failed to apply indexes/constraints after data sync", zap.Error(constraintErr))
-				result.ConstraintExecutionError = constraintErr
-				input.metrics.SyncErrorsTotal.WithLabelValues("constraint_apply", input.tableName).Inc()
-			} else {
-				log.Info("Index and constraint application phase complete.")
-			}
+			log.Info("Index and constraint application phase complete.")
 		}
 	} else if !result.SchemaSyncSkipped {
 		log.Info("No index or constraint DDLs to execute for this table.")
 	}
-    // ... (cek context error setelah tahap 4 seperti sebelumnya) ...
+
+    // Cek context terakhir kali sebelum return
 	if err := tableCtx.Err(); err != nil {
-		log.Error("Context cancelled or timed out during index/constraint application phase", zap.Error(err))
+		log.Error("Context cancelled or timed out during/after index/constraint application phase", zap.Error(err))
 		if result.ConstraintExecutionError == nil {
 			result.ConstraintExecutionError = fmt.Errorf("context error during constraint application: %w", err)
+		}
+		// result.Skipped sudah mungkin true dari tahap sebelumnya jika context error.
+		// Jika belum, set sekarang.
+		if !result.Skipped {
+			result.Skipped = true
+			result.SkipReason = "Context cancelled/timed out during/after index/constraint application"
 		}
 	}
 
 	return result
 }
 
-// logFinalTableResult adalah helper untuk mencatat hasil akhir pemrosesan tabel.
-// (Implementasi tetap sama seperti sebelumnya)
+// logFinalTableResult (tetap sama)
 func logFinalTableResult(log *zap.Logger, result processTableResult, metricsStore *metrics.Store) {
 	logFields := []zap.Field{
 		zap.Duration("duration", result.Duration),
@@ -201,27 +211,33 @@ func logFinalTableResult(log *zap.Logger, result processTableResult, metricsStor
 		zap.Bool("schema_sync_explicitly_disabled", result.SchemaSyncSkipped),
 	}
 
-	hasCriticalError := result.SchemaAnalysisError != nil || result.SchemaExecutionError != nil || result.DataError != nil
-	hasConstraintErrorOnly := !hasCriticalError && result.ConstraintExecutionError != nil
+	hasCriticalErrorExcludingConstraints := result.SchemaAnalysisError != nil || result.SchemaExecutionError != nil || result.DataError != nil
+	hasOnlyConstraintError := !hasCriticalErrorExcludingConstraints && result.ConstraintExecutionError != nil
 
 	if result.Skipped {
 		logFields = append(logFields, zap.String("skip_reason", result.SkipReason))
+		// Tambahkan error penyebab skip jika ada
 		if result.SchemaAnalysisError != nil { logFields = append(logFields, zap.NamedError("schema_analysis_error_cause", result.SchemaAnalysisError)) }
 		if result.SchemaExecutionError != nil { logFields = append(logFields, zap.NamedError("schema_execution_error_cause", result.SchemaExecutionError)) }
 		if result.DataError != nil { logFields = append(logFields, zap.NamedError("data_error_cause", result.DataError)) }
-		log.Warn("Table processing was skipped or interrupted by error/cancellation", logFields...)
-	} else if hasCriticalError {
+		if result.ConstraintExecutionError != nil && (result.SchemaAnalysisError != nil || result.SchemaExecutionError != nil || result.DataError != nil) {
+		    // Hanya log constraint error sebagai 'cause' jika ada error lain yang menyebabkan skip
+		    logFields = append(logFields, zap.NamedError("constraint_execution_error_after_skip_trigger", result.ConstraintExecutionError))
+		}
+		log.Warn("Table processing was SKIPPED or INTERRUPTED by error/cancellation", logFields...)
+	} else if hasCriticalErrorExcludingConstraints {
 		if result.SchemaAnalysisError != nil { logFields = append(logFields, zap.NamedError("schema_analysis_error", result.SchemaAnalysisError)) }
 		if result.SchemaExecutionError != nil { logFields = append(logFields, zap.NamedError("schema_execution_error", result.SchemaExecutionError)) }
 		if result.DataError != nil { logFields = append(logFields, zap.NamedError("data_error", result.DataError)) }
-		if result.ConstraintExecutionError != nil { logFields = append(logFields, zap.NamedError("constraint_execution_error_concurrent", result.ConstraintExecutionError)) }
-		log.Error("Table synchronization finished with critical errors", logFields...)
-	} else if hasConstraintErrorOnly {
+		// Jika ada error kritis, constraint error (jika ada) adalah sekunder.
+		if result.ConstraintExecutionError != nil { logFields = append(logFields, zap.NamedError("constraint_execution_error_concurrent_with_critical", result.ConstraintExecutionError)) }
+		log.Error("Table synchronization finished with CRITICAL ERRORS", logFields...)
+	} else if hasOnlyConstraintError { // Tidak ada error kritis, hanya error constraint
 		logFields = append(logFields, zap.NamedError("constraint_execution_error", result.ConstraintExecutionError))
 		log.Warn("Table data synchronization SUCCEEDED, but applying constraints/indexes FAILED", logFields...)
-		metricsStore.TableSyncSuccessTotal.WithLabelValues(result.Table).Inc()
-	} else {
-		log.Info("Table synchronization finished successfully", logFields...)
+		metricsStore.TableSyncSuccessTotal.WithLabelValues(result.Table).Inc() // Anggap data sukses
+	} else { // Sukses penuh
+		log.Info("Table synchronization finished SUCCESSFULLY", logFields...)
 		metricsStore.TableSyncSuccessTotal.WithLabelValues(result.Table).Inc()
 	}
 }

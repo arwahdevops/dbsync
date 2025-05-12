@@ -4,6 +4,7 @@ package sync
 import (
 	"context"
 	"fmt"
+	"sort" // <-- TAMBAHKAN IMPOR INI
 	"strings"
 	"time"
 
@@ -48,9 +49,9 @@ func (s *SchemaSyncer) SyncTableSchema(ctx context.Context, table string, strate
 		PrimaryKeys: make([]string, 0), // Inisialisasi
 	}
 
-	if s.isSystemTable(table, s.srcDialect) {
+	if s.isSystemTable(table, s.srcDialect) { // from syncer_helpers.go
 		log.Debug("Skipping system table for schema sync.")
-		return result, nil
+		return result, nil // Tidak ada DDL, tidak ada PK yang relevan untuk sync
 	}
 
 	srcSchema, srcExists, err := s.fetchSchemaDetails(ctx, s.srcDB, s.srcDialect, table, "source")
@@ -59,24 +60,40 @@ func (s *SchemaSyncer) SyncTableSchema(ctx context.Context, table string, strate
 	}
 	if !srcExists {
 		log.Warn("Source table does not exist. Skipping schema sync for this table.")
-		return result, nil
+		return result, nil // Tidak ada DDL, PK juga tidak ada
 	}
 	if len(srcSchema.Columns) == 0 {
 		log.Warn("Source table exists but appears to have no columns. Skipping schema sync for this table.")
-		return result, nil
+		return result, nil // Tidak ada DDL, PK juga tidak ada
 	}
-	result.PrimaryKeys = getPKColumnNames(srcSchema.Columns)
 
-	if err := s.populateMappedTypesForSourceColumns(srcSchema.Columns, table); err != nil {
-		return nil, err
+	// Dapatkan PK dari sumber, ini penting bahkan untuk strategi 'none' agar data sync tahu cara paginasi
+	result.PrimaryKeys = getPKColumnNames(srcSchema.Columns) // from syncer_helpers.go
+	if len(result.PrimaryKeys) == 0 { // Coba dari constraint jika kolom tidak menandai PK
+		for _, cons := range srcSchema.Constraints {
+			if cons.Type == "PRIMARY KEY" {
+				result.PrimaryKeys = cons.Columns
+				sort.Strings(result.PrimaryKeys) // Pastikan urutan konsisten
+				break
+			}
+		}
+	}
+	log.Debug("Determined primary keys for source table (for data sync pagination).", zap.Strings("pks", result.PrimaryKeys))
+
+
+	// Isi MappedType untuk kolom sumber. Ini diperlukan untuk SEMUA strategi
+	// karena MappedType sumber akan menjadi dasar untuk definisi kolom tujuan.
+	if err := s.populateMappedTypesForSourceColumns(srcSchema.Columns, table); err != nil { // from syncer_type_mapper.go
+		return nil, fmt.Errorf("failed to populate mapped types for source columns of table '%s': %w", table, err)
 	}
 
 	switch strategy {
 	case config.SchemaSyncDropCreate:
 		log.Warn("Using 'drop_create' strategy - THIS IS DESTRUCTIVE!")
+		// generateDDLsForDropCreate sudah menggunakan MappedType dari srcSchema.Columns
 		ddls, errGen := s.generateDDLsForDropCreate(table, srcSchema.Columns, srcSchema.Indexes, srcSchema.Constraints)
 		if errGen != nil {
-			return nil, errGen
+			return nil, fmt.Errorf("failed to generate DDLs for drop_create strategy on table '%s': %w", table, errGen)
 		}
 		result.TableDDL = ddls.TableDDL
 		result.IndexDDLs = ddls.IndexDDLs
@@ -91,22 +108,27 @@ func (s *SchemaSyncer) SyncTableSchema(ctx context.Context, table string, strate
 
 		if !dstExists {
 			log.Info("Destination table not found, will perform CREATE TABLE operation instead of ALTER.")
+			// Sama seperti drop_create, tapi tanpa DROP eksplisit di awal (CREATE IF NOT EXISTS akan menangani)
 			ddls, errGen := s.generateDDLsForDropCreate(table, srcSchema.Columns, srcSchema.Indexes, srcSchema.Constraints)
 			if errGen != nil {
-				return nil, errGen
+				return nil, fmt.Errorf("failed to generate DDLs for create (alter strategy, dst not exists) on table '%s': %w", table, errGen)
 			}
 			result.TableDDL = ddls.TableDDL
 			result.IndexDDLs = ddls.IndexDDLs
 			result.ConstraintDDLs = ddls.ConstraintDDLs
 		} else {
 			log.Debug("Destination table exists, generating ALTER DDLs if necessary.")
-			s.populateMappedTypesForDestinationColumns(dstSchema.Columns) // MappedType diisi untuk perbandingan
+			// populateMappedTypesForDestinationColumns menggunakan tipe asli tujuan jika MappedType kosong.
+			// Ini digunakan oleh getColumnModifications untuk perbandingan.
+			s.populateMappedTypesForDestinationColumns(dstSchema.Columns) // from syncer_type_mapper.go
 
+			// generateAlterDDLs menggunakan srcSchema.Columns (yang MappedType-nya sudah diisi untuk target)
+			// dan dstSchema.Columns (yang MappedType-nya diisi dengan tipe asli tujuan)
 			joinedAlterColumnDDLs, indexDDLs, constraintDDLs, errGen := s.generateAlterDDLs(
 				table,
 				srcSchema.Columns, srcSchema.Indexes, srcSchema.Constraints,
 				dstSchema.Columns, dstSchema.Indexes, dstSchema.Constraints,
-			)
+			) // from schema_alter.go
 			if errGen != nil {
 				return nil, fmt.Errorf("failed to generate ALTER DDLs for '%s': %w", table, errGen)
 			}
@@ -117,7 +139,7 @@ func (s *SchemaSyncer) SyncTableSchema(ctx context.Context, table string, strate
 
 	case config.SchemaSyncNone:
 		log.Info("Schema sync strategy is 'none'. No DDLs will be generated or executed for table structure.")
-		// result.PrimaryKeys sudah di-set dari srcSchema.Columns
+		// result.PrimaryKeys sudah di-set dari srcSchema.Columns di atas.
 
 	default:
 		return nil, fmt.Errorf("unknown schema sync strategy: %s for table '%s'", strategy, table)
@@ -132,51 +154,37 @@ func (s *SchemaSyncer) generateDDLsForDropCreate(table string, srcColumns []Colu
 	log := s.logger.With(zap.String("table", table), zap.String("strategy", "generate_drop_create_ddls"))
 	result := &SchemaExecutionResult{}
 
-	tableDDL, _, errGen := s.generateCreateTableDDL(table, srcColumns)
+	// generateCreateTableDDL menggunakan MappedType dari srcColumns
+	// dan juga mengembalikan PK (unquoted) untuk data sync, meskipun kita tidak langsung pakai di sini.
+	tableDDL, _, errGen := s.generateCreateTableDDL(table, srcColumns) // from schema_ddl_create.go
 	if errGen != nil {
 		return nil, fmt.Errorf("failed to generate CREATE TABLE DDL for '%s': %w", table, errGen)
 	}
 	result.TableDDL = tableDDL
 
-	inlineConstraintNames := make(map[string]bool)
-	for _, cons := range srcConstraints {
-		if cons.Type == "PRIMARY KEY" || cons.Type == "UNIQUE" {
-			inlineConstraintNames[cons.Name] = true
-		}
-	}
-
-	filteredIndexes := make([]IndexInfo, 0, len(srcIndexes))
+	finalIndexes := make([]IndexInfo, 0, len(srcIndexes))
 	for _, idx := range srcIndexes {
 		if idx.IsPrimary {
-			log.Debug("Skipping explicit CREATE INDEX for PRIMARY KEY (handled by CREATE TABLE).", zap.String("index_name", idx.Name))
+			log.Debug("Skipping explicit CREATE INDEX for PRIMARY KEY in drop_create (handled by CREATE TABLE).", zap.String("index_name", idx.Name))
 			continue
 		}
-		if idx.IsUnique && inlineConstraintNames[idx.Name] {
-			log.Debug("Skipping explicit CREATE UNIQUE INDEX; likely covered by inline UNIQUE constraint from CREATE TABLE.", zap.String("index_name", idx.Name))
-			continue
-		}
-		filteredIndexes = append(filteredIndexes, idx)
+		finalIndexes = append(finalIndexes, idx)
 	}
-	result.IndexDDLs = s.generateCreateIndexDDLs(table, filteredIndexes)
+	result.IndexDDLs = s.generateCreateIndexDDLs(table, finalIndexes) // from schema_ddl_create.go
 
-	filteredConstraints := make([]ConstraintInfo, 0, len(srcConstraints))
+	finalConstraints := make([]ConstraintInfo, 0, len(srcConstraints))
 	for _, cons := range srcConstraints {
 		if cons.Type == "PRIMARY KEY" {
-			log.Debug("Skipping explicit ADD CONSTRAINT for PRIMARY KEY (handled by CREATE TABLE).", zap.String("constraint_name", cons.Name))
+			log.Debug("Skipping explicit ADD CONSTRAINT for PRIMARY KEY in drop_create (handled by CREATE TABLE).", zap.String("constraint_name", cons.Name))
 			continue
 		}
-		// UNIQUE constraint yang dibuat inline dengan CREATE TABLE biasanya tidak perlu ADD CONSTRAINT terpisah
-		// kecuali jika namanya berbeda dari indeks unik yang mendukungnya.
-		// Untuk drop_create, CREATE TABLE seharusnya sudah menangani ini.
-		if cons.Type == "UNIQUE" && inlineConstraintNames[cons.Name] {
-		    // Periksa apakah ada kolom yang berbeda atau jika constraint memiliki nama yang berbeda dari indeks.
-		    // Untuk kesederhanaan drop_create, kita asumsikan CREATE TABLE sudah benar.
-			log.Debug("Skipping explicit ADD CONSTRAINT UNIQUE; likely covered by inline UNIQUE constraint from CREATE TABLE.", zap.String("constraint_name", cons.Name))
+		if cons.Type == "UNIQUE" {
+			log.Debug("Skipping explicit ADD CONSTRAINT UNIQUE in drop_create (handled by CREATE UNIQUE INDEX or inline in CREATE TABLE).", zap.String("constraint_name", cons.Name))
 			continue
 		}
-		filteredConstraints = append(filteredConstraints, cons)
+		finalConstraints = append(finalConstraints, cons)
 	}
-	result.ConstraintDDLs = s.generateAddConstraintDDLs(table, filteredConstraints)
+	result.ConstraintDDLs = s.generateAddConstraintDDLs(table, finalConstraints) // from schema_ddl_create.go
 
 	return result, nil
 }
@@ -191,20 +199,21 @@ func (s *SchemaSyncer) ExecuteDDLs(ctx context.Context, table string, ddls *Sche
 	}
 	log.Info("Starting DDL execution for table.")
 
+	// parseAndCategorizeDDLs ada di syncer_ddl_executor.go
 	parsedDDLs, errParse := s.parseAndCategorizeDDLs(ddls, table)
 	if errParse != nil {
 		return fmt.Errorf("error parsing DDLs for table '%s': %w", table, errParse)
 	}
 
 	return s.dstDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var revertFKChecks func() error
-		isDropCreateStrategy := parsedDDLs.CreateTableDDL != "" // Jika ada CREATE_TABLE, ini adalah drop_create atau create
+		var revertFKChecks func() error // Untuk MySQL FK checks
 
-		if isDropCreateStrategy && s.dstDialect == "mysql" {
-			log.Debug("Disabling FOREIGN_KEY_CHECKS for MySQL DROP/CREATE operation.")
+		isTableCreation := parsedDDLs.CreateTableDDL != ""
+
+		if isTableCreation && s.dstDialect == "mysql" {
+			log.Debug("Disabling FOREIGN_KEY_CHECKS for MySQL table creation operation.")
 			if err := tx.Exec("SET SESSION foreign_key_checks = 0;").Error; err != nil {
 				log.Error("Failed to disable foreign key checks on destination for table. DDL execution might fail.", zap.String("table", table), zap.Error(err))
-				// Tidak return error di sini, biarkan DDL gagal jika ini masalahnya
 			} else {
 				revertFKChecks = func() error {
 					log.Debug("Re-enabling FOREIGN_KEY_CHECKS for MySQL after DDL execution.", zap.String("table", table))
@@ -220,34 +229,31 @@ func (s *SchemaSyncer) ExecuteDDLs(ctx context.Context, table string, ddls *Sche
 			}
 		}
 
-		// Fase 1 (ALTER): Drop constraint dan indeks yang ada (jika bukan drop_create)
-		if !isDropCreateStrategy {
+		// Urutan Eksekusi:
+		if !isTableCreation { // Strategi ALTER murni
 			if err := s.executeDDLPhase(tx, "Phase 1 (ALTER): Dropping existing constraints", parsedDDLs.DropConstraintDDLs, true, log); err != nil {
-				log.Error("Error(s) occurred during dropping existing constraints. Transaction will be rolled back.", zap.Error(err))
 				return err
 			}
 			if err := s.executeDDLPhase(tx, "Phase 1 (ALTER): Dropping existing indexes", parsedDDLs.DropIndexDDLs, true, log); err != nil {
-				log.Error("Error(s) occurred during dropping existing indexes. Transaction will be rolled back.", zap.Error(err))
 				return err
 			}
 		}
 
-		// Fase 2: CREATE TABLE (jika drop_create) atau ALTER COLUMN (jika alter)
-		if isDropCreateStrategy {
+		if isTableCreation {
 			log.Warn("Executing DROP TABLE IF EXISTS prior to CREATE (destructive operation).", zap.String("table", table))
 			dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s", utils.QuoteIdentifier(table, s.dstDialect))
 			if s.dstDialect == "postgres" {
 				dropSQL += " CASCADE"
 			}
-			// Teruskan dropSQL ke shouldIgnoreDDLError
+			dropSQL += ";"
 			if err := tx.Exec(dropSQL).Error; err != nil {
-				if !s.shouldIgnoreDDLError(err, dropSQL) {
-					log.Error("Failed to execute DROP TABLE IF EXISTS, aborting.", zap.String("table", table), zap.Error(err))
+				if !s.shouldIgnoreDDLError(err, dropSQL) { // from syncer_ddl_executor.go
+					log.Error("Failed to execute DROP TABLE IF EXISTS, aborting table creation.", zap.String("table", table), zap.Error(err))
 					return fmt.Errorf("failed to execute DROP TABLE IF EXISTS for '%s': %w", table, err)
 				}
 				log.Warn("DROP TABLE IF EXISTS resulted in an ignorable error.", zap.String("table", table), zap.Error(err))
 			}
-			if err := s.executeDDLPhase(tx, "Phase 2 (DROP/CREATE): Creating table", []string{parsedDDLs.CreateTableDDL}, false, log); err != nil {
+			if err := s.executeDDLPhase(tx, "Phase 2 (CREATE): Creating table", []string{parsedDDLs.CreateTableDDL}, false, log); err != nil {
 				return err
 			}
 		} else if len(parsedDDLs.AlterColumnDDLs) > 0 {
@@ -258,25 +264,20 @@ func (s *SchemaSyncer) ExecuteDDLs(ctx context.Context, table string, ddls *Sche
 			log.Info("Phase 2: No table structure (CREATE/ALTER) changes needed.")
 		}
 
-		// Fase 3: ADD INDEX
 		if err := s.executeDDLPhase(tx, "Phase 3: Creating new indexes", parsedDDLs.AddIndexDDLs, true, log); err != nil {
-			log.Error("Error(s) occurred during creating new indexes. Transaction will be rolled back.", zap.Error(err))
 			return err
 		}
 
-		// Fase 4: ADD CONSTRAINT
-		var deferredFKs []string
-		var nonDeferredFKs []string
+		var deferredFKs, nonDeferredConstraints []string
 		if s.dstDialect == "postgres" {
-			deferredFKs, nonDeferredFKs = s.splitPostgresFKsForDeferredExecution(parsedDDLs.AddConstraintDDLs)
+			deferredFKs, nonDeferredConstraints = s.splitPostgresFKsForDeferredExecution(parsedDDLs.AddConstraintDDLs) // from syncer_ddl_executor.go
 		} else {
-			nonDeferredFKs = parsedDDLs.AddConstraintDDLs
+			nonDeferredConstraints = parsedDDLs.AddConstraintDDLs
 		}
 
-		if err := s.executeDDLPhase(tx, "Phase 4: Adding new non-deferred constraints", nonDeferredFKs, false, log); err != nil {
+		if err := s.executeDDLPhase(tx, "Phase 4: Adding new non-deferred constraints", nonDeferredConstraints, false, log); err != nil {
 			return err
 		}
-
 		if s.dstDialect == "postgres" && len(deferredFKs) > 0 {
 			if err := s.executeDDLPhase(tx, "Phase 4 (Postgres): Adding new DEFERRED FK constraints", deferredFKs, false, log); err != nil {
 				return err
@@ -306,12 +307,14 @@ func (s *SchemaSyncer) GetPrimaryKeys(ctx context.Context, table string) ([]stri
 		return []string{}, nil
 	}
 
-	pks := getPKColumnNames(srcSchema.Columns)
+	pks := getPKColumnNames(srcSchema.Columns) // from syncer_helpers.go
 	if len(pks) == 0 {
 		log.Debug("No primary key detected for table via column information. Checking constraints...")
 		for _, cons := range srcSchema.Constraints {
 			if cons.Type == "PRIMARY KEY" {
-				pks = cons.Columns
+				pks = make([]string, len(cons.Columns))
+				copy(pks, cons.Columns)
+				sort.Strings(pks) // Pastikan urutan konsisten
 				log.Info("Found primary key via constraints.", zap.Strings("pk_columns", pks))
 				break
 			}
@@ -326,34 +329,54 @@ func (s *SchemaSyncer) GetPrimaryKeys(ctx context.Context, table string) ([]stri
 }
 
 // GetFKDependencies mengambil dependensi FK keluar untuk daftar tabel yang diberikan.
-// Mengembalikan peta: nama tabel -> slice nama tabel yang dirujuk.
+// Mengembalikan peta: nama tabel -> slice nama tabel yang dirujuk (hanya jika tabel referensi ada di tableNames).
 func (s *SchemaSyncer) GetFKDependencies(ctx context.Context, db *gorm.DB, dialect string, tableNames []string) (map[string][]string, error) {
 	log := s.logger.With(zap.String("dialect", dialect), zap.String("action", "GetFKDependencies"))
-	log.Info("Fetching foreign key dependencies for tables.", zap.Strings("tables_to_query", tableNames))
+	log.Info("Fetching foreign key dependencies for tables.", zap.Strings("tables_to_query_for_fk_deps", tableNames))
 
 	dependencies := make(map[string][]string)
-	tableSet := make(map[string]bool)
+	tableSet := make(map[string]bool, len(tableNames))
 	for _, tn := range tableNames {
-		dependencies[tn] = []string{} // Inisialisasi
+		dependencies[tn] = []string{}
 		tableSet[tn] = true
 	}
 
 	for _, tableName := range tableNames {
-		constraints, err := s.getConstraints(ctx, db, dialect, tableName)
+		constraints, err := s.getConstraints(ctx, db, dialect, tableName) // from syncer_fetch_dispatch.go
 		if err != nil {
-			log.Error("Failed to get constraints for FK dependency analysis", zap.String("table", tableName), zap.Error(err))
-			return nil, fmt.Errorf("failed to get constraints for table %s (dialect: %s) for FK dependency: %w", tableName, dialect, err)
+			log.Error("Failed to get constraints for FK dependency analysis. This might affect table processing order.",
+				zap.String("table_being_analyzed", tableName), zap.Error(err))
+			continue
 		}
 
+		currentTableFkTargets := make(map[string]bool)
 		for _, cons := range constraints {
 			if cons.Type == "FOREIGN KEY" && cons.ForeignTable != "" && cons.ForeignTable != tableName {
-				// Hanya pertimbangkan FK ke tabel lain yang juga ada dalam set yang disinkronkan
 				if _, isRelevantForeignTable := tableSet[cons.ForeignTable]; isRelevantForeignTable {
-					dependencies[tableName] = append(dependencies[tableName], cons.ForeignTable)
+					if !currentTableFkTargets[cons.ForeignTable] {
+						dependencies[tableName] = append(dependencies[tableName], cons.ForeignTable)
+						currentTableFkTargets[cons.ForeignTable] = true
+					}
 				}
 			}
 		}
+		if len(dependencies[tableName]) > 0 {
+			sort.Strings(dependencies[tableName]) // Urutkan untuk konsistensi
+		}
 	}
-	log.Debug("Foreign key dependencies fetched.", zap.Any("dependencies_map", dependencies))
+
+	if log.Core().Enabled(zap.DebugLevel) {
+		debugDeps := make(map[string][]string)
+		for k, v := range dependencies {
+			if len(v) > 0 {
+				debugDeps[k] = v
+			}
+		}
+		if len(debugDeps) > 0 {
+			log.Debug("Foreign key dependencies (table -> its prerequisites within the sync set) fetched.", zap.Any("dependencies_map", debugDeps))
+		} else {
+			log.Debug("No relevant foreign key dependencies found among the set of tables being synced.")
+		}
+	}
 	return dependencies, nil
 }

@@ -5,9 +5,10 @@ package integration
 import (
 	"context"
 	"database/sql"
+	"errors" // <--- THIS IMPORT WAS MISSING
 	"fmt"
 	"os"
-	"path/filepath" // For robust path joining
+	"path/filepath" 
 	"strings"
 	"testing"
 	"time"
@@ -398,7 +399,6 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 
 	// --- Foreign Key Verification ---
 	verifyForeignKeyExists := func(t *testing.T, db *gorm.DB, fromTable, fromColumn, toTable, toColumn, fkNameHint string) {
-		// (Implementation from your original test - assumed correct and kept)
 		t.Helper()
 		var constraintName string
 		query := `
@@ -520,32 +520,4 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
     t.Run("VerifyPrimaryKey_product_variants", func(t *testing.T) {
 		verifyUniqueConstraintExists(t, targetDB.DB, "product_variants", []string{"variant_id"}, "product_variants_pkey")
 	})
-
-	// --- Index Verification (Example for a non-PK/UQ index if one existed) ---
-	// verifyIndexExists := func(t *testing.T, db *gorm.DB, tableName string, indexName string, expectedColumns []string, isUnique bool) {
-	// 	t.Helper()
-	// 	var indexDef struct {
-	// 		IndexName string `gorm:"column:indexname"`
-	// 		IndexDef  string `gorm:"column:indexdef"`
-	// 	}
-	// 	query := "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = current_schema() AND tablename = $1 AND indexname = $2;"
-	// 	queryCtx, queryCancel := context.WithTimeout(ctx, 10*time.Second)
-	// 	defer queryCancel()
-	// 	err := db.WithContext(queryCtx).Raw(query, tableName, indexName).First(&indexDef).Error
-	// 	require.NoError(t, err, "Index '%s' on table '%s' not found or error querying", indexName, tableName)
-
-	// 	if isUnique {
-	// 		assert.Contains(t, indexDef.IndexDef, "UNIQUE", "Index '%s' should be unique", indexName)
-	// 	} else {
-	// 		assert.NotContains(t, indexDef.IndexDef, "UNIQUE", "Index '%s' should not be unique", indexName)
-	// 	}
-	// 	for _, col := range expectedColumns {
-	// 		assert.Contains(t, indexDef.IndexDef, col, "Index '%s' definition should contain column '%s'", indexName, col)
-	// 	}
-	// }
-	// t.Run("VerifyIndex_posts_published_at", func(t *testing.T) { // Assuming source_schema.sql adds this index
-	// verifyIndexExists(t, targetDB.DB, "posts", "idx_posts_published_at", []string{"published_at"}, false)
-	// })
-	// Current source_schema.sql does not have explicit non-PK/UQ indexes, so this part is commented out.
-	// If `idx_posts_published_at` was added in source_schema.sql, this test would verify it.
 }

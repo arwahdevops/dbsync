@@ -74,10 +74,9 @@ func (s *SchemaSyncer) getSQLiteColumns(ctx context.Context, db *gorm.DB, table 
 			// Collation per kolom di SQLite didefinisikan dalam CREATE TABLE
 			var collation sql.NullString
 			if createTableSQL != "" {
-			    collation.String = s.extractSQLiteColumnCollation(createTableSQL, c.Name)
-			    collation.Valid = collation.String != ""
+				collation.String = s.extractSQLiteColumnCollation(createTableSQL, c.Name)
+				collation.Valid = collation.String != ""
 			}
-
 
 			isAutoIncrement := c.Pk > 0 && strings.ToUpper(finalType) == "INTEGER" && !isGenerated
 			// AUTOINCREMENT keyword di SQLite hanya berlaku untuk ROWID alias (INTEGER PRIMARY KEY)
@@ -85,7 +84,6 @@ func (s *SchemaSyncer) getSQLiteColumns(ctx context.Context, db *gorm.DB, table 
 			if isAutoIncrement && createTableSQL != "" {
 				isAutoIncrement = s.checkSQLiteColumnAutoincrement(createTableSQL, c.Name)
 			}
-
 
 			result = append(result, ColumnInfo{
 				Name: c.Name, Type: finalType, IsNullable: c.NotNull == 0,
@@ -124,7 +122,7 @@ func (s *SchemaSyncer) getSQLiteColumns(ctx context.Context, db *gorm.DB, table 
 		}
 		return nil, fmt.Errorf("sqlite: PRAGMA table_info failed for table '%s': %w", table, err)
 	}
-    if len(columnsDataTableInfo) == 0 {
+	if len(columnsDataTableInfo) == 0 {
 		log.Warn("PRAGMA table_info returned no columns.")
 		return []ColumnInfo{}, nil
 	}
@@ -137,8 +135,8 @@ func (s *SchemaSyncer) getSQLiteColumns(ctx context.Context, db *gorm.DB, table 
 		}
 		var collation sql.NullString
 		if createTableSQL != "" {
-		    collation.String = s.extractSQLiteColumnCollation(createTableSQL, c.Name)
-		    collation.Valid = collation.String != ""
+			collation.String = s.extractSQLiteColumnCollation(createTableSQL, c.Name)
+			collation.Valid = collation.String != ""
 		}
 
 		result = append(result, ColumnInfo{
@@ -154,7 +152,9 @@ func (s *SchemaSyncer) getSQLiteColumns(ctx context.Context, db *gorm.DB, table 
 
 // extractSQLiteGeneratedColumnExpr (tetap sama dari iterasi sebelumnya, mungkin perlu penyempurnaan regex)
 func (s *SchemaSyncer) extractSQLiteGeneratedColumnExpr(createTableSQL, columnName string) string {
-	if createTableSQL == "" { return "" }
+	if createTableSQL == "" {
+		return ""
+	}
 	patterns := []string{
 		`(?i)\b` + regexp.QuoteMeta(columnName) + `\b\s+[^,)]+\s+GENERATED\s+ALWAYS\s+AS\s*\((.*?)\)`,
 		`(?i)"` + regexp.QuoteMeta(columnName) + `"\s+[^,)]+\s+GENERATED\s+ALWAYS\s+AS\s*\((.*?)\)`,
@@ -173,60 +173,76 @@ func (s *SchemaSyncer) extractSQLiteGeneratedColumnExpr(createTableSQL, columnNa
 
 // extractSQLiteColumnCollation mencoba mengekstrak klausa COLLATE untuk kolom tertentu.
 func (s *SchemaSyncer) extractSQLiteColumnCollation(createTableSQL, columnName string) string {
-    if createTableSQL == "" { return "" }
-    // Pola: `colName` type ... COLLATE `collationName`
-    // Perlu menangani quoting nama kolom dan nama kolasi.
-    // Ini adalah parser sederhana.
-    patterns := []string{
-        `(?i)\b` + regexp.QuoteMeta(columnName) + `\b[^,]*?\s+COLLATE\s+("?\w+"?|\w+)`,
-        `(?i)"` + regexp.QuoteMeta(columnName) + `"[^,]*?\s+COLLATE\s+("?\w+"?|\w+)`,
-        `(?i)\x60` + regexp.QuoteMeta(columnName) + `\x60[^,]*?\s+COLLATE\s+("?\w+"?|\w+)`,
-        `(?i)\[` + regexp.QuoteMeta(columnName) + `\][^,]*?\s+COLLATE\s+("?\w+"?|\w+)`,
-    }
-    for _, pattern := range patterns {
-        re := regexp.MustCompile(pattern)
-        matches := re.FindStringSubmatch(createTableSQL)
-        if len(matches) > 1 && matches[1] != "" {
-            return strings.Trim(matches[1], "\"`") // Hapus quote jika ada
-        }
-    }
-    return ""
+	if createTableSQL == "" {
+		return ""
+	}
+	// Pola: `colName` type ... COLLATE `collationName`
+	// Perlu menangani quoting nama kolom dan nama kolasi.
+	// Ini adalah parser sederhana.
+	patterns := []string{
+		`(?i)\b` + regexp.QuoteMeta(columnName) + `\b[^,]*?\s+COLLATE\s+("?\w+"?|\w+)`,
+		`(?i)"` + regexp.QuoteMeta(columnName) + `"[^,]*?\s+COLLATE\s+("?\w+"?|\w+)`,
+		`(?i)\x60` + regexp.QuoteMeta(columnName) + `\x60[^,]*?\s+COLLATE\s+("?\w+"?|\w+)`,
+		`(?i)\[` + regexp.QuoteMeta(columnName) + `\][^,]*?\s+COLLATE\s+("?\w+"?|\w+)`,
+	}
+	for _, pattern := range patterns {
+		re := regexp.MustCompile(pattern)
+		matches := re.FindStringSubmatch(createTableSQL)
+		if len(matches) > 1 && matches[1] != "" {
+			return strings.Trim(matches[1], "\"`") // Hapus quote jika ada
+		}
+	}
+	return ""
 }
 
 // checkSQLiteColumnAutoincrement memeriksa apakah keyword AUTOINCREMENT ada untuk kolom PK.
 func (s *SchemaSyncer) checkSQLiteColumnAutoincrement(createTableSQL, columnName string) bool {
-    if createTableSQL == "" { return false }
-    // Pola: `colName` INTEGER PRIMARY KEY AUTOINCREMENT
-    patterns := []string{
-        `(?i)\b` + regexp.QuoteMeta(columnName) + `\b\s+INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT`,
-        `(?i)"` + regexp.QuoteMeta(columnName) + `"\s+INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT`,
-        `(?i)\x60` + regexp.QuoteMeta(columnName) + `\x60\s+INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT`,
-        `(?i)\[` + regexp.QuoteMeta(columnName) + `\]\s+INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT`,
-    }
-     for _, pattern := range patterns {
-        re := regexp.MustCompile(pattern)
-        if re.MatchString(createTableSQL) {
-            return true
-        }
-    }
-    return false
+	if createTableSQL == "" {
+		return false
+	}
+	// Pola: `colName` INTEGER PRIMARY KEY AUTOINCREMENT
+	patterns := []string{
+		`(?i)\b` + regexp.QuoteMeta(columnName) + `\b\s+INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT`,
+		`(?i)"` + regexp.QuoteMeta(columnName) + `"\s+INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT`,
+		`(?i)\x60` + regexp.QuoteMeta(columnName) + `\x60\s+INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT`,
+		`(?i)\[` + regexp.QuoteMeta(columnName) + `\]\s+INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT`,
+	}
+	for _, pattern := range patterns {
+		re := regexp.MustCompile(pattern)
+		if re.MatchString(createTableSQL) {
+			return true
+		}
+	}
+	return false
 }
-
 
 func (s *SchemaSyncer) getSQLiteIndexes(ctx context.Context, db *gorm.DB, table string) ([]IndexInfo, error) {
 	log := s.logger.With(zap.String("table", table), zap.String("dialect", "sqlite"), zap.String("action", "getSQLiteIndexes"))
 
 	var count int64
 	db.WithContext(ctx).Raw("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&count)
-	if count == 0 { log.Warn("Table not found, cannot fetch indexes."); return []IndexInfo{}, nil }
+	if count == 0 {
+		log.Warn("Table not found, cannot fetch indexes.")
+		return []IndexInfo{}, nil
+	}
 
-	var indexList []struct { Name string `gorm:"column:name"`; Unique int `gorm:"column:unique"`; Origin string `gorm:"column:origin"`	}
+	var indexList []struct {
+		Name   string `gorm:"column:name"`
+		Unique int    `gorm:"column:unique"`
+		Origin string `gorm:"column:origin"`
+	}
 	pragmaIndexListQuery := fmt.Sprintf("PRAGMA index_list(%s)", utils.QuoteIdentifier(table, "sqlite"))
 	if err := db.WithContext(ctx).Raw(pragmaIndexListQuery).Scan(&indexList).Error; err != nil {
-		if err == gorm.ErrRecordNotFound { log.Debug("No indexes found for table via PRAGMA index_list."); return []IndexInfo{}, nil }
+		if err == gorm.ErrRecordNotFound {
+			log.Debug("No indexes found for table via PRAGMA index_list.")
+			return []IndexInfo{}, nil
+		}
 		return nil, fmt.Errorf("sqlite: PRAGMA index_list failed for table '%s': %w", table, err)
 	}
-	if len(indexList) == 0 { log.Debug("No indexes returned by PRAGMA index_list."); return []IndexInfo{}, nil }
+	if len(indexList) == 0 {
+		log.Debug("No indexes returned by PRAGMA index_list.")
+		return []IndexInfo{}, nil
+	}
 
 	indexes := make([]IndexInfo, 0, len(indexList))
 	for _, idxItem := range indexList {
@@ -234,7 +250,10 @@ func (s *SchemaSyncer) getSQLiteIndexes(ctx context.Context, db *gorm.DB, table 
 			log.Debug("Skipping SQLite auto-generated index.", zap.String("index_name", idxItem.Name))
 			continue
 		}
-		var columnsForThisIndex []struct { SeqNo int `gorm:"column:seqno"`; Name sql.NullString `gorm:"column:name"`}
+		var columnsForThisIndex []struct {
+			SeqNo int            `gorm:"column:seqno"`
+			Name  sql.NullString `gorm:"column:name"`
+		}
 		pragmaIndexInfoQuery := fmt.Sprintf("PRAGMA index_info(%s)", utils.QuoteIdentifier(idxItem.Name, "sqlite"))
 		if errInfo := db.WithContext(ctx).Raw(pragmaIndexInfoQuery).Scan(&columnsForThisIndex).Error; errInfo != nil {
 			log.Warn("sqlite: PRAGMA index_info failed, skipping this index.", zap.String("index_name", idxItem.Name), zap.Error(errInfo))
@@ -245,23 +264,30 @@ func (s *SchemaSyncer) getSQLiteIndexes(ctx context.Context, db *gorm.DB, table 
 			continue
 		}
 
-		tempCols := make(map[int]string); maxSeqNo := -1; hasExpression := false
+		tempCols := make(map[int]string)
+		maxSeqNo := -1
+		hasExpression := false
 		for _, colInfo := range columnsForThisIndex {
 			colName := fmt.Sprintf("<expression_seq_%d>", colInfo.SeqNo) // Default jika nama kolom NULL
-			if colInfo.Name.Valid && colInfo.Name.String != "" { colName = colInfo.Name.String } else { hasExpression = true }
+			if colInfo.Name.Valid && colInfo.Name.String != "" {
+				colName = colInfo.Name.String
+			} else {
+				hasExpression = true
+			}
 			tempCols[colInfo.SeqNo] = colName
-			if colInfo.SeqNo > maxSeqNo { maxSeqNo = colInfo.SeqNo }
+			if colInfo.SeqNo > maxSeqNo {
+				maxSeqNo = colInfo.SeqNo
+			}
 		}
 		finalColumns := make([]string, 0, maxSeqNo+1) // Inisialisasi dengan kapasitas
-		for i := 0; i <= maxSeqNo; i++ { // Iterasi dari 0 sampai maxSeqNo
-		    if name, ok := tempCols[i]; ok {
-		        finalColumns = append(finalColumns, name)
-		    } else {
-		        // Ini seharusnya tidak terjadi jika SeqNo continuous dan 0-based
-		        log.Warn("Missing sequence number in PRAGMA index_info results, index columns might be incomplete.", zap.Int("missing_seq", i), zap.String("index_name", idxItem.Name))
-		    }
+		for i := 0; i <= maxSeqNo; i++ {              // Iterasi dari 0 sampai maxSeqNo
+			if name, ok := tempCols[i]; ok {
+				finalColumns = append(finalColumns, name)
+			} else {
+				// Ini seharusnya tidak terjadi jika SeqNo continuous dan 0-based
+				log.Warn("Missing sequence number in PRAGMA index_info results, index columns might be incomplete.", zap.Int("missing_seq", i), zap.String("index_name", idxItem.Name))
+			}
 		}
-
 
 		var rawDefSQL string
 		// Ambil DDL jika ada ekspresi atau jika origin bukan 'c' (karena PK/UQ mungkin tidak punya DDL CREATE INDEX eksplisit)
@@ -286,32 +312,51 @@ func (s *SchemaSyncer) getSQLiteConstraints(ctx context.Context, db *gorm.DB, ta
 
 	var count int64
 	db.WithContext(ctx).Raw("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&count)
-	if count == 0 { log.Warn("Table not found, cannot fetch constraints."); return []ConstraintInfo{}, nil }
+	if count == 0 {
+		log.Warn("Table not found, cannot fetch constraints.")
+		return []ConstraintInfo{}, nil
+	}
 
 	consMap := make(map[string]*ConstraintInfo)
 	var fkList []struct {
-		ID int `gorm:"column:id"`; Seq int `gorm:"column:seq"`; Table string `gorm:"column:table"`
-		From string `gorm:"column:from"`; To string `gorm:"column:to"`; OnUpdate string `gorm:"column:on_update"`
+		ID       int    `gorm:"column:id"`
+		Seq      int    `gorm:"column:seq"`
+		Table    string `gorm:"column:table"`
+		From     string `gorm:"column:from"`
+		To       string `gorm:"column:to"`
+		OnUpdate string `gorm:"column:on_update"`
 		OnDelete string `gorm:"column:on_delete"`
 	}
 	pragmaFKQuery := fmt.Sprintf("PRAGMA foreign_key_list(%s)", utils.QuoteIdentifier(table, "sqlite"))
 	if errFK := db.WithContext(ctx).Raw(pragmaFKQuery).Scan(&fkList).Error; errFK != nil && errFK != gorm.ErrRecordNotFound {
 		log.Warn("sqlite: PRAGMA foreign_key_list failed, FK constraints might be missed.", zap.Error(errFK))
 	} else if len(fkList) > 0 {
-		fkGroup := make(map[int][]struct{ Seq int; Local, Foreign string })
+		fkGroup := make(map[int][]struct {
+			Seq            int
+			Local, Foreign string
+		})
 		fkDetails := make(map[int]ConstraintInfo)
 		for _, fk := range fkList {
 			if _, ok := fkDetails[fk.ID]; !ok {
 				fkName := fmt.Sprintf("fk_%s_auto_id%d_pragma", table, fk.ID) // Nama sementara dari pragma
 				fkDetails[fk.ID] = ConstraintInfo{Name: fkName, Type: "FOREIGN KEY", ForeignTable: fk.Table, OnUpdate: fk.OnUpdate, OnDelete: fk.OnDelete}
-				fkGroup[fk.ID] = make([]struct{ Seq int; Local, Foreign string }, 0)
+				fkGroup[fk.ID] = make([]struct {
+					Seq            int
+					Local, Foreign string
+				}, 0)
 			}
-			fkGroup[fk.ID] = append(fkGroup[fk.ID], struct{ Seq int; Local, Foreign string }{Seq: fk.Seq, Local: fk.From, Foreign: fk.To})
+			fkGroup[fk.ID] = append(fkGroup[fk.ID], struct {
+				Seq            int
+				Local, Foreign string
+			}{Seq: fk.Seq, Local: fk.From, Foreign: fk.To})
 		}
 		for id, details := range fkDetails {
-			colPairs := fkGroup[id]; sort.Slice(colPairs, func(i, j int) bool { return colPairs[i].Seq < colPairs[j].Seq })
+			colPairs := fkGroup[id]
+			sort.Slice(colPairs, func(i, j int) bool { return colPairs[i].Seq < colPairs[j].Seq })
 			localCols, foreignCols := make([]string, len(colPairs)), make([]string, len(colPairs))
-			for i, pair := range colPairs { localCols[i], foreignCols[i] = pair.Local, pair.Foreign }
+			for i, pair := range colPairs {
+				localCols[i], foreignCols[i] = pair.Local, pair.Foreign
+			}
 			details.Columns, details.ForeignColumns = localCols, foreignCols
 			consMap[details.Name] = &details
 		}
@@ -327,22 +372,29 @@ func (s *SchemaSyncer) getSQLiteConstraints(ctx context.Context, db *gorm.DB, ta
 		// Ini perlu dipertimbangkan. Idealnya, parser DDL constraint juga mencoba mengekstrak detail FK.
 		// Untuk sekarang, kita tambahkan hasil parsing DDL ke map.
 		pkInfo := parseSQLitePKFromDDL(createTableSQL, table) // Beri nama tabel untuk PK default
-		if pkInfo.Name != "" { consMap[pkInfo.Name] = &pkInfo }
+		if pkInfo.Name != "" {
+			consMap[pkInfo.Name] = &pkInfo
+		}
 
 		uniqueInfos := parseSQLiteUniqueFromDDL(createTableSQL, table)
-		for _, uqInfo := range uniqueInfos { consMap[uqInfo.Name] = &uqInfo }
+		for _, uqInfo := range uniqueInfos {
+			consMap[uqInfo.Name] = &uqInfo
+		}
 
 		checkInfos := parseSQLiteChecksFromDDL(createTableSQL, table)
-		for _, chkInfo := range checkInfos { consMap[chkInfo.Name] = &chkInfo }
+		for _, chkInfo := range checkInfos {
+			consMap[chkInfo.Name] = &chkInfo
+		}
 	}
 
 	constraints := make([]ConstraintInfo, 0, len(consMap))
-	for _, cons := range consMap { constraints = append(constraints, *cons) }
+	for _, cons := range consMap {
+		constraints = append(constraints, *cons)
+	}
 	sort.Slice(constraints, func(i, j int) bool { return constraints[i].Name < constraints[j].Name })
 	log.Debug("Fetched SQLite constraint info successfully.", zap.Int("constraint_count", len(constraints)))
 	return constraints, nil
 }
-
 
 // --- Helper Parsing SQLite CREATE TABLE ---
 // parseSQLitePKFromDDL, parseSQLiteUniqueFromDDL, parseSQLiteChecksFromDDL
@@ -350,78 +402,84 @@ func (s *SchemaSyncer) getSQLiteConstraints(ctx context.Context, db *gorm.DB, ta
 //  untuk membuat nama constraint default jika tidak ada nama eksplisit)
 
 func parseSQLitePKFromDDL(sql string, tableName string) ConstraintInfo {
-    rePK := regexp.MustCompile(`(?i)(?:CONSTRAINT\s+("?(?P<name>\w+)"?)\s+)?PRIMARY\s+KEY\s*\((?P<cols>[^)]+)\)`)
-    matches := rePK.FindStringSubmatch(sql)
-    pkInfo := ConstraintInfo{Type: "PRIMARY KEY"}
-    if len(matches) > 0 {
-        resultMap := make(map[string]string)
-        for i, name := range rePK.SubexpNames() {
-            if i != 0 && name != "" && i < len(matches) { resultMap[name] = matches[i] }
-        }
-        pkInfo.Name = strings.Trim(resultMap["name"], "\"`[]")
-        if pkInfo.Name == "" { // Jika PK tidak punya nama eksplisit, buat nama default
-            pkInfo.Name = fmt.Sprintf("pk_%s", tableName) 
-        }
-        colsStr := resultMap["cols"]
-        for _, rawCol := range strings.Split(colsStr, ",") {
-            if unquoted := strings.Trim(strings.TrimSpace(rawCol), "\"`[]"); unquoted != "" {
-                pkInfo.Columns = append(pkInfo.Columns, unquoted)
-            }
-        }
-        if len(pkInfo.Columns) > 0 {
-            // Urutan kolom PK dari DDL harus dipertahankan, jangan sort di sini.
-            return pkInfo
-        }
-    }
-    return ConstraintInfo{} // Tidak ada PK eksplisit (mungkin inline di kolom)
+	rePK := regexp.MustCompile(`(?i)(?:CONSTRAINT\s+("?(?P<name>\w+)"?)\s+)?PRIMARY\s+KEY\s*\((?P<cols>[^)]+)\)`)
+	matches := rePK.FindStringSubmatch(sql)
+	pkInfo := ConstraintInfo{Type: "PRIMARY KEY"}
+	if len(matches) > 0 {
+		resultMap := make(map[string]string)
+		for i, name := range rePK.SubexpNames() {
+			if i != 0 && name != "" && i < len(matches) {
+				resultMap[name] = matches[i]
+			}
+		}
+		pkInfo.Name = strings.Trim(resultMap["name"], "\"`[]")
+		if pkInfo.Name == "" { // Jika PK tidak punya nama eksplisit, buat nama default
+			pkInfo.Name = fmt.Sprintf("pk_%s", tableName)
+		}
+		colsStr := resultMap["cols"]
+		for _, rawCol := range strings.Split(colsStr, ",") {
+			if unquoted := strings.Trim(strings.TrimSpace(rawCol), "\"`[]"); unquoted != "" {
+				pkInfo.Columns = append(pkInfo.Columns, unquoted)
+			}
+		}
+		if len(pkInfo.Columns) > 0 {
+			// Urutan kolom PK dari DDL harus dipertahankan, jangan sort di sini.
+			return pkInfo
+		}
+	}
+	return ConstraintInfo{} // Tidak ada PK eksplisit (mungkin inline di kolom)
 }
 
 func parseSQLiteUniqueFromDDL(sql string, tableName string) []ConstraintInfo {
-    var uniques []ConstraintInfo
-    reUQ := regexp.MustCompile(`(?i)CONSTRAINT\s+("?(?P<name>\w+)"?)\s+UNIQUE\s*\((?P<cols>[^)]+)\)`)
-    allMatches := reUQ.FindAllStringSubmatch(sql, -1)
-    for i, matches := range allMatches {
-        uqInfo := ConstraintInfo{Type: "UNIQUE"}
-        resultMap := make(map[string]string)
-        for j, name := range reUQ.SubexpNames() {
-            if j != 0 && name != "" && j < len(matches) { resultMap[name] = matches[j] }
-        }
-        uqInfo.Name = strings.Trim(resultMap["name"], "\"`[]")
-        if uqInfo.Name == "" { // Beri nama default jika tidak ada
-             uqInfo.Name = fmt.Sprintf("uq_%s_auto_%d", tableName, i+1)
-        }
-        colsStr := resultMap["cols"]
-        for _, rawCol := range strings.Split(colsStr, ",") {
-            if unquoted := strings.Trim(strings.TrimSpace(rawCol), "\"`[]"); unquoted != "" {
-                uqInfo.Columns = append(uqInfo.Columns, unquoted)
-            }
-        }
-        if len(uqInfo.Columns) > 0 {
-            // Urutan kolom UNIQUE dari DDL dipertahankan.
-            uniques = append(uniques, uqInfo)
-        }
-    }
-    return uniques
+	var uniques []ConstraintInfo
+	reUQ := regexp.MustCompile(`(?i)CONSTRAINT\s+("?(?P<name>\w+)"?)\s+UNIQUE\s*\((?P<cols>[^)]+)\)`)
+	allMatches := reUQ.FindAllStringSubmatch(sql, -1)
+	for i, matches := range allMatches {
+		uqInfo := ConstraintInfo{Type: "UNIQUE"}
+		resultMap := make(map[string]string)
+		for j, name := range reUQ.SubexpNames() {
+			if j != 0 && name != "" && j < len(matches) {
+				resultMap[name] = matches[j]
+			}
+		}
+		uqInfo.Name = strings.Trim(resultMap["name"], "\"`[]")
+		if uqInfo.Name == "" { // Beri nama default jika tidak ada
+			uqInfo.Name = fmt.Sprintf("uq_%s_auto_%d", tableName, i+1)
+		}
+		colsStr := resultMap["cols"]
+		for _, rawCol := range strings.Split(colsStr, ",") {
+			if unquoted := strings.Trim(strings.TrimSpace(rawCol), "\"`[]"); unquoted != "" {
+				uqInfo.Columns = append(uqInfo.Columns, unquoted)
+			}
+		}
+		if len(uqInfo.Columns) > 0 {
+			// Urutan kolom UNIQUE dari DDL dipertahankan.
+			uniques = append(uniques, uqInfo)
+		}
+	}
+	return uniques
 }
 
 func parseSQLiteChecksFromDDL(sql string, tableName string) []ConstraintInfo {
-    var checks []ConstraintInfo
-    reCheck := regexp.MustCompile(`(?i)CONSTRAINT\s+("?(?P<name>\w+)"?)\s+CHECK\s*\((?P<expr>.*?)\)(?:\s*,|\s*\)|$)`)
-    allMatches := reCheck.FindAllStringSubmatch(sql, -1)
-    for i, matches := range allMatches {
-        chkInfo := ConstraintInfo{Type: "CHECK"}
-        resultMap := make(map[string]string)
-        for j, name := range reCheck.SubexpNames() {
-            if j != 0 && name != "" && j < len(matches) { resultMap[name] = matches[j] }
-        }
-        chkInfo.Name = strings.Trim(resultMap["name"], "\"`[]")
-         if chkInfo.Name == "" { // Beri nama default jika tidak ada
-             chkInfo.Name = fmt.Sprintf("chk_%s_auto_%d", tableName, i+1)
-        }
-        chkInfo.Definition = strings.TrimSpace(resultMap["expr"])
-        if chkInfo.Definition != "" { // Nama boleh kosong jika inline, tapi definisi harus ada
-            checks = append(checks, chkInfo)
-        }
-    }
-    return checks
+	var checks []ConstraintInfo
+	reCheck := regexp.MustCompile(`(?i)CONSTRAINT\s+("?(?P<name>\w+)"?)\s+CHECK\s*\((?P<expr>.*?)\)(?:\s*,|\s*\)|$)`)
+	allMatches := reCheck.FindAllStringSubmatch(sql, -1)
+	for i, matches := range allMatches {
+		chkInfo := ConstraintInfo{Type: "CHECK"}
+		resultMap := make(map[string]string)
+		for j, name := range reCheck.SubexpNames() {
+			if j != 0 && name != "" && j < len(matches) {
+				resultMap[name] = matches[j]
+			}
+		}
+		chkInfo.Name = strings.Trim(resultMap["name"], "\"`[]")
+		if chkInfo.Name == "" { // Beri nama default jika tidak ada
+			chkInfo.Name = fmt.Sprintf("chk_%s_auto_%d", tableName, i+1)
+		}
+		chkInfo.Definition = strings.TrimSpace(resultMap["expr"])
+		if chkInfo.Definition != "" { // Nama boleh kosong jika inline, tapi definisi harus ada
+			checks = append(checks, chkInfo)
+		}
+	}
+	return checks
 }

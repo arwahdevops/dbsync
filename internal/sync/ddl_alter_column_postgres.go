@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"go.uber.org/zap"
 	"github.com/arwahdevops/dbsync/internal/utils"
+	"go.uber.org/zap"
 )
 
 // generatePostgresModifyColumnDDLs menghasilkan DDLs untuk mengubah kolom di PostgreSQL.
@@ -99,7 +99,7 @@ func (s *SchemaSyncer) generatePostgresModifyColumnDDLs(table string, src Column
 			// src.MappedType adalah *tipe dasar* yang diinginkan.
 			if !dst.IsGenerated || (src.IsGenerated && dst.IsGenerated && src.MappedType != extractBaseTypeFromGenerated(dst.Type, log)) {
 				targetTypeDDL := src.MappedType // Ini adalah tipe dasar target + modifier yang sudah benar.
-				
+
 				// Ambil PostgresUsingExpr. originalSrcTypeForMappingKey sudah memperhitungkan jika src generated.
 				var originalSrcTypeForMappingKey string
 				if src.IsGenerated {
@@ -142,9 +142,8 @@ func (s *SchemaSyncer) generatePostgresModifyColumnDDLs(table string, src Column
 				hasAlteredTypeOrGeneratedStatus = true
 			} else if dst.IsGenerated {
 				log.Debug("Skipping ALTER COLUMN TYPE because destination column is generated and its generated status is not being changed by this sync pass, or base types match.",
-				    zap.String("column", src.Name), zap.String("src_mapped_type", src.MappedType), zap.String("dst_base_type", extractBaseTypeFromGenerated(dst.Type, log)))
+					zap.String("column", src.Name), zap.String("src_mapped_type", src.MappedType), zap.String("dst_base_type", extractBaseTypeFromGenerated(dst.Type, log)))
 			}
-
 
 		case strings.HasPrefix(diff, "nullability"):
 			// Perubahan nullability bisa diterapkan meskipun kolomnya generated.
@@ -165,7 +164,7 @@ func (s *SchemaSyncer) generatePostgresModifyColumnDDLs(table string, src Column
 					// Pastikan kita tidak mencoba SET DEFAULT untuk fungsi DB yang sama (misal, nextval() yang mungkin sudah implisit)
 					// Atau jika formattedDefault adalah keyword fungsi yang tidak perlu 'SET DEFAULT'
 					if !isKnownDbFunction(normalizeDefaultValue(formattedDefault, s.dstDialect)) ||
-					   (s.dstDialect == "postgres" && strings.HasPrefix(strings.ToLower(formattedDefault), "nextval(")) { // nextval ditangani oleh identity/serial
+						(s.dstDialect == "postgres" && strings.HasPrefix(strings.ToLower(formattedDefault), "nextval(")) { // nextval ditangani oleh identity/serial
 						ddl = fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;", quotedTable, quotedColumnName, formattedDefault)
 					} else {
 						// Jika kolom sebelumnya punya default dan sekarang sumber tidak (atau defaultnya NULL/fungsi implisit), kita DROP DEFAULT.
@@ -195,11 +194,12 @@ func (s *SchemaSyncer) generatePostgresModifyColumnDDLs(table string, src Column
 					// Untuk sekarang, tambahkan saja. Eksekutor DDL mungkin perlu lebih pintar.
 					// Atau, kita bisa berasumsi ADD GENERATED akan menimpa/menghapus default.
 					// Kita tambahkan saja, lebih aman.
-					if ddlDropOldDefault != "" { ddls = append(ddls, ddlDropOldDefault) }
+					if ddlDropOldDefault != "" {
+						ddls = append(ddls, ddlDropOldDefault)
+					}
 
 				}
 			}
-
 
 		case strings.HasPrefix(diff, "collation"):
 			// Collation hanya bisa diubah bersamaan dengan tipe di PostgreSQL.
@@ -233,7 +233,6 @@ func (s *SchemaSyncer) generatePostgresModifyColumnDDLs(table string, src Column
 			} else {
 				log.Debug("Skipping collation modification as column is generated.", zap.String("column", src.Name))
 			}
-
 
 		case strings.HasPrefix(diff, "auto_increment"):
 			// Perubahan status identity (auto_increment)

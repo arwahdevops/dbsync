@@ -167,7 +167,6 @@ func (s *SchemaSyncer) mapColumnDefinition(col ColumnInfo) (quotedName string, t
 	return // quotedName, typeAndAttributes, nil
 }
 
-
 // generateCreateIndexDDLs (tetap sama)
 func (s *SchemaSyncer) generateCreateIndexDDLs(table string, indexes []IndexInfo) []string {
 	ddls := make([]string, 0, len(indexes))
@@ -190,7 +189,10 @@ func (s *SchemaSyncer) generateCreateIndexDDLs(table string, indexes []IndexInfo
 			quotedCols[i] = utils.QuoteIdentifier(colName, s.dstDialect)
 		}
 
-		uniqueKeyword := ""; if idx.IsUnique { uniqueKeyword = "UNIQUE " }
+		uniqueKeyword := ""
+		if idx.IsUnique {
+			uniqueKeyword = "UNIQUE "
+		}
 		ifNotExistsKeyword := ""
 		if s.dstDialect == "postgres" || s.dstDialect == "sqlite" {
 			ifNotExistsKeyword = "IF NOT EXISTS "
@@ -274,8 +276,12 @@ func (s *SchemaSyncer) generateAddConstraintDDLs(table string, constraints []Con
 			onDeleteAction := normalizeFKAction(c.OnDelete)
 			onUpdateAction := normalizeFKAction(c.OnUpdate)
 			fkActions := ""
-			if onDeleteAction != "NO ACTION" && onDeleteAction != "" { fkActions += " ON DELETE " + onDeleteAction }
-			if onUpdateAction != "NO ACTION" && onUpdateAction != "" { fkActions += " ON UPDATE " + onUpdateAction }
+			if onDeleteAction != "NO ACTION" && onDeleteAction != "" {
+				fkActions += " ON DELETE " + onDeleteAction
+			}
+			if onUpdateAction != "NO ACTION" && onUpdateAction != "" {
+				fkActions += " ON UPDATE " + onUpdateAction
+			}
 
 			deferrableClause := ""
 			if s.dstDialect == "postgres" {
@@ -312,7 +318,6 @@ func (s *SchemaSyncer) generateAddConstraintDDLs(table string, constraints []Con
 	return ddls
 }
 
-
 // --- Helper untuk DDL Create/Modify (getAutoIncrementSyntax, formatDefaultValue, getCollationSyntax, getCommentSyntax tetap sama) ---
 func (s *SchemaSyncer) getAutoIncrementSyntax(mappedDestType string) string {
 	normMappedDestType := normalizeTypeName(mappedDestType)
@@ -348,14 +353,22 @@ func (s *SchemaSyncer) formatDefaultValue(value, mappedDataType string) string {
 		(s.dstDialect == "sqlite" && normType == "boolean") { // SQLite boolean sering INT 0/1
 
 		normVal := normalizeDefaultValue(value, s.srcDialect) // Normalisasi dari nilai sumber
-		if normVal == "1" { // "1" adalah hasil normalisasi untuk true-ish values
-			if s.dstDialect == "postgres" { return "TRUE" }
-			if s.dstDialect == "sqlite" { return "1" } // SQLite boolean biasanya 1
+		if normVal == "1" {                                   // "1" adalah hasil normalisasi untuk true-ish values
+			if s.dstDialect == "postgres" {
+				return "TRUE"
+			}
+			if s.dstDialect == "sqlite" {
+				return "1"
+			} // SQLite boolean biasanya 1
 			return "'1'" // MySQL tinyint(1) defaultnya perlu di-quote jika diset sebagai string
 		}
 		if normVal == "0" { // "0" adalah hasil normalisasi untuk false-ish values
-			if s.dstDialect == "postgres" { return "FALSE" }
-			if s.dstDialect == "sqlite" { return "0" } // SQLite boolean biasanya 0
+			if s.dstDialect == "postgres" {
+				return "FALSE"
+			}
+			if s.dstDialect == "sqlite" {
+				return "0"
+			} // SQLite boolean biasanya 0
 			return "'0'" // MySQL tinyint(1)
 		}
 	}
@@ -366,7 +379,7 @@ func (s *SchemaSyncer) formatDefaultValue(value, mappedDataType string) string {
 		// Jika sumbernya adalah literal numerik, tapi di-quote ('123'), normalisasi akan menghapus quote.
 		// Di sini kita ingin memastikan default numerik tidak di-quote di DDL tujuan.
 		valToCheck := normalizeDefaultValue(value, s.srcDialect) // Normalisasi lagi dari nilai asli sumber
-		if !isDefaultNullOrFunction(valToCheck) { // Bukan NULL atau fungsi
+		if !isDefaultNullOrFunction(valToCheck) {                // Bukan NULL atau fungsi
 			if _, err := strconv.ParseFloat(valToCheck, 64); err == nil {
 				// Jika value bisa di-parse sebagai float setelah normalisasi (menghapus quote),
 				// gunakan valToCheck (yang sudah tanpa quote).
@@ -380,7 +393,7 @@ func (s *SchemaSyncer) formatDefaultValue(value, mappedDataType string) string {
 		// Jika valToCheck adalah fungsi (mis. CURRENT_TIMESTAMP), atau tidak bisa di-parse sbg float,
 		// biarkan jatuh ke logika quoting di bawah, yang mungkin benar untuk fungsi atau string default yang kompleks.
 	}
-	
+
 	// Untuk tipe bit/varbit PostgreSQL
 	if s.dstDialect == "postgres" && (normType == "bit" || normType == "varbit") {
 		// Jika value sudah dalam format B'...' atau X'...', biarkan.
@@ -399,7 +412,9 @@ func (s *SchemaSyncer) formatDefaultValue(value, mappedDataType string) string {
 }
 
 func (s *SchemaSyncer) getCollationSyntax(collationName string) string {
-	if collationName == "" { return "" }
+	if collationName == "" {
+		return ""
+	}
 	// Hanya terapkan collation jika dialek sumber dan tujuan sama,
 	// karena nama collation tidak portabel.
 	if s.srcDialect != s.dstDialect {
@@ -423,11 +438,13 @@ func (s *SchemaSyncer) getCollationSyntax(collationName string) string {
 }
 
 func (s *SchemaSyncer) getCommentSyntax(comment string) string {
-	if comment == "" { return "" }
+	if comment == "" {
+		return ""
+	}
 	if s.dstDialect == "mysql" {
 		// MySQL mendukung COMMENT inline
-		escapedComment := strings.ReplaceAll(comment, "\\", "\\\\") // Escape backslash
-		escapedComment = strings.ReplaceAll(escapedComment, "'", "''")  // Escape single quote
+		escapedComment := strings.ReplaceAll(comment, "\\", "\\\\")    // Escape backslash
+		escapedComment = strings.ReplaceAll(escapedComment, "'", "''") // Escape single quote
 		return fmt.Sprintf("COMMENT '%s'", escapedComment)
 	}
 	// PostgreSQL dan SQLite memerlukan statement COMMENT ON terpisah, jadi tidak di-handle di sini.

@@ -18,7 +18,6 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-
 	// Impor logger dbsync jika Anda ingin menggunakan GORM logger kustom di sini
 	// dbsync_logger "github.com/arwahdevops/dbsync/internal/logger"
 )
@@ -127,9 +126,9 @@ func startMySQLContainer(ctx context.Context, t *testing.T) *TestDBInstance {
 		Image:        mysqlImage,
 		ExposedPorts: []string{"3306/tcp"},
 		Env: map[string]string{
-			"MYSQL_DATABASE":       dbName,
-			"MYSQL_USER":         dbUser,
-			"MYSQL_PASSWORD":     dbPassword,
+			"MYSQL_DATABASE":      dbName,
+			"MYSQL_USER":          dbUser,
+			"MYSQL_PASSWORD":      dbPassword,
 			"MYSQL_ROOT_PASSWORD": rootPassword,
 		},
 		WaitingFor: wait.ForListeningPort("3306/tcp").
@@ -312,7 +311,7 @@ func splitSQLStatements(sqlScript string) []string {
 				// anggap itu statement selesai jika diakhiri titik koma sebelumnya, atau bagian dari statement.
 				// Untuk keamanan, kita tambahkan newline agar split di bawahnya bekerja jika ada statement sebelum komentar.
 				if currentStatement.Len() > 0 {
-				    currentStatement.WriteString("\n")
+					currentStatement.WriteString("\n")
 				}
 				continue
 			}
@@ -321,7 +320,7 @@ func splitSQLStatements(sqlScript string) []string {
 					i++
 				}
 				if currentStatement.Len() > 0 {
-				    currentStatement.WriteString("\n")
+					currentStatement.WriteString("\n")
 				}
 				continue
 			}
@@ -355,9 +354,9 @@ func splitSQLStatements(sqlScript string) []string {
 	// Hapus statement yang mungkin hanya ";"
 	finalStatements := make([]string, 0, len(statements))
 	for _, stmt := range statements {
-	    if strings.TrimSpace(stmt) != ";" && strings.TrimSpace(stmt) != "" {
-	        finalStatements = append(finalStatements, stmt)
-	    }
+		if strings.TrimSpace(stmt) != ";" && strings.TrimSpace(stmt) != "" {
+			finalStatements = append(finalStatements, stmt)
+		}
 	}
 
 	return finalStatements
@@ -370,7 +369,6 @@ func min(a, b int) int {
 	}
 	return b
 }
-
 
 // executeSQLFile membaca dan mengeksekusi perintah SQL dari sebuah file.
 func executeSQLFile(t *testing.T, db *gorm.DB, filePath string) {

@@ -39,14 +39,14 @@ func TestParseAndCategorizeDDLs(t *testing.T) {
 		expectedError  bool
 	}{
 		{
-			name:   "Empty Input",
-			syncer: syncerPostgres,
-			inputDDLs: &SchemaExecutionResult{},
+			name:       "Empty Input",
+			syncer:     syncerPostgres,
+			inputDDLs:  &SchemaExecutionResult{},
 			inputTable: "test_table_empty",
 			expectedParsed: &categorizedDDLs{
-				CreateTableDDL:     "", // Eksplisitkan
-				AlterColumnDDLs:    []string{}, AddIndexDDLs: []string{}, DropIndexDDLs: []string{},
-				AddConstraintDDLs:  []string{}, DropConstraintDDLs: []string{},
+				CreateTableDDL:  "", // Eksplisitkan
+				AlterColumnDDLs: []string{}, AddIndexDDLs: []string{}, DropIndexDDLs: []string{},
+				AddConstraintDDLs: []string{}, DropConstraintDDLs: []string{},
 			},
 			expectedError: false,
 		},
@@ -58,9 +58,9 @@ func TestParseAndCategorizeDDLs(t *testing.T) {
 			},
 			inputTable: "test_table1",
 			expectedParsed: &categorizedDDLs{
-				CreateTableDDL:     "CREATE TABLE \"test_table1\" (id INT PRIMARY KEY)",
-				AlterColumnDDLs:    []string{}, AddIndexDDLs: []string{}, DropIndexDDLs: []string{},
-				AddConstraintDDLs:  []string{}, DropConstraintDDLs: []string{},
+				CreateTableDDL:  "CREATE TABLE \"test_table1\" (id INT PRIMARY KEY)",
+				AlterColumnDDLs: []string{}, AddIndexDDLs: []string{}, DropIndexDDLs: []string{},
+				AddConstraintDDLs: []string{}, DropConstraintDDLs: []string{},
 			},
 			expectedError: false,
 		},
@@ -72,9 +72,9 @@ func TestParseAndCategorizeDDLs(t *testing.T) {
 			},
 			inputTable: "test_table_space",
 			expectedParsed: &categorizedDDLs{
-				CreateTableDDL:     "CREATE TABLE \"test_table_space\" (name VARCHAR(50))",
-				AlterColumnDDLs:    []string{}, AddIndexDDLs: []string{}, DropIndexDDLs: []string{},
-				AddConstraintDDLs:  []string{}, DropConstraintDDLs: []string{},
+				CreateTableDDL:  "CREATE TABLE \"test_table_space\" (name VARCHAR(50))",
+				AlterColumnDDLs: []string{}, AddIndexDDLs: []string{}, DropIndexDDLs: []string{},
+				AddConstraintDDLs: []string{}, DropConstraintDDLs: []string{},
 			},
 			expectedError: false,
 		},
@@ -86,15 +86,15 @@ func TestParseAndCategorizeDDLs(t *testing.T) {
 			},
 			inputTable: "test_alter",
 			expectedParsed: &categorizedDDLs{
-				CreateTableDDL:     "",
+				CreateTableDDL: "",
 				// Urutan setelah sorting: DROP dulu, baru ADD
-				AlterColumnDDLs:    []string{"ALTER TABLE \"test_alter\" DROP COLUMN old_col", "ALTER TABLE \"test_alter\" ADD COLUMN new_col INT"},
-				AddIndexDDLs:       []string{}, DropIndexDDLs: []string{}, AddConstraintDDLs: []string{}, DropConstraintDDLs: []string{},
+				AlterColumnDDLs: []string{"ALTER TABLE \"test_alter\" DROP COLUMN old_col", "ALTER TABLE \"test_alter\" ADD COLUMN new_col INT"},
+				AddIndexDDLs:    []string{}, DropIndexDDLs: []string{}, AddConstraintDDLs: []string{}, DropConstraintDDLs: []string{},
 			},
 			expectedError: false,
 		},
 		{
-			name:   "Mixed DDLs with Sorting Applied",
+			name: "Mixed DDLs with Sorting Applied",
 			// Gunakan syncer MySQL karena input DDL ada yang gaya MySQL (MODIFY COLUMN)
 			// dan logika sorting bisa dipengaruhi oleh dialek di extractConstraintNameAndTypeForDrop
 			syncer: newTestSchemaSyncer("mysql", logger),
@@ -137,10 +137,10 @@ func TestParseAndCategorizeDDLs(t *testing.T) {
 			},
 			inputTable: "unrec_table",
 			expectedParsed: &categorizedDDLs{
-				CreateTableDDL:     "",
+				CreateTableDDL: "",
 				// Urutan setelah sorting: ALTER dulu baru UNKNOWN
-				AlterColumnDDLs:    []string{"ALTER TABLE tbl ADD col1 INT", "UNKNOWN DDL STATEMENT"},
-				AddIndexDDLs:       []string{}, DropIndexDDLs: []string{}, AddConstraintDDLs: []string{}, DropConstraintDDLs: []string{},
+				AlterColumnDDLs: []string{"ALTER TABLE tbl ADD col1 INT", "UNKNOWN DDL STATEMENT"},
+				AddIndexDDLs:    []string{}, DropIndexDDLs: []string{}, AddConstraintDDLs: []string{}, DropConstraintDDLs: []string{},
 			},
 			expectedError: false,
 		},
@@ -152,9 +152,9 @@ func TestParseAndCategorizeDDLs(t *testing.T) {
 			},
 			inputTable: "create_then_alter",
 			expectedParsed: &categorizedDDLs{
-				CreateTableDDL:     "CREATE TABLE create_then_alter (id INT)",
-				AlterColumnDDLs:    []string{"ALTER TABLE create_then_alter ADD COLUMN name VARCHAR(10)"},
-				AddIndexDDLs:       []string{}, DropIndexDDLs: []string{}, AddConstraintDDLs: []string{}, DropConstraintDDLs: []string{},
+				CreateTableDDL:  "CREATE TABLE create_then_alter (id INT)",
+				AlterColumnDDLs: []string{"ALTER TABLE create_then_alter ADD COLUMN name VARCHAR(10)"},
+				AddIndexDDLs:    []string{}, DropIndexDDLs: []string{}, AddConstraintDDLs: []string{}, DropConstraintDDLs: []string{},
 			},
 			expectedError: false,
 		},
@@ -162,15 +162,15 @@ func TestParseAndCategorizeDDLs(t *testing.T) {
 			name:   "Empty statements and only semicolons",
 			syncer: syncerPostgres,
 			inputDDLs: &SchemaExecutionResult{
-				TableDDL: "; ; ALTER TABLE t1 ADD c1 INT; ;",
+				TableDDL:  "; ; ALTER TABLE t1 ADD c1 INT; ;",
 				IndexDDLs: []string{"", " ; ", "DROP INDEX idx1;", "  "},
 			},
 			inputTable: "t1",
 			expectedParsed: &categorizedDDLs{
-				CreateTableDDL:     "",
-				AlterColumnDDLs:    []string{"ALTER TABLE t1 ADD c1 INT"},
-				DropIndexDDLs:      []string{"DROP INDEX idx1"},
-				AddIndexDDLs:       []string{}, AddConstraintDDLs: []string{}, DropConstraintDDLs: []string{},
+				CreateTableDDL:  "",
+				AlterColumnDDLs: []string{"ALTER TABLE t1 ADD c1 INT"},
+				DropIndexDDLs:   []string{"DROP INDEX idx1"},
+				AddIndexDDLs:    []string{}, AddConstraintDDLs: []string{}, DropConstraintDDLs: []string{},
 			},
 			expectedError: false,
 		},
@@ -310,16 +310,16 @@ func TestSortConstraintsForDrop(t *testing.T) {
 	// Sesuai logika: FKs, UNIQUE, CHECKs, PKs, UNKNOWN_FROM_NAME, UNKNOWN_DDL_STRUCTURE
 	// Dalam setiap grup, diurutkan berdasarkan nama constraint yang diekstrak.
 	expected := []string{
-		"ALTER TABLE t1 DROP CONSTRAINT fk_1",                 // Nama: fk_1
-		"ALTER TABLE t1 DROP CONSTRAINT fk_2",                 // Nama: fk_2
-		"ALTER TABLE t1 DROP FOREIGN KEY mysql_fk_direct",     // Nama: mysql_fk_direct
-		"ALTER TABLE t1 DROP CONSTRAINT uq_1",                 // Nama: uq_1
-		"ALTER TABLE t1 DROP CONSTRAINT chk_1",                // Nama: chk_1
-		"ALTER TABLE t1 DROP CHECK mysql_check_direct",        // Nama: mysql_check_direct
-		"ALTER TABLE t1 DROP CONSTRAINT pk_constraint_name",   // Nama: pk_constraint_name
-		"ALTER TABLE t1 DROP PRIMARY KEY",                     // Nama: PRIMARY_KEY_IMPLICIT_DROP_NAME_FOR_SORT
-		"ALTER TABLE t1 DROP CONSTRAINT some_other_constraint",// Nama: some_other_constraint
-		"DROP CONSTRAINT unknown_type_cons",                   // Nama: DROP CONSTRAINT unknown_type_cons
+		"ALTER TABLE t1 DROP CONSTRAINT fk_1",                  // Nama: fk_1
+		"ALTER TABLE t1 DROP CONSTRAINT fk_2",                  // Nama: fk_2
+		"ALTER TABLE t1 DROP FOREIGN KEY mysql_fk_direct",      // Nama: mysql_fk_direct
+		"ALTER TABLE t1 DROP CONSTRAINT uq_1",                  // Nama: uq_1
+		"ALTER TABLE t1 DROP CONSTRAINT chk_1",                 // Nama: chk_1
+		"ALTER TABLE t1 DROP CHECK mysql_check_direct",         // Nama: mysql_check_direct
+		"ALTER TABLE t1 DROP CONSTRAINT pk_constraint_name",    // Nama: pk_constraint_name
+		"ALTER TABLE t1 DROP PRIMARY KEY",                      // Nama: PRIMARY_KEY_IMPLICIT_DROP_NAME_FOR_SORT
+		"ALTER TABLE t1 DROP CONSTRAINT some_other_constraint", // Nama: some_other_constraint
+		"DROP CONSTRAINT unknown_type_cons",                    // Nama: DROP CONSTRAINT unknown_type_cons
 	}
 
 	// Bersihkan input DDLs dari titik koma untuk konsistensi dengan hasil cleanSingleDDL

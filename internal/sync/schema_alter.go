@@ -37,12 +37,30 @@ func (s *SchemaSyncer) generateAlterDDLs(
 	var accumulatedErrors error // Menggunakan error tunggal yang bisa di-append dengan multierr
 
 	// Buat map untuk pencarian cepat objek sumber dan tujuan
-	srcColMap := make(map[string]ColumnInfo); for _, c := range srcColumns { srcColMap[c.Name] = c }
-	dstColMap := make(map[string]ColumnInfo); for _, c := range dstColumns { dstColMap[c.Name] = c }
-	srcIdxMap := make(map[string]IndexInfo); for _, i := range srcIndexes { srcIdxMap[i.Name] = i }
-	dstIdxMap := make(map[string]IndexInfo); for _, i := range dstIndexes { dstIdxMap[i.Name] = i }
-	srcConsMap := make(map[string]ConstraintInfo); for _, c := range srcConstraints { srcConsMap[c.Name] = c }
-	dstConsMap := make(map[string]ConstraintInfo); for _, c := range dstConstraints { dstConsMap[c.Name] = c }
+	srcColMap := make(map[string]ColumnInfo)
+	for _, c := range srcColumns {
+		srcColMap[c.Name] = c
+	}
+	dstColMap := make(map[string]ColumnInfo)
+	for _, c := range dstColumns {
+		dstColMap[c.Name] = c
+	}
+	srcIdxMap := make(map[string]IndexInfo)
+	for _, i := range srcIndexes {
+		srcIdxMap[i.Name] = i
+	}
+	dstIdxMap := make(map[string]IndexInfo)
+	for _, i := range dstIndexes {
+		dstIdxMap[i.Name] = i
+	}
+	srcConsMap := make(map[string]ConstraintInfo)
+	for _, c := range srcConstraints {
+		srcConsMap[c.Name] = c
+	}
+	dstConsMap := make(map[string]ConstraintInfo)
+	for _, c := range dstConstraints {
+		dstConsMap[c.Name] = c
+	}
 
 	// --- Tahap 1: Hasilkan DDL DROP untuk objek di tujuan yang tidak ada di sumber atau dimodifikasi ---
 	// Urutan drop: FK, Constraint lain (UNIQUE, CHECK), baru Indeks.
@@ -181,7 +199,9 @@ func (s *SchemaSyncer) generateAlterDDLs(
 
 	indexesToAdd := []IndexInfo{}
 	for srcIdxName, si := range srcIdxMap {
-		if si.IsPrimary { continue }
+		if si.IsPrimary {
+			continue
+		}
 		_, dstIdxExists := dstIdxMap[srcIdxName]
 		_, needsRecreate := indexesToRecreate[srcIdxName]
 		if !dstIdxExists || needsRecreate {
@@ -197,7 +217,9 @@ func (s *SchemaSyncer) generateAlterDDLs(
 
 	constraintsToAdd := []ConstraintInfo{}
 	for srcConsName, sc := range srcConsMap {
-		if sc.Type == "PRIMARY KEY" { continue }
+		if sc.Type == "PRIMARY KEY" {
+			continue
+		}
 		_, dstConsExists := dstConsMap[srcConsName]
 		_, needsRecreate := constraintsToRecreate[srcConsName]
 		if !dstConsExists || needsRecreate {
@@ -221,7 +243,7 @@ func (s *SchemaSyncer) generateAlterDDLs(
 	} else {
 		log.Info("Finished generating ALTER DDLs successfully for table.",
 			zap.Bool("has_column_alters", alterColumnDDLsJoined != ""),
-			zap.Int("num_index_ddls_total", len(finalIndexDDLs)),      // Termasuk DROP dan ADD
+			zap.Int("num_index_ddls_total", len(finalIndexDDLs)),           // Termasuk DROP dan ADD
 			zap.Int("num_constraint_ddls_total", len(finalConstraintDDLs)), // Termasuk DROP dan ADD
 		)
 	}

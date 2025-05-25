@@ -32,8 +32,8 @@ func cleanSingleDDL(ddl string) string {
 func (s *SchemaSyncer) parseAndCategorizeDDLs(ddls *SchemaExecutionResult, table string) (*categorizedDDLs, error) {
 	log := s.logger.With(zap.String("table", table), zap.String("phase", "parse-ddls"))
 	parsed := &categorizedDDLs{
-		AlterColumnDDLs:    make([]string, 0), AddIndexDDLs: make([]string, 0),
-		DropIndexDDLs:      make([]string, 0), AddConstraintDDLs: make([]string, 0),
+		AlterColumnDDLs: make([]string, 0), AddIndexDDLs: make([]string, 0),
+		DropIndexDDLs: make([]string, 0), AddConstraintDDLs: make([]string, 0),
 		DropConstraintDDLs: make([]string, 0),
 	}
 
@@ -79,7 +79,9 @@ func (s *SchemaSyncer) parseAndCategorizeDDLs(ddls *SchemaExecutionResult, table
 	// Proses IndexDDLs
 	for _, ddl := range ddls.IndexDDLs {
 		cleanedDDL := cleanSingleDDL(ddl)
-		if cleanedDDL == "" { continue }
+		if cleanedDDL == "" {
+			continue
+		}
 		upperCleanedDDL := strings.ToUpper(cleanedDDL)
 		if strings.HasPrefix(upperCleanedDDL, "DROP INDEX") {
 			parsed.DropIndexDDLs = append(parsed.DropIndexDDLs, cleanedDDL)
@@ -93,17 +95,19 @@ func (s *SchemaSyncer) parseAndCategorizeDDLs(ddls *SchemaExecutionResult, table
 	// Proses ConstraintDDLs
 	for _, ddl := range ddls.ConstraintDDLs {
 		cleanedDDL := cleanSingleDDL(ddl)
-		if cleanedDDL == "" { continue }
+		if cleanedDDL == "" {
+			continue
+		}
 		upperCleanedDDL := strings.ToUpper(cleanedDDL)
 		isDrop := false
 		// Cek keyword DROP constraint yang umum
 		if strings.Contains(upperCleanedDDL, "DROP CONSTRAINT") ||
 			strings.Contains(upperCleanedDDL, "DROP FOREIGN KEY") || // MySQL specific
-			strings.Contains(upperCleanedDDL, "DROP CHECK") ||       // MySQL specific
+			strings.Contains(upperCleanedDDL, "DROP CHECK") || // MySQL specific
 			strings.Contains(upperCleanedDDL, "DROP PRIMARY KEY") { // MySQL specific
 			isDrop = true
 		} else if strings.HasPrefix(upperCleanedDDL, "DROP CONSTRAINT") { // Fallback jika hanya "DROP CONSTRAINT nama"
-		    isDrop = true
+			isDrop = true
 		}
 
 		if isDrop {
@@ -285,14 +289,14 @@ func (s *SchemaSyncer) shouldIgnoreDDLError(err error, ddl string) bool {
 				return true
 			}
 			if strings.Contains(upperDDL, "ADD CONSTRAINT") && strings.Contains(upperDDL, "UNIQUE") &&
-			   strings.Contains(errStrLower, "constraint") && strings.Contains(errStrLower, "already exists") {
+				strings.Contains(errStrLower, "constraint") && strings.Contains(errStrLower, "already exists") {
 				logCtx.Debug("SQLite: Ignoring 'constraint already exists' for ADD CONSTRAINT UNIQUE.")
 				return true
 			}
 			// JANGAN abaikan "UNIQUE constraint failed: table.column" karena ini error data, bukan skema duplikat.
 			if strings.Contains(errStrLower, "unique constraint failed") && !strings.Contains(errStrLower, "already exists") {
-			    logCtx.Debug("SQLite: 'UNIQUE constraint failed' (data violation during DDL execution) will NOT be ignored.")
-			    return false
+				logCtx.Debug("SQLite: 'UNIQUE constraint failed' (data violation during DDL execution) will NOT be ignored.")
+				return false
 			}
 		}
 		if isDrop {
@@ -320,7 +324,6 @@ func (s *SchemaSyncer) extractConstraintNameAndTypeForDrop(ddl string, logger *z
 	// \p{L} untuk huruf unicode, \p{N} untuk angka unicode.
 	nameRegex := `(?:IF\s+EXISTS\s+)?("?(?:[\w\p{L}\p{N}.-]|[\._-])+"?(?:\."?(?:[\w\p{L}\p{N}.-]|[\._-])+"?)?|[\w\p{L}\p{N}.-]+|\[(?:[\w\p{L}\p{N}.-]|[\._-])+\])`
 
-
 	if strings.Contains(upperDDL, "DROP PRIMARY KEY") {
 		constraintName = "PRIMARY_KEY_IMPLICIT_DROP_NAME_FOR_SORT"
 		constraintType = "PRIMARY KEY"
@@ -334,11 +337,17 @@ func (s *SchemaSyncer) extractConstraintNameAndTypeForDrop(ddl string, logger *z
 		constraintName = strings.Trim(matches[len(matches)-1], "\"`[]")
 		if constraintName != "" {
 			lowerName := strings.ToLower(constraintName)
-			if strings.Contains(lowerName, "fk_") || strings.Contains(lowerName, "_fk") || strings.HasSuffix(lowerName, "fkey") { constraintType = "FOREIGN KEY"
-			} else if strings.Contains(lowerName, "uq_") || strings.Contains(lowerName, "_uq") || (strings.HasSuffix(lowerName, "key") && !strings.Contains(lowerName, "primary") && !strings.Contains(lowerName, "foreign")) { constraintType = "UNIQUE"
-			} else if strings.Contains(lowerName, "pk_") || strings.Contains(lowerName, "_pk") || strings.HasSuffix(lowerName, "pkey") { constraintType = "PRIMARY KEY"
-			} else if strings.Contains(lowerName, "chk_") || strings.Contains(lowerName, "_chk") || strings.HasPrefix(lowerName, "check_") || strings.HasPrefix(lowerName, "ck_") { constraintType = "CHECK"
-			} else { constraintType = "UNKNOWN_CONSTRAINT_TYPE_FROM_NAME" }
+			if strings.Contains(lowerName, "fk_") || strings.Contains(lowerName, "_fk") || strings.HasSuffix(lowerName, "fkey") {
+				constraintType = "FOREIGN KEY"
+			} else if strings.Contains(lowerName, "uq_") || strings.Contains(lowerName, "_uq") || (strings.HasSuffix(lowerName, "key") && !strings.Contains(lowerName, "primary") && !strings.Contains(lowerName, "foreign")) {
+				constraintType = "UNIQUE"
+			} else if strings.Contains(lowerName, "pk_") || strings.Contains(lowerName, "_pk") || strings.HasSuffix(lowerName, "pkey") {
+				constraintType = "PRIMARY KEY"
+			} else if strings.Contains(lowerName, "chk_") || strings.Contains(lowerName, "_chk") || strings.HasPrefix(lowerName, "check_") || strings.HasPrefix(lowerName, "ck_") {
+				constraintType = "CHECK"
+			} else {
+				constraintType = "UNKNOWN_CONSTRAINT_TYPE_FROM_NAME"
+			}
 		} else {
 			constraintType = "UNKNOWN_DROP_CONSTRAINT_NO_NAME_PARSED"
 		}
@@ -365,20 +374,29 @@ func (s *SchemaSyncer) sortConstraintsForDrop(ddls []string) []string {
 	priority := func(ddl string) int {
 		_, consType := s.extractConstraintNameAndTypeForDrop(ddl, s.logger, s.dstDialect)
 		switch consType {
-		case "FOREIGN KEY": return 1
-		case "UNIQUE": return 2
-		case "CHECK": return 3
-		case "PRIMARY KEY": return 4
-		case "INDEX": return 5
-		case "UNKNOWN_CONSTRAINT_TYPE_FROM_NAME", "UNKNOWN_DROP_CONSTRAINT_NO_NAME_PARSED": return 6
-		default: return 7 // UNKNOWN_DDL_STRUCTURE_FOR_DROP_SORT
+		case "FOREIGN KEY":
+			return 1
+		case "UNIQUE":
+			return 2
+		case "CHECK":
+			return 3
+		case "PRIMARY KEY":
+			return 4
+		case "INDEX":
+			return 5
+		case "UNKNOWN_CONSTRAINT_TYPE_FROM_NAME", "UNKNOWN_DROP_CONSTRAINT_NO_NAME_PARSED":
+			return 6
+		default:
+			return 7 // UNKNOWN_DDL_STRUCTURE_FOR_DROP_SORT
 		}
 	}
 	sorted := make([]string, len(ddls))
 	copy(sorted, ddls)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		priI, priJ := priority(sorted[i]), priority(sorted[j])
-		if priI != priJ { return priI < priJ }
+		if priI != priJ {
+			return priI < priJ
+		}
 		nameI, _ := s.extractConstraintNameAndTypeForDrop(sorted[i], s.logger, s.dstDialect)
 		nameJ, _ := s.extractConstraintNameAndTypeForDrop(sorted[j], s.logger, s.dstDialect)
 		return nameI < nameJ
@@ -390,10 +408,18 @@ func (s *SchemaSyncer) sortConstraintsForDrop(ddls []string) []string {
 func (s *SchemaSyncer) sortConstraintsForAdd(ddls []string) []string {
 	priority := func(ddl string) int {
 		upperDDL := strings.ToUpper(ddl)
-		if strings.Contains(upperDDL, "PRIMARY KEY") { return 1 }
-		if strings.Contains(upperDDL, "UNIQUE") { return 2 }
-		if strings.Contains(upperDDL, "CHECK") { return 3 }
-		if strings.Contains(upperDDL, "FOREIGN KEY") { return 4 }
+		if strings.Contains(upperDDL, "PRIMARY KEY") {
+			return 1
+		}
+		if strings.Contains(upperDDL, "UNIQUE") {
+			return 2
+		}
+		if strings.Contains(upperDDL, "CHECK") {
+			return 3
+		}
+		if strings.Contains(upperDDL, "FOREIGN KEY") {
+			return 4
+		}
 		s.logger.Debug("ADD CONSTRAINT DDL with unknown priority category for sorting.", zap.String("ddl_preview", truncateForLog(ddl, 70)))
 		return 5
 	}
@@ -401,7 +427,9 @@ func (s *SchemaSyncer) sortConstraintsForAdd(ddls []string) []string {
 	copy(sorted, ddls)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		priI, priJ := priority(sorted[i]), priority(sorted[j])
-		if priI != priJ { return priI < priJ }
+		if priI != priJ {
+			return priI < priJ
+		}
 		return sorted[i] < sorted[j]
 	})
 	return sorted
@@ -411,14 +439,18 @@ func (s *SchemaSyncer) sortConstraintsForAdd(ddls []string) []string {
 func (s *SchemaSyncer) sortAlterColumns(ddls []string) []string {
 	priority := func(ddl string) int {
 		upperDDL := strings.ToUpper(ddl)
-		if strings.Contains(upperDDL, "DROP COLUMN") { return 1 }
+		if strings.Contains(upperDDL, "DROP COLUMN") {
+			return 1
+		}
 		if strings.Contains(upperDDL, "MODIFY COLUMN") || // MySQL
 			(strings.Contains(upperDDL, "ALTER COLUMN") && // PostgreSQL
 				!strings.Contains(upperDDL, "ADD COLUMN") &&
 				!strings.Contains(upperDDL, "DROP COLUMN")) {
 			return 2
 		}
-		if strings.Contains(upperDDL, "ADD COLUMN") { return 3 }
+		if strings.Contains(upperDDL, "ADD COLUMN") {
+			return 3
+		}
 		if ddl != "" && !strings.Contains(upperDDL, "UNKNOWN DDL STATEMENT") {
 			s.logger.Debug("ALTER DDL with unknown priority category for sorting.", zap.String("ddl_preview", truncateForLog(ddl, 70)))
 		}
@@ -428,7 +460,9 @@ func (s *SchemaSyncer) sortAlterColumns(ddls []string) []string {
 	copy(sorted, ddls)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		priI, priJ := priority(sorted[i]), priority(sorted[j])
-		if priI != priJ { return priI < priJ }
+		if priI != priJ {
+			return priI < priJ
+		}
 		return sorted[i] < sorted[j]
 	})
 	return sorted

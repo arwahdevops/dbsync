@@ -8,15 +8,15 @@ import (
 	"errors" // <--- THIS IMPORT WAS MISSING
 	"fmt"
 	"os"
-	"path/filepath" 
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 	"go.uber.org/zap"
+	"gorm.io/gorm"
 
 	"github.com/arwahdevops/dbsync/internal/config"
 	dbsync_db "github.com/arwahdevops/dbsync/internal/db"
@@ -29,16 +29,16 @@ import (
 // pgColumnInfo holds schema details for a PostgreSQL column for verification.
 type pgColumnInfo struct {
 	ColumnName             string         `gorm:"column:column_name"`
-	DataType               string         `gorm:"column:data_type"`                 // e.g., integer, character varying, text, numeric, boolean, timestamp with time zone
-	UdtName                string         `gorm:"column:udt_name"`                  // underlying type name, e.g., int4, varchar, text, numeric, bool, timestamptz
-	IsNullable             string         `gorm:"column:is_nullable"`               // "YES" or "NO"
-	ColumnDefault          sql.NullString `gorm:"column:column_default"`            // e.g., nextval('users_id_seq'::regclass), true, 'active'::character varying
+	DataType               string         `gorm:"column:data_type"`      // e.g., integer, character varying, text, numeric, boolean, timestamp with time zone
+	UdtName                string         `gorm:"column:udt_name"`       // underlying type name, e.g., int4, varchar, text, numeric, bool, timestamptz
+	IsNullable             string         `gorm:"column:is_nullable"`    // "YES" or "NO"
+	ColumnDefault          sql.NullString `gorm:"column:column_default"` // e.g., nextval('users_id_seq'::regclass), true, 'active'::character varying
 	CharacterMaximumLength sql.NullInt64  `gorm:"column:character_maximum_length"`
 	NumericPrecision       sql.NullInt64  `gorm:"column:numeric_precision"`
 	NumericScale           sql.NullInt64  `gorm:"column:numeric_scale"`
-	IsIdentity             string         `gorm:"column:is_identity"`             // "YES" or "NO" (for PG IDENTITY columns)
-	IdentityGeneration     sql.NullString `gorm:"column:identity_generation"`     // "BY DEFAULT" or "ALWAYS"
-	IsUpdatable            string         `gorm:"column:is_updatable"`            // "YES" or "NO" (can indicate generated columns if "NO")
+	IsIdentity             string         `gorm:"column:is_identity"`         // "YES" or "NO" (for PG IDENTITY columns)
+	IdentityGeneration     sql.NullString `gorm:"column:identity_generation"` // "BY DEFAULT" or "ALWAYS"
+	IsUpdatable            string         `gorm:"column:is_updatable"`        // "YES" or "NO" (can indicate generated columns if "NO")
 	OrdinalPosition        int            `gorm:"column:ordinal_position"`
 }
 
@@ -92,7 +92,6 @@ func normalizePgActualDataType(rawDataType, rawUdtName string) string {
 		return dataType // Fallback to raw (normalized) data_type
 	}
 }
-
 
 // expectedPgColumnSchema defines the expected schema for a PostgreSQL column after migration.
 type expectedPgColumnSchema struct {
@@ -174,7 +173,6 @@ func verifyTableSchema(t *testing.T, ctx context.Context, targetDB *gorm.DB, tab
 			assert.False(t, actualCol.CharacterMaximumLength.Valid, "Expected CharacterMaximumLength to be NULL for column '%s.%s' (type: %s), but had value %d", tableName, actualCol.ColumnName, actualNormalizedType, actualCol.CharacterMaximumLength.Int64)
 		}
 
-
 		// Verify numeric precision and scale
 		if expectedCol.NumPrecision.Valid {
 			assert.True(t, actualCol.NumericPrecision.Valid, "Expected NumericPrecision to be valid for column '%s.%s'", tableName, actualCol.ColumnName)
@@ -223,7 +221,6 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 	executeSQLFile(t, sourceDB.DB, sourceSchemaFilePath)
 	testLogger.Info("Source database setup complete.", zap.String("schema_file_used", sourceSchemaFilePath))
 
-
 	// Clean up target database (idempotent)
 	testLogger.Info("Cleaning up target database before sync...")
 	targetTablesToDrop := []string{"comments", "post_categories", "posts", "categories", "users", "product_variants", "products"} // Add new tables
@@ -237,20 +234,20 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 
 	// Configure dbsync
 	cfg := &config.Config{
-		SyncDirection:          "mysql-to-postgres",
-		SchemaSyncStrategy:     config.SchemaSyncDropCreate,
-		BatchSize:              100,
-		Workers:                2,
-		TableTimeout:           3 * time.Minute,
-		SkipFailedTables:       false,
-		DisableFKDuringSync:    true, // Important for create strategy with FKs
+		SyncDirection:       "mysql-to-postgres",
+		SchemaSyncStrategy:  config.SchemaSyncDropCreate,
+		BatchSize:           100,
+		Workers:             2,
+		TableTimeout:        3 * time.Minute,
+		SkipFailedTables:    false,
+		DisableFKDuringSync: true, // Important for create strategy with FKs
 		SrcDB: config.DatabaseConfig{
-			Dialect:  sourceDB.Dialect, Host: sourceDB.Host, Port: mustPortInt(t, sourceDB.Port),
-			User:     sourceDB.Username, Password: sourceDB.Password, DBName: sourceDB.DBName, SSLMode:  "disable",
+			Dialect: sourceDB.Dialect, Host: sourceDB.Host, Port: mustPortInt(t, sourceDB.Port),
+			User: sourceDB.Username, Password: sourceDB.Password, DBName: sourceDB.DBName, SSLMode: "disable",
 		},
 		DstDB: config.DatabaseConfig{
-			Dialect:  targetDB.Dialect, Host: targetDB.Host, Port: mustPortInt(t, targetDB.Port),
-			User:     targetDB.Username, Password: targetDB.Password, DBName: targetDB.DBName, SSLMode:  "disable",
+			Dialect: targetDB.Dialect, Host: targetDB.Host, Port: mustPortInt(t, targetDB.Port),
+			User: targetDB.Username, Password: targetDB.Password, DBName: targetDB.DBName, SSLMode: "disable",
 		},
 		MaxRetries:    1,
 		RetryInterval: 1 * time.Second,
@@ -282,10 +279,18 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 			res, ok := results[tableName]
 			require.True(t, ok, "Result for table '%s' not found in orchestrator results", tableName)
 			// Log errors if any, for easier debugging
-			if res.SchemaAnalysisError != nil { t.Logf("SchemaAnalysisError for %s: %v", tableName, res.SchemaAnalysisError) }
-			if res.SchemaExecutionError != nil { t.Logf("SchemaExecutionError for %s: %v", tableName, res.SchemaExecutionError) }
-			if res.DataError != nil { t.Logf("DataError for %s: %v", tableName, res.DataError) }
-			if res.ConstraintExecutionError != nil { t.Logf("ConstraintExecutionError for %s: %v", tableName, res.ConstraintExecutionError) }
+			if res.SchemaAnalysisError != nil {
+				t.Logf("SchemaAnalysisError for %s: %v", tableName, res.SchemaAnalysisError)
+			}
+			if res.SchemaExecutionError != nil {
+				t.Logf("SchemaExecutionError for %s: %v", tableName, res.SchemaExecutionError)
+			}
+			if res.DataError != nil {
+				t.Logf("DataError for %s: %v", tableName, res.DataError)
+			}
+			if res.ConstraintExecutionError != nil {
+				t.Logf("ConstraintExecutionError for %s: %v", tableName, res.ConstraintExecutionError)
+			}
 
 			assert.NoError(t, res.SchemaAnalysisError, "Schema analysis should not error for table '%s'", tableName)
 			assert.NoError(t, res.SchemaExecutionError, "Schema execution should not error for table '%s'", tableName)
@@ -306,18 +311,20 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 		"bio":         {TargetType: "text", IsNullable: "YES"},
 		"age":         {TargetType: "smallint", IsNullable: "YES"}, // MySQL TINYINT (not (1)) maps to SMALLINT
 		"salary":      {TargetType: "numeric", IsNullable: "YES", NumPrecision: sql.NullInt64{Int64: 10, Valid: true}, NumScale: sql.NullInt64{Int64: 2, Valid: true}},
-		"is_active":   {TargetType: "boolean", IsNullable: "YES", ExpectedDefaultSnippet: sql.NullString{String: "true", Valid: true}}, // MySQL TINYINT(1) DEFAULT 1 maps to BOOLEAN DEFAULT TRUE
-		"created_at":  {TargetType: "timestamp with time zone", IsNullable: "YES", ExpectedDefaultSnippet: sql.NullString{String: "now()", Valid: true}}, // MySQL TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-		"updated_at":  {TargetType: "timestamp with time zone", IsNullable: "YES", ExpectedDefaultSnippet: sql.NullString{String: "now()", Valid: true}}, // MySQL TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP (ON UPDATE part is lost in create, default remains)
-		"json_data":   {TargetType: "jsonb", IsNullable: "YES"}, // MySQL JSON maps to jsonb
-		"binary_data": {TargetType: "bytea", IsNullable: "YES"}, // MySQL BLOB maps to bytea
+		"is_active":   {TargetType: "boolean", IsNullable: "YES", ExpectedDefaultSnippet: sql.NullString{String: "true", Valid: true}},                                                                 // MySQL TINYINT(1) DEFAULT 1 maps to BOOLEAN DEFAULT TRUE
+		"created_at":  {TargetType: "timestamp with time zone", IsNullable: "YES", ExpectedDefaultSnippet: sql.NullString{String: "now()", Valid: true}},                                               // MySQL TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		"updated_at":  {TargetType: "timestamp with time zone", IsNullable: "YES", ExpectedDefaultSnippet: sql.NullString{String: "now()", Valid: true}},                                               // MySQL TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP (ON UPDATE part is lost in create, default remains)
+		"json_data":   {TargetType: "jsonb", IsNullable: "YES"},                                                                                                                                        // MySQL JSON maps to jsonb
+		"binary_data": {TargetType: "bytea", IsNullable: "YES"},                                                                                                                                        // MySQL BLOB maps to bytea
 		"user_status": {TargetType: "character varying", IsNullable: "YES", CharMaxLen: sql.NullInt64{Int64: 255, Valid: true}, ExpectedDefaultSnippet: sql.NullString{String: "active", Valid: true}}, // ENUM -> VARCHAR(255)
 	}
 	t.Run("VerifyTableSchema_users", func(t *testing.T) {
 		verifyTableSchema(t, ctx, targetDB.DB, "users", expectedUserSchema)
 	})
-	t.Run("VerifyDataCount_users", func(t *testing.T) { res, _ := results["users"]; assert.EqualValues(t, 3, res.RowsSynced, "users row count") })
-
+	t.Run("VerifyDataCount_users", func(t *testing.T) {
+		res, _ := results["users"]
+		assert.EqualValues(t, 3, res.RowsSynced, "users row count")
+	})
 
 	expectedCategoriesSchema := map[string]expectedPgColumnSchema{
 		"category_id":   {TargetType: "integer", IsNullable: "NO", IsIdentity: "YES", IdentityGeneration: sql.NullString{String: "BY DEFAULT", Valid: true}, ExpectedDefaultSnippet: sql.NullString{String: "nextval", Valid: true}},
@@ -328,23 +335,27 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 	t.Run("VerifyTableSchema_categories", func(t *testing.T) {
 		verifyTableSchema(t, ctx, targetDB.DB, "categories", expectedCategoriesSchema)
 	})
-	t.Run("VerifyDataCount_categories", func(t *testing.T) { res, _ := results["categories"]; assert.EqualValues(t, 3, res.RowsSynced, "categories row count") })
-
+	t.Run("VerifyDataCount_categories", func(t *testing.T) {
+		res, _ := results["categories"]
+		assert.EqualValues(t, 3, res.RowsSynced, "categories row count")
+	})
 
 	expectedPostsSchema := map[string]expectedPgColumnSchema{
-		"post_id":     {TargetType: "integer", IsNullable: "NO", IsIdentity: "YES", IdentityGeneration: sql.NullString{String: "BY DEFAULT", Valid: true}, ExpectedDefaultSnippet: sql.NullString{String: "nextval", Valid: true}},
-		"author_id":   {TargetType: "integer", IsNullable: "NO"},
-		"title":       {TargetType: "character varying", IsNullable: "NO", CharMaxLen: sql.NullInt64{Int64: 200, Valid: true}},
-		"content":     {TargetType: "text", IsNullable: "YES"},
-		"slug":        {TargetType: "character varying", IsNullable: "NO", CharMaxLen: sql.NullInt64{Int64: 100, Valid: true}},
-		"published_at":{TargetType: "timestamp without time zone", IsNullable: "YES"}, // MySQL DATETIME maps to timestamp without time zone
-		"views":       {TargetType: "integer", IsNullable: "YES", ExpectedDefaultSnippet: sql.NullString{String: "0", Valid: true}},
+		"post_id":      {TargetType: "integer", IsNullable: "NO", IsIdentity: "YES", IdentityGeneration: sql.NullString{String: "BY DEFAULT", Valid: true}, ExpectedDefaultSnippet: sql.NullString{String: "nextval", Valid: true}},
+		"author_id":    {TargetType: "integer", IsNullable: "NO"},
+		"title":        {TargetType: "character varying", IsNullable: "NO", CharMaxLen: sql.NullInt64{Int64: 200, Valid: true}},
+		"content":      {TargetType: "text", IsNullable: "YES"},
+		"slug":         {TargetType: "character varying", IsNullable: "NO", CharMaxLen: sql.NullInt64{Int64: 100, Valid: true}},
+		"published_at": {TargetType: "timestamp without time zone", IsNullable: "YES"}, // MySQL DATETIME maps to timestamp without time zone
+		"views":        {TargetType: "integer", IsNullable: "YES", ExpectedDefaultSnippet: sql.NullString{String: "0", Valid: true}},
 	}
 	t.Run("VerifyTableSchema_posts", func(t *testing.T) {
 		verifyTableSchema(t, ctx, targetDB.DB, "posts", expectedPostsSchema)
 	})
-	t.Run("VerifyDataCount_posts", func(t *testing.T) { res, _ := results["posts"]; assert.EqualValues(t, 4, res.RowsSynced, "posts row count") })
-
+	t.Run("VerifyDataCount_posts", func(t *testing.T) {
+		res, _ := results["posts"]
+		assert.EqualValues(t, 4, res.RowsSynced, "posts row count")
+	})
 
 	expectedCommentsSchema := map[string]expectedPgColumnSchema{
 		"comment_id":        {TargetType: "integer", IsNullable: "NO", IsIdentity: "YES", IdentityGeneration: sql.NullString{String: "BY DEFAULT", Valid: true}, ExpectedDefaultSnippet: sql.NullString{String: "nextval", Valid: true}},
@@ -357,8 +368,10 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 	t.Run("VerifyTableSchema_comments", func(t *testing.T) {
 		verifyTableSchema(t, ctx, targetDB.DB, "comments", expectedCommentsSchema)
 	})
-	t.Run("VerifyDataCount_comments", func(t *testing.T) { res, _ := results["comments"]; assert.EqualValues(t, 3, res.RowsSynced, "comments row count") })
-
+	t.Run("VerifyDataCount_comments", func(t *testing.T) {
+		res, _ := results["comments"]
+		assert.EqualValues(t, 3, res.RowsSynced, "comments row count")
+	})
 
 	expectedPostCategoriesSchema := map[string]expectedPgColumnSchema{
 		"post_id":     {TargetType: "integer", IsNullable: "NO"},
@@ -367,35 +380,41 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 	t.Run("VerifyTableSchema_post_categories", func(t *testing.T) {
 		verifyTableSchema(t, ctx, targetDB.DB, "post_categories", expectedPostCategoriesSchema)
 	})
-	t.Run("VerifyDataCount_post_categories", func(t *testing.T) { res, _ := results["post_categories"]; assert.EqualValues(t, 5, res.RowsSynced, "post_categories row count") })
+	t.Run("VerifyDataCount_post_categories", func(t *testing.T) {
+		res, _ := results["post_categories"]
+		assert.EqualValues(t, 5, res.RowsSynced, "post_categories row count")
+	})
 
+	// Verification for new tables 'products' and 'product_variants'
+	expectedProductsSchema := map[string]expectedPgColumnSchema{
+		"product_id":   {TargetType: "integer", IsNullable: "NO", IsIdentity: "YES", IdentityGeneration: sql.NullString{String: "BY DEFAULT", Valid: true}, ExpectedDefaultSnippet: sql.NullString{String: "nextval", Valid: true}},
+		"product_name": {TargetType: "character varying", IsNullable: "NO", CharMaxLen: sql.NullInt64{Int64: 255, Valid: true}},
+		"description":  {TargetType: "text", IsNullable: "YES"},
+		"price":        {TargetType: "numeric", IsNullable: "NO", NumPrecision: sql.NullInt64{Int64: 10, Valid: true}, NumScale: sql.NullInt64{Int64: 2, Valid: true}},
+		"created_date": {TargetType: "date", IsNullable: "YES", ExpectedDefaultSnippet: sql.NullString{String: "CURRENT_DATE", Valid: true}}, // MySQL DATE with DEFAULT (CURDATE())
+	}
+	t.Run("VerifyTableSchema_products", func(t *testing.T) {
+		verifyTableSchema(t, ctx, targetDB.DB, "products", expectedProductsSchema)
+	})
+	t.Run("VerifyDataCount_products", func(t *testing.T) {
+		res, _ := results["products"]
+		assert.EqualValues(t, 2, res.RowsSynced, "products row count")
+	})
 
-    // Verification for new tables 'products' and 'product_variants'
-    expectedProductsSchema := map[string]expectedPgColumnSchema{
-        "product_id":   {TargetType: "integer", IsNullable: "NO", IsIdentity: "YES", IdentityGeneration: sql.NullString{String: "BY DEFAULT", Valid: true}, ExpectedDefaultSnippet: sql.NullString{String: "nextval", Valid: true}},
-        "product_name": {TargetType: "character varying", IsNullable: "NO", CharMaxLen: sql.NullInt64{Int64: 255, Valid: true}},
-        "description":  {TargetType: "text", IsNullable: "YES"},
-        "price":        {TargetType: "numeric", IsNullable: "NO", NumPrecision: sql.NullInt64{Int64: 10, Valid: true}, NumScale: sql.NullInt64{Int64: 2, Valid: true}},
-        "created_date": {TargetType: "date", IsNullable: "YES", ExpectedDefaultSnippet: sql.NullString{String: "CURRENT_DATE", Valid: true}}, // MySQL DATE with DEFAULT (CURDATE())
-    }
-    t.Run("VerifyTableSchema_products", func(t *testing.T) {
-        verifyTableSchema(t, ctx, targetDB.DB, "products", expectedProductsSchema)
-    })
-	t.Run("VerifyDataCount_products", func(t *testing.T) { res, _ := results["products"]; assert.EqualValues(t, 2, res.RowsSynced, "products row count") })
-
-
-    expectedProductVariantsSchema := map[string]expectedPgColumnSchema{
-        "variant_id": {TargetType: "integer", IsNullable: "NO", IsIdentity: "YES", IdentityGeneration: sql.NullString{String: "BY DEFAULT", Valid: true}, ExpectedDefaultSnippet: sql.NullString{String: "nextval", Valid: true}},
-        "product_id": {TargetType: "integer", IsNullable: "NO"},
-        "sku":        {TargetType: "character varying", IsNullable: "NO", CharMaxLen: sql.NullInt64{Int64: 100, Valid: true}},
-        "attributes": {TargetType: "jsonb", IsNullable: "YES"},
-        "stock_qty":  {TargetType: "integer", IsNullable: "NO", ExpectedDefaultSnippet: sql.NullString{String: "0", Valid: true}},
-    }
-    t.Run("VerifyTableSchema_product_variants", func(t *testing.T) {
-        verifyTableSchema(t, ctx, targetDB.DB, "product_variants", expectedProductVariantsSchema)
-    })
-	t.Run("VerifyDataCount_product_variants", func(t *testing.T) { res, _ := results["product_variants"]; assert.EqualValues(t, 3, res.RowsSynced, "product_variants row count") })
-
+	expectedProductVariantsSchema := map[string]expectedPgColumnSchema{
+		"variant_id": {TargetType: "integer", IsNullable: "NO", IsIdentity: "YES", IdentityGeneration: sql.NullString{String: "BY DEFAULT", Valid: true}, ExpectedDefaultSnippet: sql.NullString{String: "nextval", Valid: true}},
+		"product_id": {TargetType: "integer", IsNullable: "NO"},
+		"sku":        {TargetType: "character varying", IsNullable: "NO", CharMaxLen: sql.NullInt64{Int64: 100, Valid: true}},
+		"attributes": {TargetType: "jsonb", IsNullable: "YES"},
+		"stock_qty":  {TargetType: "integer", IsNullable: "NO", ExpectedDefaultSnippet: sql.NullString{String: "0", Valid: true}},
+	}
+	t.Run("VerifyTableSchema_product_variants", func(t *testing.T) {
+		verifyTableSchema(t, ctx, targetDB.DB, "product_variants", expectedProductVariantsSchema)
+	})
+	t.Run("VerifyDataCount_product_variants", func(t *testing.T) {
+		res, _ := results["product_variants"]
+		assert.EqualValues(t, 3, res.RowsSynced, "product_variants row count")
+	})
 
 	// --- Foreign Key Verification ---
 	verifyForeignKeyExists := func(t *testing.T, db *gorm.DB, fromTable, fromColumn, toTable, toColumn, fkNameHint string) {
@@ -444,10 +463,9 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 	t.Run("VerifyForeignKey_categories_to_self_categories", func(t *testing.T) {
 		verifyForeignKeyExists(t, targetDB.DB, "categories", "parent_cat_id", "categories", "category_id", "categories_parent_cat_id_fkey")
 	})
-    t.Run("VerifyForeignKey_product_variants_to_products", func(t *testing.T) {
+	t.Run("VerifyForeignKey_product_variants_to_products", func(t *testing.T) {
 		verifyForeignKeyExists(t, targetDB.DB, "product_variants", "product_id", "products", "product_id", "product_variants_product_id_fkey")
 	})
-
 
 	// --- Unique Constraint Verification ---
 	verifyUniqueConstraintExists := func(t *testing.T, db *gorm.DB, tableName string, columnNames []string, constraintNameHint string) {
@@ -480,7 +498,6 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 		t.Logf("Found %d UNIQUE or PK constraint(s) for columns %v on table %s (Hint was: '%s')", count, columnNames, tableName, constraintNameHint)
 	}
 
-
 	t.Run("VerifyUniqueConstraint_users_username", func(t *testing.T) {
 		verifyUniqueConstraintExists(t, targetDB.DB, "users", []string{"username"}, "users_username_key") // PG default name
 	})
@@ -493,10 +510,9 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 	t.Run("VerifyUniqueConstraint_posts_slug", func(t *testing.T) {
 		verifyUniqueConstraintExists(t, targetDB.DB, "posts", []string{"slug"}, "posts_slug_key")
 	})
-    t.Run("VerifyUniqueConstraint_product_variants_sku", func(t *testing.T) {
+	t.Run("VerifyUniqueConstraint_product_variants_sku", func(t *testing.T) {
 		verifyUniqueConstraintExists(t, targetDB.DB, "product_variants", []string{"sku"}, "product_variants_sku_key")
 	})
-
 
 	// --- Primary Key Verification (Combined with Unique check for tables with simple PKs) ---
 	t.Run("VerifyPrimaryKey_users", func(t *testing.T) {
@@ -514,10 +530,10 @@ func TestMySQLToPostgres_CreateStrategy_WithFKVerification(t *testing.T) {
 	t.Run("VerifyPrimaryKey_post_categories", func(t *testing.T) { // Composite PK
 		verifyUniqueConstraintExists(t, targetDB.DB, "post_categories", []string{"post_id", "category_id"}, "post_categories_pkey")
 	})
-    t.Run("VerifyPrimaryKey_products", func(t *testing.T) {
+	t.Run("VerifyPrimaryKey_products", func(t *testing.T) {
 		verifyUniqueConstraintExists(t, targetDB.DB, "products", []string{"product_id"}, "products_pkey")
 	})
-    t.Run("VerifyPrimaryKey_product_variants", func(t *testing.T) {
+	t.Run("VerifyPrimaryKey_product_variants", func(t *testing.T) {
 		verifyUniqueConstraintExists(t, targetDB.DB, "product_variants", []string{"variant_id"}, "product_variants_pkey")
 	})
 }

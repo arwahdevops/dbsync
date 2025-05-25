@@ -210,7 +210,11 @@ func (s *SchemaSyncer) parsePostgresIndexColumnsFromDef(rawDef, tableName string
 	var currentPart strings.Builder
 	parenLevel := 0
 	for _, char := range contentInsideParens {
-		if char == '(' { parenLevel++ } else if char == ')' { parenLevel-- }
+		if char == '(' {
+			parenLevel++
+		} else if char == ')' {
+			parenLevel--
+		}
 		if char == ',' && parenLevel == 0 {
 			columns = append(columns, strings.TrimSpace(currentPart.String()))
 			currentPart.Reset()
@@ -227,9 +231,9 @@ func (s *SchemaSyncer) parsePostgresIndexColumnsFromDef(rawDef, tableName string
 		cleanedColumns = append(cleanedColumns, strings.TrimSpace(colExpr))
 	}
 	if len(cleanedColumns) > 0 {
-	    log.Debug("Parsed columns/expressions from index definition.", zap.String("raw_def_preview", truncateForLog(rawDef, 50)), zap.Strings("parsed_cols_exprs", cleanedColumns))
+		log.Debug("Parsed columns/expressions from index definition.", zap.String("raw_def_preview", truncateForLog(rawDef, 50)), zap.Strings("parsed_cols_exprs", cleanedColumns))
 	} else if contentInsideParens != "" {
-	    log.Warn("Found content within parentheses for index definition but failed to parse into distinct columns/expressions.", zap.String("content", contentInsideParens), zap.String("raw_def", rawDef))
+		log.Warn("Found content within parentheses for index definition but failed to parse into distinct columns/expressions.", zap.String("content", contentInsideParens), zap.String("raw_def", rawDef))
 	}
 	return cleanedColumns
 }

@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"go.uber.org/zap"
 	"github.com/arwahdevops/dbsync/internal/utils"
+	"go.uber.org/zap"
 )
 
 // generateModifyColumnDDLs (tetap sama, hanya memanggil dispatcher)
@@ -73,8 +73,10 @@ func (s *SchemaSyncer) generateDropColumnDDL(table string, col ColumnInfo) (stri
 	quotedColName := utils.QuoteIdentifier(col.Name, s.dstDialect)
 	var ddl string
 	switch s.dstDialect {
-	case "mysql": ddl = fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s;", quotedTable, quotedColName)
-	case "postgres": ddl = fmt.Sprintf("ALTER TABLE %s DROP COLUMN IF EXISTS %s;", quotedTable, quotedColName)
+	case "mysql":
+		ddl = fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s;", quotedTable, quotedColName)
+	case "postgres":
+		ddl = fmt.Sprintf("ALTER TABLE %s DROP COLUMN IF EXISTS %s;", quotedTable, quotedColName)
 	case "sqlite":
 		log.Warn("DROP COLUMN support in SQLite depends on version (>= 3.35.0). DDL will be generated without IF EXISTS.", zap.String("table", table), zap.String("column", col.Name))
 		ddl = fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s;", quotedTable, quotedColName)
@@ -114,10 +116,14 @@ func (s *SchemaSyncer) generateDropConstraintDDL(table string, constraint Constr
 	switch s.dstDialect {
 	case "mysql":
 		switch strings.ToUpper(constraint.Type) {
-		case "FOREIGN KEY": ddl = fmt.Sprintf("ALTER TABLE %s DROP FOREIGN KEY %s;", quotedTable, quotedConstraintName)
-		case "UNIQUE": ddl = fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s;", quotedTable, quotedConstraintName)
-		case "CHECK": ddl = fmt.Sprintf("ALTER TABLE %s DROP CHECK %s;", quotedTable, quotedConstraintName)
-		case "PRIMARY KEY": ddl = fmt.Sprintf("ALTER TABLE %s DROP PRIMARY KEY;", quotedTable)
+		case "FOREIGN KEY":
+			ddl = fmt.Sprintf("ALTER TABLE %s DROP FOREIGN KEY %s;", quotedTable, quotedConstraintName)
+		case "UNIQUE":
+			ddl = fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s;", quotedTable, quotedConstraintName)
+		case "CHECK":
+			ddl = fmt.Sprintf("ALTER TABLE %s DROP CHECK %s;", quotedTable, quotedConstraintName)
+		case "PRIMARY KEY":
+			ddl = fmt.Sprintf("ALTER TABLE %s DROP PRIMARY KEY;", quotedTable)
 		default:
 			log.Error("Unsupported constraint type for DROP CONSTRAINT in MySQL", zap.String("constraint_type", constraint.Type), zap.String("constraint_name", constraint.Name))
 			return "", fmt.Errorf("unsupported constraint type '%s' for DROP CONSTRAINT in MySQL for constraint '%s'", constraint.Type, constraint.Name)

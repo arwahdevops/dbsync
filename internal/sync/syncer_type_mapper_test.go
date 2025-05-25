@@ -69,7 +69,9 @@ func TestIsStringType(t *testing.T) {
 		t.Run("IsString_"+sType, func(t *testing.T) { assert.True(t, isStringType(sType), "Expected '%s' to be a string type", sType) })
 	}
 	for _, nsType := range nonStringTypes {
-		t.Run("IsNotString_"+nsType, func(t *testing.T) { assert.False(t, isStringType(nsType), "Expected '%s' NOT to be a string type", nsType) })
+		t.Run("IsNotString_"+nsType, func(t *testing.T) {
+			assert.False(t, isStringType(nsType), "Expected '%s' NOT to be a string type", nsType)
+		})
 	}
 }
 
@@ -80,7 +82,9 @@ func TestIsBinaryType(t *testing.T) {
 		t.Run("IsBinary_"+bType, func(t *testing.T) { assert.True(t, isBinaryType(bType), "Expected '%s' to be a binary type", bType) })
 	}
 	for _, nbType := range nonBinaryTypes {
-		t.Run("IsNotBinary_"+nbType, func(t *testing.T) { assert.False(t, isBinaryType(nbType), "Expected '%s' NOT to be a binary type", nbType) })
+		t.Run("IsNotBinary_"+nbType, func(t *testing.T) {
+			assert.False(t, isBinaryType(nbType), "Expected '%s' NOT to be a binary type", nbType)
+		})
 	}
 }
 
@@ -88,10 +92,14 @@ func TestIsNumericType(t *testing.T) {
 	numericTypes := []string{"tinyint", "smallint", "mediumint", "int", "integer", "bigint", "serial", "bigserial", "decimal", "numeric", "float", "double", "real", "money"}
 	nonNumericTypes := []string{"char", "varchar", "text", "date", "timestamp", "bool", "blob", "json"}
 	for _, numType := range numericTypes {
-		t.Run("IsNumeric_"+numType, func(t *testing.T) { assert.True(t, isNumericType(numType), "Expected '%s' to be a numeric type", numType) })
+		t.Run("IsNumeric_"+numType, func(t *testing.T) {
+			assert.True(t, isNumericType(numType), "Expected '%s' to be a numeric type", numType)
+		})
 	}
 	for _, nonNumType := range nonNumericTypes {
-		t.Run("IsNotNumeric_"+nonNumType, func(t *testing.T) { assert.False(t, isNumericType(nonNumType), "Expected '%s' NOT to be a numeric type", nonNumType) })
+		t.Run("IsNotNumeric_"+nonNumType, func(t *testing.T) {
+			assert.False(t, isNumericType(nonNumType), "Expected '%s' NOT to be a numeric type", nonNumType)
+		})
 	}
 }
 
@@ -99,10 +107,14 @@ func TestIsIntegerType(t *testing.T) {
 	integerTypes := []string{"tinyint", "smallint", "mediumint", "int", "integer", "bigint", "serial", "bigserial"}
 	nonIntegerTypes := []string{"decimal", "float", "varchar", "text", "date"}
 	for _, intType := range integerTypes {
-		t.Run("IsInteger_"+intType, func(t *testing.T) { assert.True(t, isIntegerType(intType), "Expected '%s' to be an integer type", intType) })
+		t.Run("IsInteger_"+intType, func(t *testing.T) {
+			assert.True(t, isIntegerType(intType), "Expected '%s' to be an integer type", intType)
+		})
 	}
 	for _, nonIntType := range nonIntegerTypes {
-		t.Run("IsNotInteger_"+nonIntType, func(t *testing.T) { assert.False(t, isIntegerType(nonIntType), "Expected '%s' NOT to be an integer type", nonIntType) })
+		t.Run("IsNotInteger_"+nonIntType, func(t *testing.T) {
+			assert.False(t, isIntegerType(nonIntType), "Expected '%s' NOT to be an integer type", nonIntType)
+		})
 	}
 }
 
@@ -110,10 +122,14 @@ func TestIsPrecisionRelevant(t *testing.T) {
 	relevantTypes := []string{"decimal", "numeric", "time", "timetz", "timestamp", "timestamptz", "datetime"}
 	nonRelevantTypes := []string{"int", "varchar", "text", "date", "bool"}
 	for _, relType := range relevantTypes {
-		t.Run("IsPrecisionRelevant_"+relType, func(t *testing.T) { assert.True(t, isPrecisionRelevant(relType), "Expected precision to be relevant for '%s'", relType) })
+		t.Run("IsPrecisionRelevant_"+relType, func(t *testing.T) {
+			assert.True(t, isPrecisionRelevant(relType), "Expected precision to be relevant for '%s'", relType)
+		})
 	}
 	for _, nonRelType := range nonRelevantTypes {
-		t.Run("IsNotPrecisionRelevant_"+nonRelType, func(t *testing.T) { assert.False(t, isPrecisionRelevant(nonRelType), "Expected precision NOT to be relevant for '%s'", nonRelType) })
+		t.Run("IsNotPrecisionRelevant_"+nonRelType, func(t *testing.T) {
+			assert.False(t, isPrecisionRelevant(nonRelType), "Expected precision NOT to be relevant for '%s'", nonRelType)
+		})
 	}
 }
 
@@ -121,10 +137,14 @@ func TestIsScaleRelevant(t *testing.T) {
 	relevantTypes := []string{"decimal", "numeric"}
 	nonRelevantTypes := []string{"int", "varchar", "text", "date", "bool", "time", "timestamp"}
 	for _, relType := range relevantTypes {
-		t.Run("IsScaleRelevant_"+relType, func(t *testing.T) { assert.True(t, isScaleRelevant(relType), "Expected scale to be relevant for '%s'", relType) })
+		t.Run("IsScaleRelevant_"+relType, func(t *testing.T) {
+			assert.True(t, isScaleRelevant(relType), "Expected scale to be relevant for '%s'", relType)
+		})
 	}
 	for _, nonRelType := range nonRelevantTypes {
-		t.Run("IsNotScaleRelevant_"+nonRelType, func(t *testing.T) { assert.False(t, isScaleRelevant(nonRelType), "Expected scale NOT to be relevant for '%s'", nonRelType) })
+		t.Run("IsNotScaleRelevant_"+nonRelType, func(t *testing.T) {
+			assert.False(t, isScaleRelevant(nonRelType), "Expected scale NOT to be relevant for '%s'", nonRelType)
+		})
 	}
 }
 
@@ -169,15 +189,15 @@ func TestApplyTypeModifiers(t *testing.T) {
 
 		// --- Kasus untuk ModifierHandlingIgnoreSource ---
 		{"IgnoreSrc_SrcVARCHAR_MappedVARCHARWithMod", "VARCHAR(100)", "VARCHAR(30)", "postgres", config.ModifierHandlingIgnoreSource, "VARCHAR(30)"}, // Menggunakan tipe target apa adanya
-		{"IgnoreSrc_SrcVARCHAR_MappedTEXTNoMod", "VARCHAR(255)", "TEXT", "postgres", config.ModifierHandlingIgnoreSource, "TEXT"},                     // Menggunakan tipe target apa adanya
+		{"IgnoreSrc_SrcVARCHAR_MappedTEXTNoMod", "VARCHAR(255)", "TEXT", "postgres", config.ModifierHandlingIgnoreSource, "TEXT"},                    // Menggunakan tipe target apa adanya
 		{"IgnoreSrc_SrcINT_MappedBIGINT", "INT(11)", "BIGINT", "mysql", config.ModifierHandlingIgnoreSource, "BIGINT"},
 		{"IgnoreSrc_SrcDECIMAL_MappedNUMERICNoMod", "DECIMAL(10,2)", "NUMERIC", "postgres", config.ModifierHandlingIgnoreSource, "NUMERIC"},
 
 		// --- Kasus Khusus dan Tepi ---
-		{"ApplySrc_SrcENUM_MappedVARCHARWithMod_TargetModWinsForEnum", "ENUM('a','b')", "VARCHAR(50)", "postgres", config.ModifierHandlingApplySource, "VARCHAR(50)"}, // ENUM adalah kasus khusus
-		{"ApplySrc_SrcWithNonNumericMod_TargetNoMod", "GEOMETRY(POINT, 4326)", "GEOMETRY", "postgres", config.ModifierHandlingApplySource, "GEOMETRY"},                  // Modifier sumber tidak transferable, target tidak punya modifier
+		{"ApplySrc_SrcENUM_MappedVARCHARWithMod_TargetModWinsForEnum", "ENUM('a','b')", "VARCHAR(50)", "postgres", config.ModifierHandlingApplySource, "VARCHAR(50)"},  // ENUM adalah kasus khusus
+		{"ApplySrc_SrcWithNonNumericMod_TargetNoMod", "GEOMETRY(POINT, 4326)", "GEOMETRY", "postgres", config.ModifierHandlingApplySource, "GEOMETRY"},                 // Modifier sumber tidak transferable, target tidak punya modifier
 		{"ApplySrc_SrcWithNonNumericMod_TargetWithMod", "GEOMETRY(POINT, 4326)", "GEOMETRY(Point)", "postgres", config.ModifierHandlingApplySource, "GEOMETRY(Point)"}, // Modifier sumber tidak transferable, target punya modifiernya sendiri
-		{"ApplySrc_SrcINT_Unsigned_MappedINT_PG", "INT(10) UNSIGNED", "INTEGER", "postgres", config.ModifierHandlingApplySource, "INTEGER"},                                // UNSIGNED diabaikan, (10) diabaikan untuk INTEGER PG
+		{"ApplySrc_SrcINT_Unsigned_MappedINT_PG", "INT(10) UNSIGNED", "INTEGER", "postgres", config.ModifierHandlingApplySource, "INTEGER"},                            // UNSIGNED diabaikan, (10) diabaikan untuk INTEGER PG
 	}
 
 	for _, tc := range testCases {

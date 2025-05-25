@@ -42,11 +42,23 @@ func (s *SchemaSyncer) getColumnModifications(src, dst ColumnInfo, log *zap.Logg
 		diffs = append(diffs, fmt.Sprintf("nullability (desired: %t, actual_dst: %t)", src.IsNullable, dst.IsNullable))
 	}
 	if !src.AutoIncrement && !src.IsGenerated && !dst.AutoIncrement && !dst.IsGenerated {
-		srcDefValStr := ""; if src.DefaultValue.Valid { srcDefValStr = src.DefaultValue.String }
-		dstDefValStr := ""; if dst.DefaultValue.Valid { dstDefValStr = dst.DefaultValue.String }
+		srcDefValStr := ""
+		if src.DefaultValue.Valid {
+			srcDefValStr = src.DefaultValue.String
+		}
+		dstDefValStr := ""
+		if dst.DefaultValue.Valid {
+			dstDefValStr = dst.DefaultValue.String
+		}
 		if !s.areDefaultsEquivalent(srcDefValStr, dstDefValStr, srcTypeForComparison, columnLogger) {
-			srcDefLog := "NULL"; if src.DefaultValue.Valid { srcDefLog = fmt.Sprintf("'%s'", src.DefaultValue.String) }
-			dstDefLog := "NULL"; if dst.DefaultValue.Valid { dstDefLog = fmt.Sprintf("'%s'", dst.DefaultValue.String) }
+			srcDefLog := "NULL"
+			if src.DefaultValue.Valid {
+				srcDefLog = fmt.Sprintf("'%s'", src.DefaultValue.String)
+			}
+			dstDefLog := "NULL"
+			if dst.DefaultValue.Valid {
+				dstDefLog = fmt.Sprintf("'%s'", dst.DefaultValue.String)
+			}
 			diffs = append(diffs, fmt.Sprintf("default (desired: %s, actual_dst: %s)", srcDefLog, dstDefLog))
 		}
 	}
@@ -68,8 +80,14 @@ func (s *SchemaSyncer) getColumnModifications(src, dst ColumnInfo, log *zap.Logg
 			columnLogger.Debug("Both columns are generated and their (normalized) expressions appear equivalent.")
 		}
 	}
-	srcCollationStr := ""; if src.Collation.Valid { srcCollationStr = src.Collation.String }
-	dstCollationStr := ""; if dst.Collation.Valid { dstCollationStr = dst.Collation.String }
+	srcCollationStr := ""
+	if src.Collation.Valid {
+		srcCollationStr = src.Collation.String
+	}
+	dstCollationStr := ""
+	if dst.Collation.Valid {
+		dstCollationStr = dst.Collation.String
+	}
 	if isStringType(normalizeTypeName(srcTypeForComparison)) && isStringType(normalizeTypeName(dst.Type)) {
 		if srcCollationStr != "" || dstCollationStr != "" {
 			normSrcColl := normalizeCollation(srcCollationStr, s.srcDialect)
@@ -86,8 +104,14 @@ func (s *SchemaSyncer) getColumnModifications(src, dst ColumnInfo, log *zap.Logg
 			}
 		}
 	}
-	srcCommentStr := ""; if src.Comment.Valid { srcCommentStr = src.Comment.String }
-	dstCommentStr := ""; if dst.Comment.Valid { dstCommentStr = dst.Comment.String }
+	srcCommentStr := ""
+	if src.Comment.Valid {
+		srcCommentStr = src.Comment.String
+	}
+	dstCommentStr := ""
+	if dst.Comment.Valid {
+		dstCommentStr = dst.Comment.String
+	}
 	if srcCommentStr != dstCommentStr {
 		columnLogger.Debug("Column comment difference detected.",
 			zap.String("desired_comment", srcCommentStr), zap.String("actual_dst_comment", dstCommentStr))
@@ -110,13 +134,23 @@ func (s *SchemaSyncer) areTypesEquivalent(srcTypeForComp, dstRawType string, src
 
 	if normSrcCompTypeBase == normDstRawTypeBase {
 		if isStringType(normSrcCompTypeBase) || isBinaryType(normSrcCompTypeBase) {
-			desiredLen := int64(-1);
+			desiredLen := int64(-1)
 			if srcInfo.MappedType != "" {
 				normDesiredFullMappedType := normalizeTypeName(srcInfo.MappedType)
-				if isLargeTextOrBlob(normDesiredFullMappedType) { desiredLen = -2 } else if srcInfo.Length.Valid { desiredLen = srcInfo.Length.Int64 }
-			} else if srcInfo.Length.Valid { desiredLen = srcInfo.Length.Int64 }
+				if isLargeTextOrBlob(normDesiredFullMappedType) {
+					desiredLen = -2
+				} else if srcInfo.Length.Valid {
+					desiredLen = srcInfo.Length.Int64
+				}
+			} else if srcInfo.Length.Valid {
+				desiredLen = srcInfo.Length.Int64
+			}
 			actualLen := int64(-1)
-			if isLargeTextOrBlob(normDstRawTypeBase) { actualLen = -2 } else if dstInfo.Length.Valid { actualLen = dstInfo.Length.Int64 }
+			if isLargeTextOrBlob(normDstRawTypeBase) {
+				actualLen = -2
+			} else if dstInfo.Length.Valid {
+				actualLen = dstInfo.Length.Int64
+			}
 			isDesiredFixed := (strings.HasPrefix(normSrcCompTypeBase, "char") && !strings.HasPrefix(normSrcCompTypeBase, "varchar")) || (strings.HasPrefix(normSrcCompTypeBase, "binary") && !strings.HasPrefix(normSrcCompTypeBase, "varbinary"))
 			isActualFixed := (strings.HasPrefix(normDstRawTypeBase, "char") && !strings.HasPrefix(normDstRawTypeBase, "varchar")) || (strings.HasPrefix(normDstRawTypeBase, "binary") && !strings.HasPrefix(normDstRawTypeBase, "varbinary"))
 			if isDesiredFixed != isActualFixed && desiredLen == actualLen && desiredLen > 0 {
@@ -129,8 +163,14 @@ func (s *SchemaSyncer) areTypesEquivalent(srcTypeForComp, dstRawType string, src
 			}
 		}
 		if isPrecisionRelevant(normSrcCompTypeBase) {
-			desiredPrec := int64(-1); if srcInfo.Precision.Valid { desiredPrec = srcInfo.Precision.Int64 }
-			actualPrec := int64(-1); if dstInfo.Precision.Valid { actualPrec = dstInfo.Precision.Int64 }
+			desiredPrec := int64(-1)
+			if srcInfo.Precision.Valid {
+				desiredPrec = srcInfo.Precision.Int64
+			}
+			actualPrec := int64(-1)
+			if dstInfo.Precision.Valid {
+				actualPrec = dstInfo.Precision.Int64
+			}
 			isTimeType := strings.Contains(normSrcCompTypeBase, "time") || strings.Contains(normSrcCompTypeBase, "timestamp") || strings.Contains(normSrcCompTypeBase, "datetime")
 			if isTimeType {
 				if !((desiredPrec <= 0 || !srcInfo.Precision.Valid) && (actualPrec <= 0 || !dstInfo.Precision.Valid)) && (desiredPrec != actualPrec) {
@@ -145,9 +185,15 @@ func (s *SchemaSyncer) areTypesEquivalent(srcTypeForComp, dstRawType string, src
 			}
 		}
 		if isScaleRelevant(normSrcCompTypeBase) {
-			desiredScale := int64(0); if srcInfo.Scale.Valid { desiredScale = srcInfo.Scale.Int64 }
-			actualScale := int64(0); if dstInfo.Scale.Valid { actualScale = dstInfo.Scale.Int64 }
-			if (srcInfo.Scale.Valid != dstInfo.Scale.Valid && !(desiredScale == 0 && actualScale == 0) ) || (srcInfo.Scale.Valid && dstInfo.Scale.Valid && desiredScale != actualScale) {
+			desiredScale := int64(0)
+			if srcInfo.Scale.Valid {
+				desiredScale = srcInfo.Scale.Int64
+			}
+			actualScale := int64(0)
+			if dstInfo.Scale.Valid {
+				actualScale = dstInfo.Scale.Int64
+			}
+			if (srcInfo.Scale.Valid != dstInfo.Scale.Valid && !(desiredScale == 0 && actualScale == 0)) || (srcInfo.Scale.Valid && dstInfo.Scale.Valid && desiredScale != actualScale) {
 				log.Debug("Decimal/Numeric type scale mismatch or one is explicitly set while other is default 0 and values differ.")
 				return false
 			}
@@ -164,8 +210,14 @@ func (s *SchemaSyncer) areTypesEquivalent(srcTypeForComp, dstRawType string, src
 		}
 	}
 	if (normSrcCompTypeBase == "datetime" && normDstRawTypeBase == "timestamp") || (normSrcCompTypeBase == "timestamp" && normDstRawTypeBase == "datetime") {
-		desiredPrec := int64(-1); if srcInfo.Precision.Valid { desiredPrec = srcInfo.Precision.Int64 }
-		actualPrec := int64(-1); if dstInfo.Precision.Valid { actualPrec = dstInfo.Precision.Int64 }
+		desiredPrec := int64(-1)
+		if srcInfo.Precision.Valid {
+			desiredPrec = srcInfo.Precision.Int64
+		}
+		actualPrec := int64(-1)
+		if dstInfo.Precision.Valid {
+			actualPrec = dstInfo.Precision.Int64
+		}
 		if ((desiredPrec <= 0 || !srcInfo.Precision.Valid) && (actualPrec <= 0 || !dstInfo.Precision.Valid)) || (desiredPrec == actualPrec) {
 			log.Debug("Equivalent datetime/timestamp types with similar/default precision found.")
 			return true
@@ -174,10 +226,22 @@ func (s *SchemaSyncer) areTypesEquivalent(srcTypeForComp, dstRawType string, src
 		return false
 	}
 	if (normSrcCompTypeBase == "decimal" && normDstRawTypeBase == "numeric") || (normSrcCompTypeBase == "numeric" && normDstRawTypeBase == "decimal") {
-		desiredPrec := int64(-1); if srcInfo.Precision.Valid { desiredPrec = srcInfo.Precision.Int64 }
-		actualPrec := int64(-1); if dstInfo.Precision.Valid { actualPrec = dstInfo.Precision.Int64 }
-		desiredScale := int64(0); if srcInfo.Scale.Valid { desiredScale = srcInfo.Scale.Int64 }
-		actualScale := int64(0); if dstInfo.Scale.Valid { actualScale = dstInfo.Scale.Int64 }
+		desiredPrec := int64(-1)
+		if srcInfo.Precision.Valid {
+			desiredPrec = srcInfo.Precision.Int64
+		}
+		actualPrec := int64(-1)
+		if dstInfo.Precision.Valid {
+			actualPrec = dstInfo.Precision.Int64
+		}
+		desiredScale := int64(0)
+		if srcInfo.Scale.Valid {
+			desiredScale = srcInfo.Scale.Int64
+		}
+		actualScale := int64(0)
+		if dstInfo.Scale.Valid {
+			actualScale = dstInfo.Scale.Int64
+		}
 		precisionMatch := (srcInfo.Precision.Valid == dstInfo.Precision.Valid && desiredPrec == actualPrec) || (!srcInfo.Precision.Valid && !dstInfo.Precision.Valid)
 		scaleMatch := desiredScale == actualScale
 		if precisionMatch && scaleMatch {
@@ -225,15 +289,22 @@ func (s *SchemaSyncer) areDefaultsEquivalent(srcDefRaw, dstDefRaw, typeForDefaul
 				srcAPD, _, srcErrAPD := apd.NewFromString(normSrcDef)
 				dstAPD, _, dstErrAPD := apd.NewFromString(normDstDef)
 				if srcErrAPD == nil && dstErrAPD == nil {
-					if srcAPD.Cmp(dstAPD) == 0 { log.Debug("Decimal/Numeric defaults (APD-parsed) are equivalent."); return true }
-					log.Debug("Decimal/Numeric defaults (APD-parsed) differ."); return false
+					if srcAPD.Cmp(dstAPD) == 0 {
+						log.Debug("Decimal/Numeric defaults (APD-parsed) are equivalent.")
+						return true
+					}
+					log.Debug("Decimal/Numeric defaults (APD-parsed) differ.")
+					return false
 				}
 				log.Debug("Could not parse one or both decimal/numeric defaults as APD. Falling back.")
 			}
 			srcNumVal, errSrcFloat := strconv.ParseFloat(normSrcDef, 64)
 			dstNumVal, errDstFloat := strconv.ParseFloat(normDstDef, 64)
 			if errSrcFloat == nil && errDstFloat == nil {
-				if srcNumVal == dstNumVal { log.Debug("Numeric defaults (float-parsed) are equivalent."); return true }
+				if srcNumVal == dstNumVal {
+					log.Debug("Numeric defaults (float-parsed) are equivalent.")
+					return true
+				}
 				log.Debug("Numeric defaults (float-parsed) differ.")
 			} else if (errSrcFloat == nil && errDstFloat != nil) || (errSrcFloat != nil && errDstFloat == nil) {
 				log.Debug("One default is float-parsable, other is not (and not identical strings/functions). Considered different.")

@@ -22,9 +22,9 @@ const (
 type ModifierHandlingStrategy string
 
 const (
-	ModifierHandlingApplySource    ModifierHandlingStrategy = "apply_source"
+	ModifierHandlingApplySource      ModifierHandlingStrategy = "apply_source"
 	ModifierHandlingUseTargetDefined ModifierHandlingStrategy = "use_target_defined"
-	ModifierHandlingIgnoreSource   ModifierHandlingStrategy = "ignore_source"
+	ModifierHandlingIgnoreSource     ModifierHandlingStrategy = "ignore_source"
 )
 
 type Config struct {
@@ -56,17 +56,17 @@ type Config struct {
 	DstDB DatabaseConfig `envPrefix:"DST_"`
 
 	// --- Optional: Vault Secret Management ---
-	VaultEnabled     bool   `env:"VAULT_ENABLED" envDefault:"false"`
-	VaultAddr        string `env:"VAULT_ADDR" envDefault:"https://127.0.0.1:8200"`
-	VaultToken       string `env:"VAULT_TOKEN"`
-	VaultCACert      string `env:"VAULT_CACERT"`
-	VaultSkipVerify  bool   `env:"VAULT_SKIP_VERIFY" envDefault:"false"`
-	SrcSecretPath    string `env:"SRC_SECRET_PATH"`
-	DstSecretPath    string `env:"DST_SECRET_PATH"`
-	SrcUsernameKey   string `env:"SRC_USERNAME_KEY" envDefault:"username"`
-	SrcPasswordKey   string `env:"SRC_PASSWORD_KEY" envDefault:"password"`
-	DstUsernameKey   string `env:"DST_USERNAME_KEY" envDefault:"username"`
-	DstPasswordKey   string `env:"DST_PASSWORD_KEY" envDefault:"password"`
+	VaultEnabled    bool   `env:"VAULT_ENABLED" envDefault:"false"`
+	VaultAddr       string `env:"VAULT_ADDR" envDefault:"https://127.0.0.1:8200"`
+	VaultToken      string `env:"VAULT_TOKEN"`
+	VaultCACert     string `env:"VAULT_CACERT"`
+	VaultSkipVerify bool   `env:"VAULT_SKIP_VERIFY" envDefault:"false"`
+	SrcSecretPath   string `env:"SRC_SECRET_PATH"`
+	DstSecretPath   string `env:"DST_SECRET_PATH"`
+	SrcUsernameKey  string `env:"SRC_USERNAME_KEY" envDefault:"username"`
+	SrcPasswordKey  string `env:"SRC_PASSWORD_KEY" envDefault:"password"`
+	DstUsernameKey  string `env:"DST_USERNAME_KEY" envDefault:"username"`
+	DstPasswordKey  string `env:"DST_PASSWORD_KEY" envDefault:"password"`
 
 	// TypeMappingFilePath string `env:"TYPE_MAPPING_FILE_PATH" envDefault:""` // DIHAPUS - Kustomisasi tipe eksternal dinonaktifkan sementara.
 }
@@ -228,14 +228,28 @@ func validateConfig(cfg *Config) error {
 		}
 		return nil
 	}
-	if err := validatePort(cfg.SrcDB.Port, "source"); err != nil { return err }
-	if err := validatePort(cfg.DstDB.Port, "destination"); err != nil { return err }
-	if err := validatePort(cfg.MetricsPort, "metrics"); err != nil { return err }
+	if err := validatePort(cfg.SrcDB.Port, "source"); err != nil {
+		return err
+	}
+	if err := validatePort(cfg.DstDB.Port, "destination"); err != nil {
+		return err
+	}
+	if err := validatePort(cfg.MetricsPort, "metrics"); err != nil {
+		return err
+	}
 
-	if cfg.BatchSize <= 0 { return fmt.Errorf("batch size must be positive") }
-	if cfg.Workers <= 0 { return fmt.Errorf("workers must be positive") }
-	if cfg.MaxRetries < 0 { return fmt.Errorf("max retries cannot be negative") }
-	if cfg.ConnPoolSize <= 0 { return fmt.Errorf("connection pool size must be positive") }
+	if cfg.BatchSize <= 0 {
+		return fmt.Errorf("batch size must be positive")
+	}
+	if cfg.Workers <= 0 {
+		return fmt.Errorf("workers must be positive")
+	}
+	if cfg.MaxRetries < 0 {
+		return fmt.Errorf("max retries cannot be negative")
+	}
+	if cfg.ConnPoolSize <= 0 {
+		return fmt.Errorf("connection pool size must be positive")
+	}
 
 	validSSL := map[string]bool{"disable": true, "allow": true, "prefer": true, "require": true, "verify-ca": true, "verify-full": true}
 	if isSSLModeRelevant(cfg.SrcDB.Dialect) && !validSSL[strings.ToLower(cfg.SrcDB.SSLMode)] {

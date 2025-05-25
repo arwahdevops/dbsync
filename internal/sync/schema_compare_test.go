@@ -63,12 +63,11 @@ func TestNormalizeDefaultValue(t *testing.T) {
 		{"Postgres Cast Function", "now()::timestamp without time zone", "postgres", "current_timestamp"},
 		{"Postgres Nextval", "nextval('my_seq'::regclass)", "postgres", "nextval"},
 		{"Postgres Boolean true cast", "true::boolean", "postgres", "1"},
-		{"Postgres Quoted text in cast", "('hello world')::text", "postgres", "hello world"}, // Diperbaiki ekspektasinya
-		{"Postgres Nested Cast", "('123'::text)::integer", "postgres", "123"},              // Diperbaiki ekspektasinya
+		{"Postgres Quoted text in cast", "('hello world')::text", "postgres", "hello world"},            // Diperbaiki ekspektasinya
+		{"Postgres Nested Cast", "('123'::text)::integer", "postgres", "123"},                           // Diperbaiki ekspektasinya
 		{"Postgres Array Literal Cast", "ARRAY['foo','bar']::text[]", "postgres", "array['foo','bar']"}, // Tanda kurung array harus tetap
-		{"Postgres Row Constructor Cast", "ROW(1, 'foo')::myrowtype", "postgres", "row(1, 'foo')"}, // Tanda kurung row harus tetap
+		{"Postgres Row Constructor Cast", "ROW(1, 'foo')::myrowtype", "postgres", "row(1, 'foo')"},      // Tanda kurung row harus tetap
 		{"Postgres Default with space and quote", "  ' default value '  ", "postgres", " default value "},
-
 
 		// SQLite Specific
 		{"SQLite NULL case-insensitive", "NuLl", "sqlite", "null"},
@@ -130,9 +129,9 @@ func TestNormalizeCheckDefinition(t *testing.T) {
 		{"Check with string literal", "name = 'Test User'", "name = 'test user'"}, // Literal juga jadi lowercase, ini batasan dari strings.ToLower()
 		{"Check with function", "LENGTH(name) > 3", "length(name) > 3"},
 		{"Only Outer Parens", "(col1 > 0)", "col1 > 0"},
-		{"Parens Not Outer Simple", "func((col1 > 0))", "func((col1 > 0))"}, // Tidak boleh strip jika ada fungsi
+		{"Parens Not Outer Simple", "func((col1 > 0))", "func((col1 > 0))"},        // Tidak boleh strip jika ada fungsi
 		{"Parens Not Outer Complex", "(a > 0) AND (b < 0)", "(a > 0) and (b < 0)"}, // Tidak boleh strip
-		{"Nested Parens Simplifiable", "(((a > 0)))", "a > 0"}, // Akan distrip iteratif
+		{"Nested Parens Simplifiable", "(((a > 0)))", "a > 0"},                     // Akan distrip iteratif
 		{"No Strip Needed", "col1 > 0 and col2 < 10", "col1 > 0 and col2 < 10"},
 		{"Check with double parens no space", "((col1 > 5))", "col1 > 5"},
 		{"Check with function and parens", "(length(name) > 5)", "length(name) > 5"},

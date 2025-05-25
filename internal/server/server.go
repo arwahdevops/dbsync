@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/pprof" // Import pprof
-	"sync" // Needed for waitgroup in readyz
+	"sync"           // Needed for waitgroup in readyz
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -78,7 +78,6 @@ func RunHTTPServer(
 			fmt.Fprintln(w, errMsg)
 		}
 	})
-
 
 	// Pprof endpoints (conditionally enabled)
 	if cfg.EnablePprof {

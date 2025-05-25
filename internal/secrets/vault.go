@@ -84,7 +84,6 @@ func (m *VaultManager) GetCredentials(ctx context.Context, path, usernameKey, pa
 		passwordKey = "password"
 	}
 
-
 	log := m.logger.With(zap.String("vault_path", path))
 	log.Info("Attempting to read secret from Vault KV v2", zap.String("username_key", usernameKey), zap.String("password_key", passwordKey))
 

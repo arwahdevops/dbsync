@@ -509,11 +509,21 @@ func processSyncResults(results map[string]projectSync.SyncResult, logger *zap.L
 		hasDataError := res.DataError != nil
 		hasConstraintError := res.ConstraintExecutionError != nil
 
-		if res.SchemaAnalysisError != nil { fields = append(fields, zap.NamedError("schema_analysis_error", res.SchemaAnalysisError)) }
-		if res.SchemaExecutionError != nil { fields = append(fields, zap.NamedError("schema_execution_error", res.SchemaExecutionError)) }
-		if res.DataError != nil { fields = append(fields, zap.NamedError("data_error", res.DataError)) }
-		if res.ConstraintExecutionError != nil { fields = append(fields, zap.NamedError("constraint_execution_error", res.ConstraintExecutionError)) }
-		if res.Skipped { fields = append(fields, zap.String("skip_reason", res.SkipReason)) }
+		if res.SchemaAnalysisError != nil {
+			fields = append(fields, zap.NamedError("schema_analysis_error", res.SchemaAnalysisError))
+		}
+		if res.SchemaExecutionError != nil {
+			fields = append(fields, zap.NamedError("schema_execution_error", res.SchemaExecutionError))
+		}
+		if res.DataError != nil {
+			fields = append(fields, zap.NamedError("data_error", res.DataError))
+		}
+		if res.ConstraintExecutionError != nil {
+			fields = append(fields, zap.NamedError("constraint_execution_error", res.ConstraintExecutionError))
+		}
+		if res.Skipped {
+			fields = append(fields, zap.String("skip_reason", res.SkipReason))
+		}
 
 		level := zap.InfoLevel
 		statusMsg := "Table synchronization SUCCEEDED."
@@ -549,7 +559,7 @@ func processSyncResults(results map[string]projectSync.SyncResult, logger *zap.L
 		zap.Int("total_tables_evaluated", totalTables),
 		zap.Int("tables_fully_successful_or_data_success_with_constraint_fail", successCount),
 		zap.Int("tables_with_schema_failures", schemaFailCount),
-		zap.Int("tables_with_data_failures_after_successful_schema", dataFailCount), // Klarifikasi
+		zap.Int("tables_with_data_failures_after_successful_schema", dataFailCount),                // Klarifikasi
 		zap.Int("tables_with_only_constraint_failures_after_successful_data", constraintFailCount), // Klarifikasi
 		zap.Int("tables_skipped_overall_processing", skippedCount),
 	)
@@ -562,7 +572,6 @@ func processSyncResults(results map[string]projectSync.SyncResult, logger *zap.L
 	if len(constraintFailedTables) > 0 {
 		logger.Warn("Constraint/Index application failures occurred for tables (data was synced successfully):", zap.Strings("tables", constraintFailedTables))
 	}
-
 
 	// Tentukan kode exit
 	if schemaFailCount > 0 || dataFailCount > 0 {

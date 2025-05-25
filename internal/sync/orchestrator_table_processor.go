@@ -8,7 +8,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/arwahdevops/dbsync/internal/config" // Diperlukan untuk config.SchemaSyncNone
+	"github.com/arwahdevops/dbsync/internal/config"  // Diperlukan untuk config.SchemaSyncNone
 	"github.com/arwahdevops/dbsync/internal/metrics" // Diperlukan untuk metrics.Store
 )
 
@@ -35,7 +35,7 @@ func (f *Orchestrator) processSingleTable(input processTableInput) processTableR
 	// --- Tahap 1: Analisis Skema & Pembuatan DDL ---
 	log.Info("Starting schema analysis and DDL generation phase.")
 	schemaResult, schemaErr := input.schemaSyncer.SyncTableSchema(tableCtx, input.tableName, input.cfg.SchemaSyncStrategy)
-	
+
 	if schemaErr != nil {
 		log.Error("Schema analysis/generation failed", zap.Error(schemaErr))
 		result.SchemaAnalysisError = schemaErr
@@ -72,7 +72,7 @@ func (f *Orchestrator) processSingleTable(input processTableInput) processTableR
 		log.Info("Starting table DDL (CREATE/ALTER) execution phase.")
 		tableStructureDDLs := &SchemaExecutionResult{TableDDL: schemaResult.TableDDL}
 		schemaExecErr := input.schemaSyncer.ExecuteDDLs(tableCtx, input.tableName, tableStructureDDLs)
-		
+
 		if schemaExecErr != nil {
 			log.Error("Table DDL (CREATE/ALTER) execution failed", zap.Error(schemaExecErr))
 			result.SchemaExecutionError = schemaExecErr
@@ -109,16 +109,16 @@ func (f *Orchestrator) processSingleTable(input processTableInput) processTableR
 
 		if len(pkColumnsForDataSync) == 0 && input.cfg.SchemaSyncStrategy != config.SchemaSyncNone {
 			log.Warn("Data sync: No primary key identified for table after schema operations. Pagination will not be used, which is unsafe and slow for large tables. Data sync might also fail if upsert requires PKs.",
-			    zap.Strings("pks_from_schema_result", pkColumnsForDataSync))
+				zap.Strings("pks_from_schema_result", pkColumnsForDataSync))
 		} else if len(pkColumnsForDataSync) == 0 && input.cfg.SchemaSyncStrategy == config.SchemaSyncNone {
-		    log.Warn("Data sync: Schema strategy is 'none' and no primary key detected via source schema analysis. Attempting full table load without pagination (unsafe for large tables). Data sync might also fail if upsert requires PKs.")
+			log.Warn("Data sync: Schema strategy is 'none' and no primary key detected via source schema analysis. Attempting full table load without pagination (unsafe for large tables). Data sync might also fail if upsert requires PKs.")
 		}
 
 		log.Info("Starting data synchronization phase.")
 		rowsSynced, batchesProcessed, dataSyncErr := f.syncData(tableCtx, input.tableName, pkColumnsForDataSync)
 		result.RowsSynced = rowsSynced
 		result.Batches = batchesProcessed
-		
+
 		if dataSyncErr != nil {
 			log.Error("Data synchronization failed", zap.Error(dataSyncErr))
 			result.DataError = dataSyncErr
@@ -195,18 +195,32 @@ func (f *Orchestrator) logFinalTableResult(log *zap.Logger, result processTableR
 
 	if result.Skipped {
 		logFields = append(logFields, zap.String("skip_reason", result.SkipReason))
-		if result.SchemaAnalysisError != nil { logFields = append(logFields, zap.NamedError("schema_analysis_error_cause", result.SchemaAnalysisError)) }
-		if result.SchemaExecutionError != nil { logFields = append(logFields, zap.NamedError("schema_execution_error_cause", result.SchemaExecutionError)) }
-		if result.DataError != nil { logFields = append(logFields, zap.NamedError("data_error_cause", result.DataError)) }
+		if result.SchemaAnalysisError != nil {
+			logFields = append(logFields, zap.NamedError("schema_analysis_error_cause", result.SchemaAnalysisError))
+		}
+		if result.SchemaExecutionError != nil {
+			logFields = append(logFields, zap.NamedError("schema_execution_error_cause", result.SchemaExecutionError))
+		}
+		if result.DataError != nil {
+			logFields = append(logFields, zap.NamedError("data_error_cause", result.DataError))
+		}
 		if result.ConstraintExecutionError != nil && (result.SchemaAnalysisError != nil || result.SchemaExecutionError != nil || result.DataError != nil) {
-		    logFields = append(logFields, zap.NamedError("constraint_execution_error_after_skip_trigger", result.ConstraintExecutionError))
+			logFields = append(logFields, zap.NamedError("constraint_execution_error_after_skip_trigger", result.ConstraintExecutionError))
 		}
 		log.Warn("Table processing was SKIPPED or INTERRUPTED by error/cancellation", logFields...)
 	} else if hasCriticalErrorExcludingConstraints {
-		if result.SchemaAnalysisError != nil { logFields = append(logFields, zap.NamedError("schema_analysis_error", result.SchemaAnalysisError)) }
-		if result.SchemaExecutionError != nil { logFields = append(logFields, zap.NamedError("schema_execution_error", result.SchemaExecutionError)) }
-		if result.DataError != nil { logFields = append(logFields, zap.NamedError("data_error", result.DataError)) }
-		if result.ConstraintExecutionError != nil { logFields = append(logFields, zap.NamedError("constraint_execution_error_concurrent_with_critical", result.ConstraintExecutionError)) }
+		if result.SchemaAnalysisError != nil {
+			logFields = append(logFields, zap.NamedError("schema_analysis_error", result.SchemaAnalysisError))
+		}
+		if result.SchemaExecutionError != nil {
+			logFields = append(logFields, zap.NamedError("schema_execution_error", result.SchemaExecutionError))
+		}
+		if result.DataError != nil {
+			logFields = append(logFields, zap.NamedError("data_error", result.DataError))
+		}
+		if result.ConstraintExecutionError != nil {
+			logFields = append(logFields, zap.NamedError("constraint_execution_error_concurrent_with_critical", result.ConstraintExecutionError))
+		}
 		log.Error("Table synchronization finished with CRITICAL ERRORS", logFields...)
 	} else if hasOnlyConstraintError {
 		logFields = append(logFields, zap.NamedError("constraint_execution_error", result.ConstraintExecutionError))

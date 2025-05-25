@@ -32,10 +32,10 @@ var _ OrchestratorInterface = (*Orchestrator)(nil)
 // NewOrchestrator membuat instance Orchestrator baru.
 func NewOrchestrator(srcConn, dstConn *db.Connector, cfg *config.Config, logger *zap.Logger, metricsStore *metrics.Store) *Orchestrator {
 	return &Orchestrator{
-		srcConn:      srcConn,
-		dstConn:      dstConn,
-		cfg:          cfg,
-		logger:       logger.Named("orchestrator"), // Memberi nama pada logger untuk konteks
+		srcConn: srcConn,
+		dstConn: dstConn,
+		cfg:     cfg,
+		logger:  logger.Named("orchestrator"), // Memberi nama pada logger untuk konteks
 		schemaSyncer: NewSchemaSyncer( // Inisialisasi SchemaSyncer
 			srcConn.DB,
 			dstConn.DB,
@@ -155,7 +155,7 @@ func (f *Orchestrator) getExecutionOrder(ctx context.Context, tableNames []strin
 		}
 	}
 
-	adj := make(map[string][]string)    // Adjacency list: U_prereq -> [V_dependen]
+	adj := make(map[string][]string) // Adjacency list: U_prereq -> [V_dependen]
 	inDegree := make(map[string]int) // InDegree[V]: jumlah U yang menjadi prasyarat untuk V
 	tableSet := make(map[string]bool)
 
@@ -190,14 +190,27 @@ func (f *Orchestrator) getExecutionOrder(ctx context.Context, tableNames []strin
 
 	if log.Core().Enabled(zap.DebugLevel) {
 		// Logging untuk In-Degree Map
-		sortedInDegreeKeys := make([]string, 0, len(inDegree)); for k := range inDegree { sortedInDegreeKeys = append(sortedInDegreeKeys, k) }; sort.Strings(sortedInDegreeKeys)
-		logInDegree := make(map[string]int); for _, k := range sortedInDegreeKeys { logInDegree[k] = inDegree[k] }
+		sortedInDegreeKeys := make([]string, 0, len(inDegree))
+		for k := range inDegree {
+			sortedInDegreeKeys = append(sortedInDegreeKeys, k)
+		}
+		sort.Strings(sortedInDegreeKeys)
+		logInDegree := make(map[string]int)
+		for _, k := range sortedInDegreeKeys {
+			logInDegree[k] = inDegree[k]
+		}
 
 		// Logging untuk Adjacency List Map
-		sortedAdjKeys := make([]string, 0, len(adj)); for k := range adj { sortedAdjKeys = append(sortedAdjKeys, k) }; sort.Strings(sortedAdjKeys)
+		sortedAdjKeys := make([]string, 0, len(adj))
+		for k := range adj {
+			sortedAdjKeys = append(sortedAdjKeys, k)
+		}
+		sort.Strings(sortedAdjKeys)
 		logAdj := make(map[string][]string)
 		for _, k := range sortedAdjKeys {
-			if len(adj[k]) > 0 { logAdj[k] = adj[k] } // Hanya log adj yang punya dependents
+			if len(adj[k]) > 0 {
+				logAdj[k] = adj[k]
+			} // Hanya log adj yang punya dependents
 		}
 		log.Debug("Constructed graph for topological sort:",
 			zap.Any("in_degree_map (V -> count of U's that are prereq for V)", logInDegree),
@@ -373,7 +386,9 @@ func (f *Orchestrator) getDestinationTablePKs(ctx context.Context, tableName str
 			for _, col := range columnsInfo {
 				if col.Pk > 0 {
 					pkMap[col.Pk] = col.Name
-					if col.Pk > maxPkOrder { maxPkOrder = col.Pk }
+					if col.Pk > maxPkOrder {
+						maxPkOrder = col.Pk
+					}
 				}
 			}
 			if maxPkOrder > 0 {
@@ -411,10 +426,10 @@ func (f *Orchestrator) getDestinationTablePKs(ctx context.Context, tableName str
 		return nil, fmt.Errorf("failed to query PKs for destination table '%s' (%s): %w", tableName, f.dstConn.Dialect, err)
 	}
 
-    if len(pks) == 0 {
-        log.Warn("No primary key columns identified for destination table. Upsert behavior might be affected if PKs are expected for conflict resolution.", zap.String("table", tableName))
-    } else {
-        log.Debug("Destination primary keys fetched.", zap.String("table", tableName), zap.Strings("pk_columns_ordered", pks))
-    }
+	if len(pks) == 0 {
+		log.Warn("No primary key columns identified for destination table. Upsert behavior might be affected if PKs are expected for conflict resolution.", zap.String("table", tableName))
+	} else {
+		log.Debug("Destination primary keys fetched.", zap.String("table", tableName), zap.Strings("pk_columns_ordered", pks))
+	}
 	return pks, nil
 }

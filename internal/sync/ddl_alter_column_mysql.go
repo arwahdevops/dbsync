@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"go.uber.org/zap"
 	"github.com/arwahdevops/dbsync/internal/utils"
+	"go.uber.org/zap"
 )
 
 // generateMySQLModifyColumnDDLs menghasilkan DDLs untuk mengubah kolom di MySQL.
@@ -15,13 +15,19 @@ func (s *SchemaSyncer) generateMySQLModifyColumnDDLs(table string, src ColumnInf
 	// Logger sudah di-scope oleh pemanggil.
 
 	hasTypeChange := false
-	originalSourceTypeForLog := src.Type      // Untuk logging
+	originalSourceTypeForLog := src.Type       // Untuk logging
 	targetTypeDDLFromMapping := src.MappedType // Tipe dasar yang diinginkan di tujuan dari hasil mapping
 
 	isSrcGenerated := src.IsGenerated
 	isDstGenerated := dst.IsGenerated
-	srcGenExpr := ""; if src.GenerationExpression.Valid { srcGenExpr = src.GenerationExpression.String }
-	dstGenExpr := ""; if dst.GenerationExpression.Valid { dstGenExpr = dst.GenerationExpression.String }
+	srcGenExpr := ""
+	if src.GenerationExpression.Valid {
+		srcGenExpr = src.GenerationExpression.String
+	}
+	dstGenExpr := ""
+	if dst.GenerationExpression.Valid {
+		dstGenExpr = dst.GenerationExpression.String
+	}
 
 	// Periksa perbedaan signifikan
 	for _, diff := range diffs {

@@ -90,7 +90,6 @@ func (c *Connector) Ping(ctx context.Context) error {
 	return sqlDB.PingContext(pingCtx)
 }
 
-
 func (c *Connector) Close() error {
 	sqlDB, err := c.DB.DB()
 	if err != nil {

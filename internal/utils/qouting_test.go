@@ -85,7 +85,6 @@ func TestUnquoteIdentifier(t *testing.T) {
 		{"PostgreSQL Incorrectly Quoted (Backticks)", "`pg_table`", "postgres", "`pg_table`"},
 		{"PostgreSQL Trim Spaces", `  "trimmed_id"  `, "postgres", "trimmed_id"},
 
-
 		// SQLite Test Cases
 		{"SQLite Basic Unquote", `"some_column"`, "sqlite", "some_column"},
 		{"SQLite With Space Unquote", `"some column"`, "sqlite", "some column"},
@@ -94,7 +93,6 @@ func TestUnquoteIdentifier(t *testing.T) {
 		{"SQLite Empty Quoted Unquote", `""`, "sqlite", ""},
 		{"SQLite Not Quoted", "sqlite_no_quotes", "sqlite", "sqlite_no_quotes"},
 		{"SQLite Incorrectly Quoted (Backticks)", "`sqlite_table`", "sqlite", "`sqlite_table`"},
-
 
 		// Unknown Dialect Test Cases (Fallback to double quotes for unquoting)
 		{"Unknown Basic Unquote", `"fallback_id"`, "unknown", "fallback_id"},

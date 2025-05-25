@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
-	"gorm.io/gorm" // Diperlukan untuk gorm.ErrRecordNotFound jika digunakan, atau operasi Transaction
+	"gorm.io/gorm"        // Diperlukan untuk gorm.ErrRecordNotFound jika digunakan, atau operasi Transaction
 	"gorm.io/gorm/clause" // Diperlukan untuk clause.OnConflict dll.
 
 	"github.com/arwahdevops/dbsync/internal/db"    // Diperlukan untuk tipe db.Connector
@@ -194,7 +194,9 @@ func (f *Orchestrator) syncData(ctx context.Context, table string, srcPKColumns 
 			query = query.Where(whereClause, args...)
 		}
 
-		if orderByClause != "" { query = query.Order(orderByClause) }
+		if orderByClause != "" {
+			query = query.Order(orderByClause)
+		}
 		query = query.Limit(f.cfg.BatchSize)
 
 		log.Debug("Fetching next batch from source database.",
@@ -249,21 +251,25 @@ func (f *Orchestrator) syncData(ctx context.Context, table string, srcPKColumns 
 							case bool:
 								transformedRow[key] = v
 							case string:
-							    sVal := strings.ToLower(strings.TrimSpace(v))
-							    if sVal == "1" || sVal == "true" || sVal == "t" || sVal == "yes" || sVal == "on" {
-							        transformedRow[key] = true
-							    } else if sVal == "0" || sVal == "false" || sVal == "f" || sVal == "no" || sVal == "off" {
-							        transformedRow[key] = false
-							    } else {
-							        transformedRow[key] = val 
-							    }
+								sVal := strings.ToLower(strings.TrimSpace(v))
+								if sVal == "1" || sVal == "true" || sVal == "t" || sVal == "yes" || sVal == "on" {
+									transformedRow[key] = true
+								} else if sVal == "0" || sVal == "false" || sVal == "f" || sVal == "no" || sVal == "off" {
+									transformedRow[key] = false
+								} else {
+									transformedRow[key] = val
+								}
 							default:
 								transformedRow[key] = val
 							}
 							continue
 						} else if f.dstConn.Dialect == "mysql" && targetType == "tinyint" {
 							if boolVal, isBool := val.(bool); isBool {
-								if boolVal { transformedRow[key] = 1 } else { transformedRow[key] = 0 }
+								if boolVal {
+									transformedRow[key] = 1
+								} else {
+									transformedRow[key] = 0
+								}
 								continue
 							}
 						}
@@ -305,7 +311,7 @@ func (f *Orchestrator) syncData(ctx context.Context, table string, srcPKColumns 
 				newLastSrcPKValues[i] = val
 			}
 			if !allPKsFound {
-				return totalRowsSynced, batches, fmt.Errorf("source PK column ('%s') missing in fetched data for table '%s', pagination failed", strings.Join(srcPKColumns,","), table)
+				return totalRowsSynced, batches, fmt.Errorf("source PK column ('%s') missing in fetched data for table '%s', pagination failed", strings.Join(srcPKColumns, ","), table)
 			}
 			lastSrcPKValues = newLastSrcPKValues
 		} else {
@@ -418,7 +424,9 @@ func (f *Orchestrator) syncBatchWithRetry(ctx context.Context, table string, bat
 
 		if txErr == nil {
 			metricStatus = "success"
-			if attempt > 0 { metricStatus = "success_retry" }
+			if attempt > 0 {
+				metricStatus = "success_retry"
+			}
 			log.Debug("Batch upsert successful.", zap.Int("attempt_number", attempt+1))
 			return nil
 		}

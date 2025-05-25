@@ -69,7 +69,7 @@ func (s *SchemaSyncer) SyncTableSchema(ctx context.Context, table string, strate
 
 	// Dapatkan PK dari sumber, ini penting bahkan untuk strategi 'none' agar data sync tahu cara paginasi
 	result.PrimaryKeys = getPKColumnNames(srcSchema.Columns) // from syncer_helpers.go
-	if len(result.PrimaryKeys) == 0 { // Coba dari constraint jika kolom tidak menandai PK
+	if len(result.PrimaryKeys) == 0 {                        // Coba dari constraint jika kolom tidak menandai PK
 		for _, cons := range srcSchema.Constraints {
 			if cons.Type == "PRIMARY KEY" {
 				result.PrimaryKeys = cons.Columns
@@ -79,7 +79,6 @@ func (s *SchemaSyncer) SyncTableSchema(ctx context.Context, table string, strate
 		}
 	}
 	log.Debug("Determined primary keys for source table (for data sync pagination).", zap.Strings("pks", result.PrimaryKeys))
-
 
 	// Isi MappedType untuk kolom sumber. Ini diperlukan untuk SEMUA strategi
 	// karena MappedType sumber akan menjadi dasar untuk definisi kolom tujuan.

@@ -22,15 +22,15 @@ func (s *SchemaSyncer) getMySQLColumns(ctx context.Context, db *gorm.DB, table s
 		Default         sql.NullString `gorm:"column:COLUMN_DEFAULT"`
 		IsNullable      string         `gorm:"column:IS_NULLABLE"`
 		// Type            string         `gorm:"column:DATA_TYPE"` // DATA_TYPE kurang lengkap untuk MySQL
-		FullType        string         `gorm:"column:COLUMN_TYPE"` // COLUMN_TYPE lebih baik, misal: varchar(255), int(11) unsigned
-		Length          sql.NullInt64  `gorm:"column:CHARACTER_MAXIMUM_LENGTH"`
-		Precision       sql.NullInt64  `gorm:"column:NUMERIC_PRECISION"`
-		Scale           sql.NullInt64  `gorm:"column:NUMERIC_SCALE"`
-		Key             string         `gorm:"column:COLUMN_KEY"`
-		Extra           string         `gorm:"column:EXTRA"`
-		Collation       sql.NullString `gorm:"column:COLLATION_NAME"`
-		Comment         sql.NullString `gorm:"column:COLUMN_COMMENT"`
-		GenerationExpr  sql.NullString `gorm:"column:GENERATION_EXPRESSION"`
+		FullType       string         `gorm:"column:COLUMN_TYPE"` // COLUMN_TYPE lebih baik, misal: varchar(255), int(11) unsigned
+		Length         sql.NullInt64  `gorm:"column:CHARACTER_MAXIMUM_LENGTH"`
+		Precision      sql.NullInt64  `gorm:"column:NUMERIC_PRECISION"`
+		Scale          sql.NullInt64  `gorm:"column:NUMERIC_SCALE"`
+		Key            string         `gorm:"column:COLUMN_KEY"`
+		Extra          string         `gorm:"column:EXTRA"`
+		Collation      sql.NullString `gorm:"column:COLLATION_NAME"`
+		Comment        sql.NullString `gorm:"column:COLUMN_COMMENT"`
+		GenerationExpr sql.NullString `gorm:"column:GENERATION_EXPRESSION"`
 	}
 
 	var version string
@@ -87,8 +87,8 @@ func (s *SchemaSyncer) getMySQLColumns(ctx context.Context, db *gorm.DB, table s
 				ORDER BY ORDINAL_POSITION;`
 			err = db.WithContext(ctx).Raw(sqlQuery, table).Scan(&columnsData).Error
 		}
-        // Setelah potensi retry, cek error lagi
-        if err != nil {
+		// Setelah potensi retry, cek error lagi
+		if err != nil {
 			if err == gorm.ErrRecordNotFound || isTableNotExistError(err, "mysql") {
 				log.Warn("Table not found or column query returned no rows.", zap.String("table", table))
 				return []ColumnInfo{}, nil // Bukan error aplikasi jika tabel tidak ada
@@ -96,7 +96,7 @@ func (s *SchemaSyncer) getMySQLColumns(ctx context.Context, db *gorm.DB, table s
 			return nil, fmt.Errorf("mysql columns query failed for table '%s': %w", table, err)
 		}
 	}
-	
+
 	if len(columnsData) == 0 { // Bisa terjadi jika tabel ada tapi tidak punya kolom (jarang) atau jika query filter lain
 		log.Warn("Column query succeeded but returned no rows. Assuming table has no columns or was filtered out.", zap.String("table", table))
 		return []ColumnInfo{}, nil
@@ -108,7 +108,7 @@ func (s *SchemaSyncer) getMySQLColumns(ctx context.Context, db *gorm.DB, table s
 			strings.Contains(strings.ToUpper(c.Extra), "STORED GENERATED")) ||
 			(c.GenerationExpr.Valid && c.GenerationExpr.String != "")
 		isAutoIncrement := strings.Contains(strings.ToLower(c.Extra), "auto_increment")
-		
+
 		colInfo := ColumnInfo{
 			Name:                 c.Field,
 			Type:                 c.FullType, // Menggunakan COLUMN_TYPE yang lebih lengkap
@@ -179,7 +179,10 @@ func (s *SchemaSyncer) getMySQLIndexes(ctx context.Context, db *gorm.DB, table s
 		return []IndexInfo{}, nil
 	}
 
-	idxColsMap := make(map[string][]struct{ Seq int; ColName string })
+	idxColsMap := make(map[string][]struct {
+		Seq     int
+		ColName string
+	})
 	idxDetailsMap := make(map[string]IndexInfo)
 
 	for _, r := range results {
@@ -199,7 +202,10 @@ func (s *SchemaSyncer) getMySQLIndexes(ctx context.Context, db *gorm.DB, table s
 				Columns:   make([]string, 0), // Akan diisi setelah diurutkan
 			}
 		}
-		idxColsMap[r.KeyName] = append(idxColsMap[r.KeyName], struct{ Seq int; ColName string }{
+		idxColsMap[r.KeyName] = append(idxColsMap[r.KeyName], struct {
+			Seq     int
+			ColName string
+		}{
 			Seq:     r.SeqInIndex,
 			ColName: r.ColumnName,
 		})
@@ -274,11 +280,11 @@ func (s *SchemaSyncer) getMySQLConstraints(ctx context.Context, db *gorm.DB, tab
 			-- AND tc.TABLE_NAME = rc.TABLE_NAME -- Tidak perlu join TABLE_NAME di sini untuk rc
 		WHERE tc.TABLE_SCHEMA = DATABASE() AND tc.TABLE_NAME = ?
 		ORDER BY tc.CONSTRAINT_NAME, kcu.ORDINAL_POSITION;`
-		// ORDINAL_POSITION di kcu adalah kunci untuk urutan kolom
+	// ORDINAL_POSITION di kcu adalah kunci untuk urutan kolom
 
 	err := db.WithContext(ctx).Raw(queryCore, table).Scan(&tcResults).Error
 	if err != nil {
-		if isTableNotExistError(err, "mysql"){ // Redundan jika cek di atas berhasil, tapi sbg fallback
+		if isTableNotExistError(err, "mysql") { // Redundan jika cek di atas berhasil, tapi sbg fallback
 			log.Warn("Table not found during constraints query (double check).", zap.String("table", table))
 			return []ConstraintInfo{}, nil
 		}
@@ -289,9 +295,9 @@ func (s *SchemaSyncer) getMySQLConstraints(ctx context.Context, db *gorm.DB, tab
 	fkReferencedColsMap := make(map[string][]string)
 	if len(tcResults) > 0 { // Hanya query jika ada constraint yang mungkin FK
 		var fkRefResults []struct {
-			ConstraintName string `gorm:"column:CONSTRAINT_NAME"`
+			ConstraintName       string `gorm:"column:CONSTRAINT_NAME"`
 			ReferencedColumnName string `gorm:"column:REFERENCED_COLUMN_NAME"`
-			OrdinalPosition int `gorm:"column:ORDINAL_POSITION"` // Untuk mengurutkan kolom referensi
+			OrdinalPosition      int    `gorm:"column:ORDINAL_POSITION"` // Untuk mengurutkan kolom referensi
 		}
 		// Query untuk mendapatkan kolom yang direferensikan oleh FK, diurutkan
 		queryFkRefCols := `
@@ -318,7 +324,6 @@ func (s *SchemaSyncer) getMySQLConstraints(ctx context.Context, db *gorm.DB, tab
 			}
 		}
 	}
-
 
 	checkClauses := make(map[string]string)
 	var checkTableExistsCount int
@@ -350,7 +355,10 @@ func (s *SchemaSyncer) getMySQLConstraints(ctx context.Context, db *gorm.DB, tab
 	}
 
 	consMap := make(map[string]*ConstraintInfo)
-	colsForConstraint := make(map[string][]struct{ Seq int64; Name string })
+	colsForConstraint := make(map[string][]struct {
+		Seq  int64
+		Name string
+	})
 
 	for _, r := range tcResults {
 		constraintName := r.ConstraintName
@@ -361,7 +369,7 @@ func (s *SchemaSyncer) getMySQLConstraints(ctx context.Context, db *gorm.DB, tab
 				Name:           constraintName,
 				Type:           constraintType,
 				Columns:        []string{},
-				ForeignTable:   r.ForeignTableName.String, // Akan diisi hanya untuk FK
+				ForeignTable:   r.ForeignTableName.String,           // Akan diisi hanya untuk FK
 				ForeignColumns: fkReferencedColsMap[constraintName], // Isi dengan kolom referensi yang sudah diambil & diurutkan
 				OnDelete:       r.DeleteRule.String,
 				OnUpdate:       r.UpdateRule.String,
@@ -378,10 +386,15 @@ func (s *SchemaSyncer) getMySQLConstraints(ctx context.Context, db *gorm.DB, tab
 
 		if r.ColumnName.Valid && r.ColumnName.String != "" {
 			seq := int64(1)
-			if r.OrdinalPosition.Valid { seq = r.OrdinalPosition.Int64 }
+			if r.OrdinalPosition.Valid {
+				seq = r.OrdinalPosition.Int64
+			}
 			// Untuk PK, UNIQUE, dan kolom LOKAL dari FK
 			if constraintType == "PRIMARY KEY" || constraintType == "UNIQUE" || constraintType == "FOREIGN KEY" {
-				colsForConstraint[constraintName] = append(colsForConstraint[constraintName], struct{ Seq int64; Name string }{
+				colsForConstraint[constraintName] = append(colsForConstraint[constraintName], struct {
+					Seq  int64
+					Name string
+				}{
 					Seq: seq, Name: r.ColumnName.String,
 				})
 			}

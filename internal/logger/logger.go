@@ -24,7 +24,7 @@ type GormLoggerInterface interface {
 
 // GormLogger implements GormLoggerInterface
 type GormLogger struct {
-	*zap.Logger                     // Use Zap logger directly
+	*zap.Logger                        // Use Zap logger directly
 	LogLevel       gormlogger.LogLevel // Use GORM's LogLevel type
 	SlowThreshold  time.Duration
 	SensitiveWords []string
@@ -61,7 +61,6 @@ func Init(debug bool, jsonOutput bool) error {
 		encoderConfig.CallerKey = "caller"
 	}
 
-
 	config.EncoderConfig = encoderConfig
 	config.DisableStacktrace = !debug // Disable stacktrace in prod
 
@@ -71,7 +70,6 @@ func Init(debug bool, jsonOutput bool) error {
 	} else {
 		config.Encoding = "console" // Use console encoder (human-readable)
 	}
-
 
 	var err error
 	buildOptions := []zap.Option{}
@@ -187,10 +185,9 @@ func (l *GormLogger) Trace(ctx context.Context, begin time.Time, fc func() (stri
 		redactedSQL = reAssign.ReplaceAllString(redactedSQL, `${1}***REDACTED***`)
 	}
 
-
 	fields := []zap.Field{
 		zap.Duration("duration_ms", elapsed.Round(time.Millisecond)), // More readable duration
-		zap.String("sql", redactedSQL), // Log redacted SQL
+		zap.String("sql", redactedSQL),                               // Log redacted SQL
 	}
 	if rows > -1 { // GORM often returns -1 for non-row-returning queries (like DDL)
 		fields = append(fields, zap.Int64("rows_affected", rows))
